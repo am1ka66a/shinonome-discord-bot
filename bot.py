@@ -3,6 +3,7 @@ from discord.ext import commands
 import random
 import pymysql
 import os
+import asyncio
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -191,27 +192,36 @@ class BlackjackGame(discord.ui.View):
         self.side_p, self.side_m = check_sidebets(self.p_hand, self.d_hand[0], p_bet, s_bet)
         if self.side_p != 0: update_game_result(user.id, self.side_p, self.side_p > 0)
 
-    def build_embed(self, done=False, res="", profit=0):
+    def build_embed(self, done=False, res="", profit=0, animating=False):
         stats = get_user_stats(self.user.id)
         bal, total, wins, t_prof = stats
         wr = (wins/total*100) if total>0 else 0
         embed = discord.Embed(title="🃏 21點大賽", color=0x2b2d31)
-        embed.description = f"餘額：{bal} | 勝率：{wr:.1f}% | 總盈虧：{t_prof}"
+        embed.description = f"目前餘額：{bal} | 勝率：{wr:.1f}% | 總盈虧：{t_prof}"
         p_cards = ' '.join([f"[{c['rank']}{c['suit']}]" for c in self.p_hand])
         embed.add_field(name="👤 你的手牌", value=f"{p_cards}\n點數：{calculate_score(self.p_hand)}", inline=False)
-        if done:
+        if done or animating:
             d_cards = ' '.join([f"[{c['rank']}{c['suit']}]" for c in self.d_hand])
             embed.add_field(name="🤖 莊家手牌", value=f"{d_cards}\n點數：{calculate_score(self.d_hand)}", inline=False)
-            embed.add_field(name="🏆 結果", value=f"{res}\n{self.side_m}", inline=False)
+            if done:
+                total_profit = profit + self.side_p
+                res_text = f"**{res}**\n{self.side_m}\n"
+                if total_profit > 0: res_text += f"\n📈 本局總計：`+{total_profit}` 幣"
+                elif total_profit < 0: res_text += f"\n📉 本局總計：`{total_profit}` 幣"
+                else: res_text += f"\n➖ 本局無輸贏"
+                res_text += f"\n💰 最新餘額：`{bal}` 幣"
+                embed.add_field(name="🏆 結果", value=res_text, inline=False)
         else:
             embed.add_field(name="🤖 莊家手牌", value=f"[{self.d_hand[0]['rank']}{self.d_hand[0]['suit']}] [❓]", inline=False)
         return embed
 
-    async def end(self, inter, res, prof, win=False):
+    async def end(self, inter, res, prof, win=False, deferred=False):
         for c in self.children: c.disabled = True
         update_game_result(self.user.id, prof, win)
         nv = NewGameView(self.user, self.bet, self.p_bet, self.s_bet, get_user_stats(self.user.id)[0])
-        await inter.response.edit_message(embed=self.build_embed(True, res, prof), view=nv)
+        emb = self.build_embed(True, res, prof)
+        if deferred: await inter.message.edit(embed=emb, view=nv)
+        else: await inter.response.edit_message(embed=emb, view=nv)
 
     @discord.ui.button(label="要牌", style=discord.ButtonStyle.success)
     async def hit(self, inter, btn):
@@ -227,11 +237,22 @@ class BlackjackGame(discord.ui.View):
     @discord.ui.button(label="停牌", style=discord.ButtonStyle.danger)
     async def stand(self, inter, btn):
         if inter.user.id != self.user.id: return
-        while calculate_score(self.d_hand) < 17: self.d_hand.append(self.deck.pop())
+        await inter.response.defer()
+        for c in self.children: c.disabled = True
+        await inter.message.edit(view=self)
+        
+        await inter.message.edit(embed=self.build_embed(done=False, animating=True))
+        await asyncio.sleep(1.2)
+
+        while calculate_score(self.d_hand) < 17:
+            self.d_hand.append(self.deck.pop())
+            await inter.message.edit(embed=self.build_embed(done=False, animating=True))
+            await asyncio.sleep(1.2)
+
         ps, ds = calculate_score(self.p_hand), calculate_score(self.d_hand)
-        if ds > 21 or ps > ds: await self.end(inter, "你贏了！", self.bet, True)
-        elif ps < ds: await self.end(inter, "你輸了", -self.bet)
-        else: await self.end(inter, "平手", 0)
+        if ds > 21 or ps > ds: await self.end(inter, "🎉 你贏了！", self.bet, True, deferred=True)
+        elif ps < ds: await self.end(inter, "💀 你輸了", -self.bet, False, deferred=True)
+        else: await self.end(inter, "🤝 平手", 0, False, deferred=True)
 
     @discord.ui.button(label="投降", style=discord.ButtonStyle.secondary)
     async def surrender(self, inter, btn):
