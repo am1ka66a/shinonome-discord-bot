@@ -168,6 +168,19 @@ class SetupView(discord.ui.View):
         self.p_bet, self.s_bet = p_bet, s_bet
         self.max_side = int(base_bet * SIDE_BET_RATIO)
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user.id:
+            await interaction.response.send_message("這不是你的牌局！", ephemeral=True)
+            return False
+            
+        now = asyncio.get_event_loop().time()
+        if hasattr(self, "last_action") and now - self.last_action < 2.0:
+            await interaction.response.send_message("⚠️ 操作太快了！按鈕有 2 秒冷卻時間。", ephemeral=True)
+            return False
+            
+        self.last_action = now
+        return True
+
     def build_embed(self, err=""):
         stats = get_user_stats(self.user.id)
         embed = discord.Embed(title="🃏 21點 — 下注設定", color=0x2b2d31)
@@ -205,6 +218,19 @@ class BlackjackGame(discord.ui.View):
         self.side_p, self.side_m = check_sidebets(self.hands[0], self.d_hand[0], p_bet, s_bet)
         if self.side_p != 0: update_game_result(user.id, self.side_p, self.side_p > 0)
         self.update_buttons()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user.id:
+            await interaction.response.send_message("這不是你的牌局！", ephemeral=True)
+            return False
+            
+        now = asyncio.get_event_loop().time()
+        if hasattr(self, "last_action") and now - self.last_action < 2.0:
+            await interaction.response.send_message("⚠️ 操作太快了！按鈕有 2 秒冷卻時間。", ephemeral=True)
+            return False
+            
+        self.last_action = now
+        return True
 
     @property
     def p_hand(self):
@@ -391,6 +417,19 @@ class NewGameView(discord.ui.View):
         self.user, self.last_bet, self.bal = user, last_bet, bal
         self.last_p_bet, self.last_s_bet = last_p_bet, last_s_bet
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user.id:
+            await interaction.response.send_message("這不是你的牌局！", ephemeral=True)
+            return False
+            
+        now = asyncio.get_event_loop().time()
+        if hasattr(self, "last_action") and now - self.last_action < 2.0:
+            await interaction.response.send_message("⚠️ 操作太快了！按鈕有 2 秒冷卻時間。", ephemeral=True)
+            return False
+            
+        self.last_action = now
+        return True
+
     @discord.ui.button(label="再一局", style=discord.ButtonStyle.success)
     async def again(self, inter, btn):
         if inter.user.id != self.user.id: return
@@ -475,6 +514,25 @@ async def balance(interaction: discord.Interaction, member: discord.Member = Non
     stats = get_user_stats(target.id)
     if not stats: return await interaction.response.send_message(f"{target.mention} 尚未註冊！", ephemeral=True)
     embed = discord.Embed(title="💰 帳戶餘額", description=f"{target.mention} 目前擁有 **{stats[0]}** 東雲幣", color=0x2b2d31)
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="record", description="查詢個人的戰績與獲利總額")
+@app_commands.describe(member="你想查詢的對象 (選填)")
+async def record_cmd(interaction: discord.Interaction, member: discord.Member = None):
+    target = member or interaction.user
+    stats = get_user_stats(target.id)
+    if not stats: return await interaction.response.send_message(f"{target.mention} 尚未註冊！", ephemeral=True)
+    
+    bal, total_games, wins, total_profit = stats
+    win_rate = (wins / total_games * 100) if total_games > 0 else 0
+    
+    embed = discord.Embed(title="📊 玩家戰績與收益", color=0x2b2d31)
+    embed.description = f"**{target.mention}** 的統計資料\n"
+    embed.add_field(name="💰 目前餘額", value=f"`{bal}` 東雲幣", inline=False)
+    embed.add_field(name="📈 歷史總獲利", value=f"`{total_profit}` 東雲幣", inline=False)
+    embed.add_field(name="🎲 總遊玩局數", value=f"`{total_games}` 局", inline=True)
+    embed.add_field(name="🏆 勝率", value=f"`{win_rate:.1f}%` ({wins}勝)", inline=True)
+    
     await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="leaderboard", description="查看全伺服器最富有的前 10 名玩家")
