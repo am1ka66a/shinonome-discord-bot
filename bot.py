@@ -162,8 +162,8 @@ class SetupView(discord.ui.View):
         stats = get_user_stats(self.user.id)
         embed = discord.Embed(title="🃏 21點 — 下注設定", color=0x2b2d31)
         embed.description = f"{'❌ ' + err + '\n' if err else ''}主注：`{self.base_bet}`\n旁注剩餘額度：**`{self.max_side - (self.p_bet + self.s_bet)}`**\n你的餘額：`{stats[0]}`"
-        embed.add_field(name="🧧 對子", value=f"`{self.p_bet}`", inline=True)
-        embed.add_field(name="🎯 21+3", value=f"`{self.s_bet}`", inline=True)
+        embed.add_field(name="🧧 對子旁注 (賠率: 同花30倍/混合5倍)", value=f"`{self.p_bet}`", inline=False)
+        embed.add_field(name="🎯 21+3旁注 (賠率: 順/同花/三條 5~50倍)", value=f"`{self.s_bet}`", inline=False)
         return embed
 
     @discord.ui.button(label="自訂下注金額", style=discord.ButtonStyle.primary)
@@ -259,6 +259,32 @@ class BlackjackGame(discord.ui.View):
         if inter.user.id != self.user.id: return
         await self.end(inter, "投降輸一半", -(self.bet//2))
 
+class ConfirmAllInView(discord.ui.View):
+    def __init__(self, user, parent_msg):
+        super().__init__(timeout=30)
+        self.user = user
+        self.parent_msg = parent_msg
+
+    @discord.ui.button(label="確定 All In！", style=discord.ButtonStyle.danger)
+    async def confirm(self, inter, btn):
+        if inter.user.id != self.user.id: return
+        self.stop()
+        try: await self.parent_msg.delete()
+        except: pass
+        stats = get_user_stats(self.user.id)
+        if stats[0] < 100:
+            return await inter.response.edit_message(content="餘額不足 100，無法遊戲", view=None)
+        
+        setup = SetupView(self.user, stats[0], 0, 0)
+        await inter.channel.send(embed=setup.build_embed(), view=setup)
+        await inter.response.edit_message(content="✅ 已進入 All In 模式", view=None)
+
+    @discord.ui.button(label="取消", style=discord.ButtonStyle.secondary)
+    async def cancel(self, inter, btn):
+        if inter.user.id != self.user.id: return
+        self.stop()
+        await inter.response.edit_message(content="❌ 已取消", view=None)
+
 class NewGameView(discord.ui.View):
     def __init__(self, user, last_bet, last_p_bet, last_s_bet, bal):
         super().__init__(timeout=90)
@@ -272,15 +298,19 @@ class NewGameView(discord.ui.View):
         setup = SetupView(self.user, self.last_bet, self.last_p_bet, self.last_s_bet)
         await inter.channel.send(embed=setup.build_embed(), view=setup)
 
-    @discord.ui.button(label="All In (全押)", style=discord.ButtonStyle.danger)
-    async def all_in(self, inter, btn):
+    @discord.ui.button(label="雙倍再局 (Double)", style=discord.ButtonStyle.primary)
+    async def double_again(self, inter, btn):
         if inter.user.id != self.user.id: return
         self.stop(); await inter.message.delete()
-        stats = get_user_stats(self.user.id)
-        if stats[0] < 100:
-            return await inter.channel.send("餘額不足 100，無法遊戲")
-        setup = SetupView(self.user, stats[0], 0, 0)
+        new_bet = self.last_bet * 2
+        setup = SetupView(self.user, new_bet, self.last_p_bet, self.last_s_bet)
         await inter.channel.send(embed=setup.build_embed(), view=setup)
+
+    @discord.ui.button(label="All In (全押主注)", style=discord.ButtonStyle.danger)
+    async def all_in(self, inter, btn):
+        if inter.user.id != self.user.id: return
+        cv = ConfirmAllInView(self.user, inter.message)
+        await inter.response.send_message("⚠️ 警告：你確定要把所有的財產全部押在主注嗎？輸了就什麼都沒了喔！", view=cv, ephemeral=True)
 
 # ==========================================
 # 🤖 4. 指令系統
@@ -321,5 +351,21 @@ async def lock(ctx):
     global IS_EVENT_ACTIVE
     IS_EVENT_ACTIVE = not IS_EVENT_ACTIVE
     await ctx.send(f"賭場狀態：{'營業中' if IS_EVENT_ACTIVE else '已打烊'}")
+
+@bot.command()
+@is_host()
+async def resetall_zero(ctx):
+    conn = get_db_connection(); c = conn.cursor()
+    c.execute("UPDATE users SET balance=0")
+    conn.commit(); conn.close()
+    await ctx.send("💥 老闆發威：所有人的餘額已經被**全部歸零**！")
+
+@bot.command()
+@is_host()
+async def resetall_default(ctx):
+    conn = get_db_connection(); c = conn.cursor()
+    c.execute("UPDATE users SET balance=50000, rescue_count=0, total_games=0, wins=0, total_profit=0")
+    conn.commit(); conn.close()
+    await ctx.send("🔄 已經為所有人重新發放 50,000 啟動資金，且重置所有戰績。")
 
 bot.run(os.getenv('DISCORD_TOKEN'))
