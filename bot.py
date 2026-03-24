@@ -16,10 +16,9 @@ ALLOWED_HOST_IDS = [531308526262550528]  # ⚠️ 填入你的 Discord ID
 SIDE_BET_RATIO = 0.5                     # 側注上限 (主注的 50%)
 IS_EVENT_ACTIVE = True                   # 賭場狀態
 
-def is_app_host():
-    def predicate(interaction: discord.Interaction) -> bool:
-        return interaction.user.id in ALLOWED_HOST_IDS
-    return app_commands.check(predicate)
+def is_host():
+    def predicate(ctx): return ctx.author.id in ALLOWED_HOST_IDS
+    return commands.check(predicate)
 
 # ==========================================
 # 🗄️ 1. 資料庫系統 (MySQL)
@@ -373,54 +372,53 @@ async def leaderboard(interaction: discord.Interaction):
     await interaction.response.send_message(embed=discord.Embed(title="🏆 排行榜", description=msg))
 
 # --- 管理員指令 ---
-@bot.tree.command(name="give", description="[管理員] 發錢給指定玩家")
-@is_app_host()
-@app_commands.describe(member="要發放的對象", amount="要發放的金額")
-async def give(interaction: discord.Interaction, member: discord.Member, amount: int):
-    if amount <= 0: return await interaction.response.send_message("金額必須大於 0", ephemeral=True)
+@bot.command()
+@is_host()
+async def give(ctx, member: discord.Member, amount: int):
+    if amount <= 0: return await ctx.send("金額必須大於 0")
     conn = get_db_connection(); c = conn.cursor()
     c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (amount, str(member.id)))
     if c.rowcount == 0: c.execute("INSERT IGNORE INTO users (user_id, balance) VALUES (%s, %s)", (str(member.id), amount))
     conn.commit(); conn.close()
-    await interaction.response.send_message(f"💸 已成功發放 **{amount}** 幣給 {member.mention}！")
+    await ctx.send(f"💸 已成功發放 **{amount}** 幣給 {member.mention}！")
 
-@bot.tree.command(name="ban", description="[管理員] 將玩家加入黑名單")
-@is_app_host()
-async def ban(interaction: discord.Interaction, member: discord.Member):
+@bot.command()
+@is_host()
+async def ban(ctx, member: discord.Member):
     conn = get_db_connection(); c = conn.cursor()
     c.execute("INSERT IGNORE INTO blacklist (user_id) VALUES (%s)", (str(member.id),))
     conn.commit(); conn.close()
-    await interaction.response.send_message(f"⛔ {member.mention} 已被列入黑名單，無法再參與遊戲！")
+    await ctx.send(f"⛔ {member.mention} 已被列入黑名單，無法再參與遊戲！")
 
-@bot.tree.command(name="unban", description="[管理員] 將玩家從黑名單移除")
-@is_app_host()
-async def unban(interaction: discord.Interaction, member: discord.Member):
+@bot.command()
+@is_host()
+async def unban(ctx, member: discord.Member):
     conn = get_db_connection(); c = conn.cursor()
     c.execute("DELETE FROM blacklist WHERE user_id=%s", (str(member.id),))
     conn.commit(); conn.close()
-    await interaction.response.send_message(f"✅ {member.mention} 已從黑名單移除！")
+    await ctx.send(f"✅ {member.mention} 已從黑名單移除！")
 
-@bot.tree.command(name="lock", description="[管理員] 開關賭場營業狀態")
-@is_app_host()
-async def lock(interaction: discord.Interaction):
+@bot.command()
+@is_host()
+async def lock(ctx):
     global IS_EVENT_ACTIVE
     IS_EVENT_ACTIVE = not IS_EVENT_ACTIVE
-    await interaction.response.send_message(f"賭場狀態：{'營業中' if IS_EVENT_ACTIVE else '已打烊'}")
+    await ctx.send(f"賭場狀態：{'營業中' if IS_EVENT_ACTIVE else '已打烊'}")
 
-@bot.tree.command(name="resetall_zero", description="[管理員] 將所有人的餘額歸零")
-@is_app_host()
-async def resetall_zero(interaction: discord.Interaction):
+@bot.command()
+@is_host()
+async def resetall_zero(ctx):
     conn = get_db_connection(); c = conn.cursor()
     c.execute("UPDATE users SET balance=0")
     conn.commit(); conn.close()
-    await interaction.response.send_message("💥 老闆發威：所有人的餘額已經被**全部歸零**！")
+    await ctx.send("💥 老闆發威：所有人的餘額已經被**全部歸零**！")
 
-@bot.tree.command(name="resetall_default", description="[管理員] 重置所有人戰績並發放 50000 幣")
-@is_app_host()
-async def resetall_default(interaction: discord.Interaction):
+@bot.command()
+@is_host()
+async def resetall_default(ctx):
     conn = get_db_connection(); c = conn.cursor()
     c.execute("UPDATE users SET balance=50000, rescue_count=0, total_games=0, wins=0, total_profit=0")
     conn.commit(); conn.close()
-    await interaction.response.send_message("🔄 已經為所有人重新發放 50,000 啟動資金，且重置所有戰績。")
+    await ctx.send("🔄 已經為所有人重新發放 50,000 啟動資金，且重置所有戰績。")
 
 bot.run(os.getenv('DISCORD_TOKEN'))
