@@ -171,8 +171,8 @@ class SetupView(discord.ui.View):
         stats = get_user_stats(self.user.id)
         embed = discord.Embed(title="🃏 21點 — 下注設定", color=0x2b2d31)
         embed.description = f"{'❌ ' + err + '\n' if err else ''}主注：`{self.base_bet}`\n旁注剩餘額度：**`{self.max_side - (self.p_bet + self.s_bet)}`**\n你的餘額：`{stats[0]}`"
-        embed.add_field(name="🧧 對子旁注 (賠率: 同花30倍/混合5倍)", value=f"`{self.p_bet}`", inline=False)
-        embed.add_field(name="🎯 21+3旁注 (賠率: 順/同花/三條 5~50倍)", value=f"`{self.s_bet}`", inline=False)
+        embed.add_field(name="🧧 對子旁注", value=f"下注金額：`{self.p_bet}`\n**同花對子**: 30倍\n**混合對子**: 5倍", inline=True)
+        embed.add_field(name="🎯 21+3旁注", value=f"下注金額：`{self.s_bet}`\n**同花三條**: 50倍\n**同花順**: 25倍\n**三條**: 25倍\n**順子**: 10倍\n**同花**: 5倍", inline=True)
         return embed
 
     @discord.ui.button(label="自訂下注金額", style=discord.ButtonStyle.primary)
