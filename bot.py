@@ -41,6 +41,14 @@ def init_db():
     conn.commit()
     conn.close()
 
+def is_blacklisted(user_id):
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT 1 FROM blacklist WHERE user_id=%s", (str(user_id),))
+    res = c.fetchone()
+    conn.close()
+    return res is not None
+
 def get_user_stats(user_id):
     conn = get_db_connection()
     c = conn.cursor()
@@ -323,18 +331,31 @@ async def on_ready(): init_db(); print(f"✅ {bot.user} 啟動")
 
 @bot.command(aliases=['註冊'])
 async def register(ctx):
+    if is_blacklisted(ctx.author.id): return await ctx.send("🚫 黑名單玩家無法註冊！")
     conn = get_db_connection(); c = conn.cursor()
     c.execute("INSERT IGNORE INTO users (user_id, balance) VALUES (%s, 50000)", (str(ctx.author.id),))
+    if c.rowcount == 0:
+        await ctx.send(f"⚠️ {ctx.author.mention} 你已經註冊過了！")
+    else:
+        await ctx.send(f"🎉 {ctx.author.mention} 註冊成功，獲得 50,000 幣！")
     conn.commit(); conn.close()
-    await ctx.send(f"🎉 {ctx.author.mention} 註冊成功，獲得 50,000 幣！")
 
 @bot.command()
 async def bj(ctx, bet: int = 1000):
     if not IS_EVENT_ACTIVE: return await ctx.send("打烊了")
+    if is_blacklisted(ctx.author.id): return await ctx.send("🚫 你已被列入黑名單，無法參與遊戲！")
     if bet < 100: return await ctx.send("低消 100")
-    if get_user_stats(ctx.author.id) is None: return await ctx.send("請先註冊")
+    if get_user_stats(ctx.author.id) is None: return await ctx.send("請先使用 !註冊 獲取啟動資金")
     sv = SetupView(ctx.author, bet)
     await ctx.send(embed=sv.build_embed(), view=sv)
+
+@bot.command(aliases=['bal', '餘額'])
+async def balance(ctx, member: discord.Member = None):
+    target = member or ctx.author
+    stats = get_user_stats(target.id)
+    if not stats: return await ctx.send(f"{target.mention} 尚未註冊！")
+    embed = discord.Embed(title="💰 帳戶餘額", description=f"{target.mention} 目前擁有 **{stats[0]}** 幣", color=0x2b2d31)
+    await ctx.send(embed=embed)
 
 @bot.command(aliases=['lb'])
 async def leaderboard(ctx):
@@ -345,6 +366,32 @@ async def leaderboard(ctx):
     await ctx.send(embed=discord.Embed(title="🏆 排行榜", description=msg))
 
 # --- 管理員指令 ---
+@bot.command()
+@is_host()
+async def give(ctx, member: discord.Member, amount: int):
+    if amount <= 0: return await ctx.send("金額必須大於 0")
+    conn = get_db_connection(); c = conn.cursor()
+    c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (amount, str(member.id)))
+    if c.rowcount == 0: c.execute("INSERT IGNORE INTO users (user_id, balance) VALUES (%s, %s)", (str(member.id), amount))
+    conn.commit(); conn.close()
+    await ctx.send(f"💸 已成功發放 **{amount}** 幣給 {member.mention}！")
+
+@bot.command()
+@is_host()
+async def ban(ctx, member: discord.Member):
+    conn = get_db_connection(); c = conn.cursor()
+    c.execute("INSERT IGNORE INTO blacklist (user_id) VALUES (%s)", (str(member.id),))
+    conn.commit(); conn.close()
+    await ctx.send(f"⛔ {member.mention} 已被列入黑名單，無法再參與遊戲！")
+
+@bot.command()
+@is_host()
+async def unban(ctx, member: discord.Member):
+    conn = get_db_connection(); c = conn.cursor()
+    c.execute("DELETE FROM blacklist WHERE user_id=%s", (str(member.id),))
+    conn.commit(); conn.close()
+    await ctx.send(f"✅ {member.mention} 已從黑名單移除！")
+
 @bot.command()
 @is_host()
 async def lock(ctx):
