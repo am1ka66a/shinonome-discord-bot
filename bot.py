@@ -116,36 +116,59 @@ def check_sidebets(player_hand, dealer_up, p_bet, s_bet):
 # ==========================================
 # 🖼️ 3. 遊戲 UI 區塊
 # ==========================================
+class BetModal(discord.ui.Modal, title='自訂下注金額'):
+    def __init__(self, view):
+        super().__init__()
+        self.view = view
+        self.b_input = discord.ui.TextInput(label='主注 (最低 100)', default=str(view.base_bet), required=True)
+        self.p_input = discord.ui.TextInput(label='對子旁注', default=str(view.p_bet), required=False)
+        self.s_input = discord.ui.TextInput(label='21+3旁注', default=str(view.s_bet), required=False)
+        self.add_item(self.b_input)
+        self.add_item(self.p_input)
+        self.add_item(self.s_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            b = int(self.b_input.value)
+            p = int(self.p_input.value or 0)
+            s = int(self.s_input.value or 0)
+            if b < 100 or p < 0 or s < 0: raise ValueError
+        except ValueError:
+            return await interaction.response.send_message("請輸入有效正整數 (主注最低 100)", ephemeral=True)
+            
+        max_side = int(b * SIDE_BET_RATIO)
+        if p + s > max_side:
+            return await interaction.response.send_message(f"旁注總和 ({p+s}) 不能超過主注的 {int(SIDE_BET_RATIO*100)}% ({max_side})", ephemeral=True)
+            
+        stats = get_user_stats(self.view.user.id)
+        if stats[0] < (b + p + s):
+            return await interaction.response.send_message(f"餘額不足！你目前有 {stats[0]} 幣", ephemeral=True)
+
+        self.view.base_bet = b
+        self.view.max_side = max_side
+        self.view.p_bet = p
+        self.view.s_bet = s
+        await interaction.response.edit_message(embed=self.view.build_embed(), view=self.view)
+
 class SetupView(discord.ui.View):
-    def __init__(self, user, base_bet):
+    def __init__(self, user, base_bet, p_bet=0, s_bet=0):
         super().__init__(timeout=90)
         self.user, self.base_bet = user, base_bet
-        self.p_bet, self.s_bet = 0, 0
+        self.p_bet, self.s_bet = p_bet, s_bet
         self.max_side = int(base_bet * SIDE_BET_RATIO)
 
     def build_embed(self, err=""):
         stats = get_user_stats(self.user.id)
-        embed = discord.Embed(title="🃏 21點 — 旁注設定", color=0x2b2d31)
-        embed.description = f"{'❌ ' + err + '\n' if err else ''}主注：`{self.base_bet}`\n旁注剩餘額度：**`{self.max_side - (self.p_bet + self.s_bet)}`**"
+        embed = discord.Embed(title="🃏 21點 — 下注設定", color=0x2b2d31)
+        embed.description = f"{'❌ ' + err + '\n' if err else ''}主注：`{self.base_bet}`\n旁注剩餘額度：**`{self.max_side - (self.p_bet + self.s_bet)}`**\n你的餘額：`{stats[0]}`"
         embed.add_field(name="🧧 對子", value=f"`{self.p_bet}`", inline=True)
         embed.add_field(name="🎯 21+3", value=f"`{self.s_bet}`", inline=True)
         return embed
 
-    @discord.ui.button(label="對子 +200", style=discord.ButtonStyle.primary)
-    async def add_p(self, inter, btn):
+    @discord.ui.button(label="自訂下注金額", style=discord.ButtonStyle.primary)
+    async def custom_bet(self, inter, btn):
         if inter.user.id != self.user.id: return
-        if self.p_bet + self.s_bet + 200 > self.max_side:
-            return await inter.response.edit_message(embed=self.build_embed("超過旁注上限"))
-        self.p_bet += 200
-        await inter.response.edit_message(embed=self.build_embed())
-
-    @discord.ui.button(label="21+3 +200", style=discord.ButtonStyle.primary)
-    async def add_s(self, inter, btn):
-        if inter.user.id != self.user.id: return
-        if self.p_bet + self.s_bet + 200 > self.max_side:
-            return await inter.response.edit_message(embed=self.build_embed("超過旁注上限"))
-        self.s_bet += 200
-        await inter.response.edit_message(embed=self.build_embed())
+        await inter.response.send_modal(BetModal(self))
 
     @discord.ui.button(label="開始遊戲", style=discord.ButtonStyle.success)
     async def start(self, inter, btn):
@@ -187,7 +210,7 @@ class BlackjackGame(discord.ui.View):
     async def end(self, inter, res, prof, win=False):
         for c in self.children: c.disabled = True
         update_game_result(self.user.id, prof, win)
-        nv = NewGameView(self.user, self.bet, get_user_stats(self.user.id)[0])
+        nv = NewGameView(self.user, self.bet, self.p_bet, self.s_bet, get_user_stats(self.user.id)[0])
         await inter.response.edit_message(embed=self.build_embed(True, res, prof), view=nv)
 
     @discord.ui.button(label="要牌", style=discord.ButtonStyle.success)
@@ -216,14 +239,26 @@ class BlackjackGame(discord.ui.View):
         await self.end(inter, "投降輸一半", -(self.bet//2))
 
 class NewGameView(discord.ui.View):
-    def __init__(self, user, last_bet, bal):
+    def __init__(self, user, last_bet, last_p_bet, last_s_bet, bal):
         super().__init__(timeout=90)
         self.user, self.last_bet, self.bal = user, last_bet, bal
+        self.last_p_bet, self.last_s_bet = last_p_bet, last_s_bet
+
     @discord.ui.button(label="再一局", style=discord.ButtonStyle.success)
     async def again(self, inter, btn):
         if inter.user.id != self.user.id: return
         self.stop(); await inter.message.delete()
-        setup = SetupView(self.user, self.last_bet)
+        setup = SetupView(self.user, self.last_bet, self.last_p_bet, self.last_s_bet)
+        await inter.channel.send(embed=setup.build_embed(), view=setup)
+
+    @discord.ui.button(label="All In (全押)", style=discord.ButtonStyle.danger)
+    async def all_in(self, inter, btn):
+        if inter.user.id != self.user.id: return
+        self.stop(); await inter.message.delete()
+        stats = get_user_stats(self.user.id)
+        if stats[0] < 100:
+            return await inter.channel.send("餘額不足 100，無法遊戲")
+        setup = SetupView(self.user, stats[0], 0, 0)
         await inter.channel.send(embed=setup.build_embed(), view=setup)
 
 # ==========================================
