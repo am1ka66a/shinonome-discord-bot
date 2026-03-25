@@ -443,7 +443,8 @@ class BlackjackGame(discord.ui.View):
         fp    = self.get_image_file(done, animating)
         if fp:
             embed.set_image(url="attachment://hand.png")
-            await msg.edit(embed=embed, view=view, attachments=[fp])
+            # Message.edit() 用 files= 上傳新附件，attachments=[] 清除舊的
+            await msg.edit(embed=embed, view=view, files=[fp], attachments=[])
         else:
             await msg.edit(embed=embed, view=view)
 
