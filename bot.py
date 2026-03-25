@@ -111,16 +111,36 @@ _CARD_MAP = {
     'Q':  {'♠': '🂭', '♥': '🂽', '♦': '🃍', '♣': '🃝'},
     'K':  {'♠': '🂮', '♥': '🂾', '♦': '🃎', '♣': '🃞'},
 }
-CARD_BACK = '**？** 🂠'  # 牌背面
+# 跨伺服器 Emoji 快取：{ 'sp_A': '<:sp_A:123456..>', ... }
+_emoji_cache: dict = {}
 
-def card_to_emoji(card):
-    """跨平台卡牌顯示：粗體點數 + 滿尺寸花色 emoji
-    桌機：♠️♥️♦️♣️ 渲染成大型 emoji，視覺清晰
-    手機：同樣完整支援，在 iOS 會額外顯示精美花色圖示
+def load_emoji_cache(bot_instance):
+    """掃描 Bot 所在的所有伺服器，建立卡牌 Emoji 快取"""
+    _emoji_cache.clear()
+    prefixes = ('sp_', 'cu_', 'lo_', 'pb_')
+    for guild in bot_instance.guilds:
+        for emoji in guild.emojis:
+            if emoji.name.startswith(prefixes) or emoji.name == 'card_back':
+                if emoji.name not in _emoji_cache:
+                    _emoji_cache[emoji.name] = str(emoji)  # '<:name:id>'
+    print(f"[Emoji] Loaded {len(_emoji_cache)}/53 card emojis from {len(bot_instance.guilds)} guild(s)")
+
+def card_back_emoji() -> str:
+    return _emoji_cache.get('card_back', '\U0001f0a0')  # fallback: 🂠
+
+def card_to_emoji(card) -> str:
+    """使用伺服器自定義 Emoji 顯示卡牌（跨伺服器完整 ID 格式）
+    需先上傳 Emoji 到 Bot 所在的任一伺服器，命名規則：
+    sp_A, sp_2...sp_K  (♠️ 黑桃)
+    cu_A, cu_2...cu_K  (♥️ 紅心)
+    lo_A, lo_2...lo_K  (♦️ 方塊)
+    pb_A, pb_2...pb_K  (♣️ 梅花)
     """
-    rank = card['rank']
-    suit = card['suit']  # ♠️ ♥️ ♦️ ♣️ (含 variation selector，各平台皆支援)
-    return f"**{rank}** {suit}"
+    _SUIT_MAP = {'\u2660': 'sp', '\u2665': 'cu', '\u2666': 'lo', '\u2663': 'pb'}
+    suit = _SUIT_MAP.get(card['suit'].replace('\ufe0f', ''), 'sp')
+    key  = f"{suit}_{card['rank']}"
+    # 有快取就用完整 <:name:id>，跨伺服器都能顯示；沒有就退回文字
+    return _emoji_cache.get(key, f"**{card['rank']}** {card['suit']}")
 
 # ==========================================
 # 🖼️ 卡牌圖片系統 (GitHub CDN + Pillow)
@@ -364,31 +384,21 @@ class BlackjackGame(discord.ui.View):
         for i, hand in enumerate(self.hands):
             indicator = "👉 " if i == self.current_hand and not done else ""
             title_text = f"{indicator}👤 {self.user.display_name} 的手牌 (第 {i+1} 手)" if len(self.hands)>1 else f"{indicator}👤 {self.user.display_name} 的手牌"
-            # 如果沒有圖片大豐就顯示文字牌
-            if not _card_cache:
-                p_cards = ' '.join([card_to_emoji(c) for c in hand])
-                embed.add_field(name=title_text, value=f"{p_cards}\n點數：{calculate_score(hand)}", inline=False)
-            else:
-                embed.add_field(name=title_text, value=f"點數：{calculate_score(hand)}", inline=False)
+            p_cards = ' '.join([card_to_emoji(c) for c in hand])
+            embed.add_field(name=title_text, value=f"{p_cards}\n點數：{calculate_score(hand)}", inline=False)
         if done or animating:
-            if not _card_cache:
-                d_cards = ' '.join([card_to_emoji(c) for c in self.d_hand])
-                embed.add_field(name="🤖 莊家手牌", value=f"{d_cards}\n點數：{calculate_score(self.d_hand)}", inline=False)
-            else:
-                embed.add_field(name="🤖 莊家手牌", value=f"點數：{calculate_score(self.d_hand)}", inline=False)
+            d_cards = ' '.join([card_to_emoji(c) for c in self.d_hand])
+            embed.add_field(name="🤖 莊家手牌", value=f"{d_cards}\n點數：{calculate_score(self.d_hand)}", inline=False)
             if done:
                 total_profit = profit + self.side_p
                 res_text = f"**{res}**\n{self.side_m}\n"
                 if total_profit > 0: res_text += f"\n📈 本局總計：`+{total_profit}` 東雲幣"
                 elif total_profit < 0: res_text += f"\n📉 本局總計：`{total_profit}` 東雲幣"
-                else: res_text += f"\n➖ 本局無輸赏"
+                else: res_text += f"\n➖ 本局無輸贏"
                 res_text += f"\n💰 最新餘額：`{bal}` 東雲幣"
                 embed.add_field(name="🏆 結果", value=res_text, inline=False)
         else:
-            if not _card_cache:
-                embed.add_field(name="🤖 莊家手牌", value=f"{card_to_emoji(self.d_hand[0])} {CARD_BACK}\n點數：❓", inline=False)
-            else:
-                embed.add_field(name="🤖 莊家手牌", value="點數：❓", inline=False)
+            embed.add_field(name="🤖 莊家手牌", value=f"{card_to_emoji(self.d_hand[0])} {card_back_emoji()}\n點數：❓", inline=False)
         return embed
 
     def get_image_file(self, done=False, animating=False):
@@ -733,8 +743,14 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 async def on_ready():
     init_db()
     await bot.tree.sync()
-    asyncio.create_task(preload_card_images())  # 從 GitHub 預載全部卡牌圖片
+    load_emoji_cache(bot)               # 掃描所有伺服器的卡牌 Emoji
+    asyncio.create_task(preload_card_images())  # 從 GitHub 預載圖片（備用）
     print(f"{bot.user} 啟動並已同步斜線指令")
+
+@bot.event
+async def on_guild_emojis_update(guild, before, after):
+    """任何伺服器的 Emoji 更新時自動重新掃描"""
+    load_emoji_cache(bot)
 
 @bot.tree.command(name="register", description="註冊你的帳號並獲得 50,000 啟動資金")
 async def register(interaction: discord.Interaction):
