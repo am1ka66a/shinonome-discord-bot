@@ -820,6 +820,26 @@ async def bj(interaction: discord.Interaction, bet: int = 1000):
     sv = SetupView(interaction.user, bet)
     await interaction.response.send_message(embed=sv.build_embed(), view=sv)
 
+@bot.tree.command(name="test_emojis", description="[測試] 顯示目前讀取到的全部 53 張撲克牌圖片功能是否正常")
+async def test_emojis(interaction: discord.Interaction):
+    # 產生一副新牌
+    deck = get_deck(1)
+    
+    spades = [c for c in deck if c['suit'] == '♠️']
+    hearts = [c for c in deck if c['suit'] == '♥️']
+    diamonds = [c for c in deck if c['suit'] == '♦️']
+    clubs = [c for c in deck if c['suit'] == '♣️']
+    
+    msg = "**♠️ 黑桃:** " + " ".join([card_to_emoji(c) for c in spades]) + "\n\n"
+    msg += "**♥️ 紅心:** " + " ".join([card_to_emoji(c) for c in hearts]) + "\n\n"
+    msg += "**♦️ 方塊:** " + " ".join([card_to_emoji(c) for c in diamonds]) + "\n\n"
+    msg += "**♣️ 梅花:** " + " ".join([card_to_emoji(c) for c in clubs]) + "\n\n"
+    msg += "**🃏 牌背:** " + card_back_emoji()
+    
+    embed = discord.Embed(title="🃏 撲克牌 Emoji 測試清單", description=msg, color=0x2b2d31)
+    embed.set_footer(text="如果某些牌顯示文字或破圖，代表該圖尚未被快取或檔名錯誤")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
 @bot.tree.command(name="balance", description="查詢個人的戰績與餘額")
 @app_commands.describe(member="你想查詢的對象 (選填)")
 async def balance(interaction: discord.Interaction, member: discord.Member = None):
