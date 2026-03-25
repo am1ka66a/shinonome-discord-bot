@@ -6,8 +6,6 @@ import pymysql
 import os
 import asyncio
 import datetime
-from io import BytesIO
-from PIL import Image as PILImage
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -111,82 +109,21 @@ _CARD_MAP = {
     'Q':  {'♠': '🂭', '♥': '🂽', '♦': '🃍', '♣': '🃝'},
     'K':  {'♠': '🂮', '♥': '🂾', '♦': '🃎', '♣': '🃞'},
 }
-# 跨伺服器 Emoji 快取：{ 'sp_A': '<:sp_A:123456..>', ... }
-_emoji_cache: dict = {}
-
-import json
-
-def load_emoji_cache(bot_instance):
-    """掃描 Bot 建立卡牌 Emoji 快取，並輸出成檔案鎖定代碼（防止未來撞名）"""
-    _emoji_cache.clear()
-    
-    # 如果已經鎖定過代碼，直接載入絕對不會撞名的對照表
-    if os.path.exists("emojis.json"):
-        with open("emojis.json", "r", encoding="utf-8") as f:
-            data = json.load(f)
-            _emoji_cache.update(data)
-        print(f"[Emoji] 成功從 emojis.json 載入鎖定的表符代碼，防撞名模式啟動！")
-        return
-
-    # 初次啟動：因為目前你的 bot 只有在私人群，可以直接掃描所有群組並記錄代碼
-    for guild in bot_instance.guilds:
-        for emoji in guild.emojis:
-            if emoji.name not in _emoji_cache:
-                _emoji_cache[emoji.name] = str(emoji)  # 格式如 '<:AS:123456789>'
-                
-    # 存檔鎖定！未來就算加了新伺服器，也會只讀取這份 json 檔案
-    try:
-        with open("emojis.json", "w", encoding="utf-8") as f:
-            json.dump(_emoji_cache, f, ensure_ascii=False, indent=4)
-        print(f"[Emoji] 成功將 {len(_emoji_cache)} 個表符代碼鎖定並儲存至 emojis.json！")
-    except Exception as e:
-        print(f"[Emoji] 無法寫入 emojis.json: {e}")
+# ==========================================
+# 🖼️ 卡牌顯示系統 (Discord 內建 Unicode Emoji)
+# ==========================================
 
 def card_back_emoji() -> str:
-    return _emoji_cache.get('BK', _emoji_cache.get('back', '\U0001f0a0'))
+    return '🃏'  # 原有的牌背符號，使用小丑完美還原
 
 def card_to_emoji(card) -> str:
-    _RANK_CODE = {'A':'A','2':'2','3':'3','4':'4','5':'5','6':'6',
-                  '7':'7','8':'8','9':'9','10':'0','J':'J','Q':'Q','K':'K'}
-    _SUIT_CODE = {'\u2660':'S','\u2665':'H','\u2666':'D','\u2663':'C'}
+    """完美還原極簡風格：直接使用 Discord 內建高品質的撲克牌 Unicode Emoji"""
     suit = card['suit'].replace('\ufe0f', '')
-    key = _RANK_CODE.get(card['rank'], '?') + _SUIT_CODE.get(suit, 'S')
-    return _emoji_cache.get(key, f"**{card['rank']}** {card['suit']}")
+    return _CARD_MAP.get(card['rank'], {}).get(suit, f"**{card['rank']}** {suit}")
 
-# ==========================================
-# 🖼️ 卡牌圖片系統 (讀取本地端 cards/ 資料夾 + Pillow)
-# ==========================================
-CARD_THUMB_SIZE = (88, 124)   # (W, H) 縮圖尺寸
-_card_cache: dict = {}         # { 'AS': PILImage, 'back': PILImage, ... }
+# 不需要再從 _emoji_cache 裡拿了
 
-_RANK_CODE = {'A':'A','2':'2','3':'3','4':'4','5':'5','6':'6',
-              '7':'7','8':'8','9':'9','10':'0','J':'J','Q':'Q','K':'K'}
-_SUIT_CODE = {'\u2660':'S','\u2665':'H','\u2666':'D','\u2663':'C'}
 
-def _card_to_code(card: dict) -> str:
-    """Convert card dict to filename code, e.g. 'AS', '0H', 'back'"""
-    suit = card['suit'].replace('\ufe0f', '')
-    return _RANK_CODE.get(card['rank'], '?') + _SUIT_CODE.get(suit, 'S')
-
-def preload_card_images():
-    """啟動時將所有 53 張卡牌 PNG 讀到記憶體快取，使用本地檔案，速度快且不受網路影響"""
-    codes = [r+s for r in 'A23456789' for s in 'SHDC'] \
-          + ['0'+s for s in 'SHDC'] \
-          + [r+s for r in ['J','Q','K'] for s in 'SHDC'] \
-          + ['back']
-    
-    loaded_count = 0
-    for code in codes:
-        try:
-            path = os.path.join('cards', f"{code}.png")
-            if os.path.exists(path):
-                img = PILImage.open(path).convert('RGBA')
-                _card_cache[code] = img.resize(CARD_THUMB_SIZE, PILImage.LANCZOS)
-                loaded_count += 1
-        except Exception as e:
-            print(f"[Card] 無法載入本地圖片 {code}.png: {e}")
-            
-    print(f"[Cards] 成功從本地 cards/ 資料夾載入 {loaded_count}/53 張圖片快取")
 
 async def _send_game(channel, gv: 'BlackjackGame') -> discord.Message:
     """Send a new game message, attaching the card image if available."""
@@ -410,66 +347,7 @@ class BlackjackGame(discord.ui.View):
             embed.add_field(name="🤖 莊家手牌", value=f"{card_to_emoji(self.d_hand[0])} {card_back_emoji()}\n點數：❓", inline=False)
         return embed
 
-    def get_image_file(self, done=False, animating=False):
-        """Generate composite card image; returns discord.File or None."""
-        if not _card_cache:
-            return None
-        W, H = CARD_THUMB_SIZE
-        PAD, GAP = 5, 10
 
-        def make_row(codes, append_back=False):
-            n = len(codes) + (1 if append_back else 0)
-            if n == 0: return None
-            row = PILImage.new('RGBA', (n*(W+PAD)-PAD, H), (0,0,0,0))
-            x = 0
-            for code in codes:
-                img = _card_cache.get(code)
-                if img: row.paste(img, (x, 0), img)
-                x += W + PAD
-            if append_back:
-                bk = _card_cache.get('back')
-                if bk: row.paste(bk, (x, 0), bk)
-            return row
-
-        rows = []
-        for hand in self.hands:
-            r = make_row([_card_to_code(c) for c in hand])
-            if r: rows.append(r)
-        d_codes = [_card_to_code(c) for c in self.d_hand]
-        if done or animating:
-            dr = make_row(d_codes)
-        else:
-            dr = make_row([d_codes[0]], append_back=True)
-        if dr: rows.append(dr)
-        if not rows: return None
-
-        max_w  = max(r.width for r in rows)
-        total_h = sum(r.height for r in rows) + GAP*(len(rows)-1) + PAD*2
-        out = PILImage.new('RGBA', (max_w+PAD*2, total_h), (0,0,0,0))
-        y = PAD
-        for row in rows:
-            out.paste(row, (PAD, y), row)
-            y += row.height + GAP
-        fp = BytesIO()
-        out.save(fp, 'PNG')
-        fp.seek(0)
-        return discord.File(fp, filename="hand.png")
-
-    async def _edit(self, msg, done=False, res="", profit=0, animating=False, extra_msg="", view=None):
-        """Edit message with embed + card image. Falls back to text if image fails."""
-        embed = self.build_embed(done, res, profit, animating, extra_msg)
-        view  = view if view is not None else self
-        fp    = self.get_image_file(done, animating)
-        if fp:
-            embed.set_image(url="attachment://hand.png")
-            try:
-                # discord.py 2.x: files= 新增附件，attachments=[] 移除舊附件
-                await msg.edit(embed=embed, view=view, files=[fp], attachments=[])
-                return
-            except Exception as e:
-                print(f"[Card] Image upload failed: {e}, falling back to text")
-        # Fallback: 純文字模式（圖片失敗時不卡住遊戲）
-        await msg.edit(embed=embed, view=view)
 
     async def check_auto_bj(self, message):
         if calculate_score(self.p_hand) == 21:
@@ -582,12 +460,7 @@ class BlackjackGame(discord.ui.View):
             await self.advance_hand(message_obj=inter.message)
         else:
             embed = self.build_embed()
-            fp    = self.get_image_file()
-            if fp:
-                embed.set_image(url="attachment://hand.png")
-                await inter.response.edit_message(embed=embed, view=self, attachments=[fp])
-            else:
-                await inter.response.edit_message(embed=embed, view=self)
+            await inter.response.edit_message(embed=embed, view=self)
 
     @discord.ui.button(label="停牌", style=discord.ButtonStyle.danger)
     async def stand(self, inter, btn):
@@ -646,14 +519,9 @@ class BlackjackGame(discord.ui.View):
         self.hand_results = [None, None]
         self.hand_bets = [self.bet, self.bet]
         self.update_buttons()
-        # split 後也更新圖片
+        # split 後也更新畫面
         embed = self.build_embed(extra_msg="✌️ 你選擇了分牌！")
-        fp = self.get_image_file()
-        if fp:
-            embed.set_image(url="attachment://hand.png")
-            await inter.response.edit_message(embed=embed, view=self, attachments=[fp])
-        else:
-            await inter.response.edit_message(embed=embed, view=self)
+        await inter.response.edit_message(embed=embed, view=self)
         if calculate_score(self.p_hand) == 21:
             await asyncio.sleep(1.5)
             await self.advance_hand(message_obj=inter.message)
@@ -762,14 +630,8 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 async def on_ready():
     init_db()
     await bot.tree.sync()
-    load_emoji_cache(bot)               # 掃描所有伺服器的卡牌 Emoji
-    preload_card_images()               # 從本地資料夾讀取圖片快取
     print(f"{bot.user} 啟動並已同步斜線指令")
 
-@bot.event
-async def on_guild_emojis_update(guild, before, after):
-    """任何伺服器的 Emoji 更新時自動重新掃描"""
-    load_emoji_cache(bot)
 
 @bot.tree.command(name="register", description="註冊你的帳號並獲得 50,000 啟動資金")
 async def register(interaction: discord.Interaction):
@@ -836,18 +698,7 @@ async def test_emojis(interaction: discord.Interaction):
     embed.set_footer(text="如果某些牌顯示文字或破圖，代表該圖尚未被快取或檔名錯誤")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="update_emojis", description="[開發者] 強制重新掃描所有伺服器並更新 emojis.json 鎖定檔")
-async def update_emojis(interaction: discord.Interaction):
-    if interaction.user.id not in ALLOWED_HOST_IDS:
-        return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
-    
-    # 移除舊的鎖定檔
-    if os.path.exists("emojis.json"):
-        os.remove("emojis.json")
-    
-    # 強制再次掃描並存檔
-    load_emoji_cache(bot)
-    await interaction.response.send_message(f"✅ 成功強迫重新掃描！這一次共記錄了 {len(_emoji_cache)} 個表情符號到新檔案！", ephemeral=True)
+
 
 @bot.tree.command(name="balance", description="查詢個人的戰績與餘額")
 @app_commands.describe(member="你想查詢的對象 (選填)")
