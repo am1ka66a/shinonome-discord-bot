@@ -114,32 +114,45 @@ _CARD_MAP = {
 # 跨伺服器 Emoji 快取：{ 'sp_A': '<:sp_A:123456..>', ... }
 _emoji_cache: dict = {}
 
+import json
+
 def load_emoji_cache(bot_instance):
-    """掃描 Bot 所在的所有伺服器，建立卡牌 Emoji 快取"""
+    """掃描 Bot 建立卡牌 Emoji 快取，並輸出成檔案鎖定代碼（防止未來撞名）"""
     _emoji_cache.clear()
-    prefixes = ('sp_', 'cu_', 'lo_', 'pb_')
+    
+    # 如果已經鎖定過代碼，直接載入絕對不會撞名的對照表
+    if os.path.exists("emojis.json"):
+        with open("emojis.json", "r", encoding="utf-8") as f:
+            data = json.load(f)
+            _emoji_cache.update(data)
+        print(f"[Emoji] 成功從 emojis.json 載入鎖定的表符代碼，防撞名模式啟動！")
+        return
+
+    # 初次啟動：因為目前你的 bot 只有在私人群，可以直接掃描所有群組並記錄代碼
     for guild in bot_instance.guilds:
         for emoji in guild.emojis:
-            if emoji.name.startswith(prefixes) or emoji.name == 'card_back':
-                if emoji.name not in _emoji_cache:
-                    _emoji_cache[emoji.name] = str(emoji)  # '<:name:id>'
-    print(f"[Emoji] Loaded {len(_emoji_cache)}/53 card emojis from {len(bot_instance.guilds)} guild(s)")
+            if emoji.name not in _emoji_cache:
+                _emoji_cache[emoji.name] = str(emoji)  # 格式如 '<:AS:123456789>'
+                
+    # 存檔鎖定！未來就算加了新伺服器，也會只讀取這份 json 檔案
+    try:
+        with open("emojis.json", "w", encoding="utf-8") as f:
+            json.dump(_emoji_cache, f, ensure_ascii=False, indent=4)
+        print(f"[Emoji] 成功將 {len(_emoji_cache)} 個表符代碼鎖定並儲存至 emojis.json！")
+    except Exception as e:
+        print(f"[Emoji] 無法寫入 emojis.json: {e}")
 
 def card_back_emoji() -> str:
-    return _emoji_cache.get('card_back', '\U0001f0a0')  # fallback: 🂠
+    return _emoji_cache.get('BK', _emoji_cache.get('back', '\U0001f0a0'))
 
 def card_to_emoji(card) -> str:
-    """使用伺服器自定義 Emoji 顯示卡牌（跨伺服器完整 ID 格式）
-    需先上傳 Emoji 到 Bot 所在的任一伺服器，命名規則：
-    sp_A, sp_2...sp_K  (♠️ 黑桃)
-    cu_A, cu_2...cu_K  (♥️ 紅心)
-    lo_A, lo_2...lo_K  (♦️ 方塊)
-    pb_A, pb_2...pb_K  (♣️ 梅花)
-    """
-    _SUIT_MAP = {'\u2660': 'sp', '\u2665': 'cu', '\u2666': 'lo', '\u2663': 'pb'}
-    suit = _SUIT_MAP.get(card['suit'].replace('\ufe0f', ''), 'sp')
-    key  = f"{suit}_{card['rank']}"
-    # 有快取就用完整 <:name:id>，跨伺服器都能顯示；沒有就退回文字
+    """使用伺服器自定義 Emoji 顯示卡牌（格式同原圖檔名 AS, 0H, BK 等）"""
+    _RANK_CODE = {'A':'A','2':'2','3':'3','4':'4','5':'5','6':'6',
+                  '7':'7','8':'8','9':'9','10':'0','J':'J','Q':'Q','K':'K'}
+    _SUIT_CODE = {'\u2660':'S','\u2665':'H','\u2666':'D','\u2663':'C'}
+    suit = card['suit'].replace('\ufe0f', '')
+    key = _RANK_CODE.get(card['rank'], '?') + _SUIT_CODE.get(suit, 'S')
+    # 有快取就用完整 <:name:id>，沒有就退回文字
     return _emoji_cache.get(key, f"**{card['rank']}** {card['suit']}")
 
 # ==========================================
@@ -599,9 +612,16 @@ class BlackjackGame(discord.ui.View):
         stats = get_user_stats(self.user.id)
         
         # 雙倍需要額外多付一份注金：目前注 + 當前手一樣大的追加注
+        # 需要考慮旁注的盈虧 (self.side_p): 若旁注輸了，會佔用原本的餘額
+        # 如果 side_p 是正的，代表旁注贏了，可用餘額會變多; 如果是負的，可用餘額會變少
+        # 如果旁注還會輸到底，最差情況： (可用餘額 + 旁注盈虧) 必須 >= 所有主注加總 + 這次雙倍需要的注
+        
+        # 但為了保守起見，如果 side_p > 0，我們不把它當作擔保 (因為玩家可能認為可用餘額沒變)
+        # 真正的擔保只有 stats[0] - (輸掉的旁注)，也就是 stats[0] + min(0, self.side_p)
+        available_balance = stats[0] + min(0, getattr(self, 'side_p', 0))
         extra_needed = self.hand_bets[self.current_hand]
-        if stats[0] < sum(self.hand_bets) + extra_needed:
-            return await inter.response.send_message("餘額不足，無法雙倍下注", ephemeral=True)
+        if available_balance < sum(self.hand_bets) + extra_needed:
+            return await inter.response.send_message("餘額不足，無法雙倍下注（可能扣除旁注後額度不夠）", ephemeral=True)
             
         self.hand_bets[self.current_hand] *= 2
         self.p_hand.append(self.deck.pop())
@@ -617,9 +637,12 @@ class BlackjackGame(discord.ui.View):
     async def split(self, inter, btn):
         if inter.user.id != self.user.id: return
         stats = get_user_stats(self.user.id)
+        
+        # 同樣需考慮旁注帶來的已確定虧損
+        available_balance = stats[0] + min(0, getattr(self, 'side_p', 0))
         current_max_loss = sum(self.hand_bets) + self.bet
-        if stats[0] < current_max_loss:
-            return await inter.response.send_message("餘額不足，無法分牌", ephemeral=True)
+        if available_balance < current_max_loss:
+            return await inter.response.send_message("餘額不足，無法分牌（可能扣除旁注後額度不夠）", ephemeral=True)
             
         self.is_split = True
         c1, c2 = self.hands[0][0], self.hands[0][1]
