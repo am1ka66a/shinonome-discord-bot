@@ -902,4 +902,16 @@ async def adminhelp(ctx):
 `!resetall_default` - 全服重置為 50,000"""
     await ctx.send(help_text)
 
+@bot.command()
+@is_host()
+async def cardstatus(ctx):
+    loaded = len(_card_cache)
+    all_codes = ([r+s for r in 'A23456789' for s in 'SHDC']
+                 + ['0'+s for s in 'SHDC']
+                 + [r+s for r in ['J','Q','K'] for s in 'SHDC']
+                 + ['back'])
+    missing = [c for c in all_codes if c not in _card_cache]
+    status = "ALL OK" if not missing else f"MISSING: {', '.join(missing[:10])}"
+    await ctx.send(f"**Card Cache**: {loaded}/53\n`{status}`\nURL: `{CARD_IMG_BASE}AS.png`")
+
 bot.run(os.getenv('DISCORD_TOKEN'))
