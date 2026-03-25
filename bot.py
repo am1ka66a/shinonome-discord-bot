@@ -346,7 +346,7 @@ class BlackjackGame(discord.ui.View):
                 continue
                 
             ps = calculate_score(hand)
-            player_bj = len(hand) == 2 and ps == 21 and not getattr(self, 'is_split', False)
+            player_bj = len(hand) == 2 and ps == 21
 
             if player_bj and not dealer_bj:
                 final_res_texts.append(f"第 {i+1} 手: 🌟 BlackJack！1.5倍賠率！" if len(self.hands)>1 else "🌟 BlackJack！1.5倍賠率！")
