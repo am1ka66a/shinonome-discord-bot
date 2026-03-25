@@ -246,10 +246,14 @@ class BlackjackGame(discord.ui.View):
         # 如果第一手還沒抽牌之前有相同點數的牌就可以分牌 (10, J, Q, K 皆為 10點)
         values = {'2':2,'3':3,'4':4,'5':5,'6':6,'7':7,'8':8,'9':9,'10':10,'J':10,'Q':10,'K':10,'A':11}
         can_split = len(self.hands) == 1 and len(self.p_hand) == 2 and values[self.p_hand[0]['rank']] == values[self.p_hand[1]['rank']]
+        can_double = len(self.p_hand) == 2
         to_remove = []
         for c in self.children:
             if c.label == "分牌":
                 if not can_split:
+                    to_remove.append(c)
+            elif c.label == "雙倍":
+                if not can_double:
                     to_remove.append(c)
             elif c.label == "投降":
                 c.disabled = len(self.p_hand) > 2 or len(self.hands) > 1
@@ -450,8 +454,8 @@ class ConfirmAllInView(discord.ui.View):
             await self.parent_msg.delete()
         except:
             pass
-        setup = SetupView(self.user, stats[0], 0, 0)
-        await inter.channel.send(embed=setup.build_embed(), view=setup)
+        gv = BlackjackGame(self.user, stats[0], 0, 0)
+        await inter.channel.send(embed=gv.build_embed(), view=gv)
 
 class NewGameView(discord.ui.View):
     def __init__(self, user, last_bet, last_p_bet, last_s_bet, current_bal):
@@ -470,15 +474,27 @@ class NewGameView(discord.ui.View):
 
     @discord.ui.button(label="再來一局", style=discord.ButtonStyle.success)
     async def again(self, inter, btn):
+        stats = get_user_stats(self.user.id)
+        if stats[0] < (self.last_bet + self.last_p_bet + self.last_s_bet):
+            return await inter.response.send_message("餘額不足", ephemeral=True)
         self.stop(); await inter.message.delete()
-        setup = SetupView(self.user, self.last_bet, self.last_p_bet, self.last_s_bet)
-        await inter.channel.send(embed=setup.build_embed(), view=setup)
+        gv = BlackjackGame(self.user, self.last_bet, self.last_p_bet, self.last_s_bet)
+        await inter.channel.send(embed=gv.build_embed(), view=gv)
 
     @discord.ui.button(label="雙倍再局 (Double)", style=discord.ButtonStyle.primary)
     async def double_again(self, inter, btn):
-        self.stop(); await inter.message.delete()
+        stats = get_user_stats(self.user.id)
         new_bet = self.last_bet * 2
-        setup = SetupView(self.user, new_bet, self.last_p_bet, self.last_s_bet)
+        if stats[0] < (new_bet + self.last_p_bet + self.last_s_bet):
+            return await inter.response.send_message("餘額不足以雙倍下注", ephemeral=True)
+        self.stop(); await inter.message.delete()
+        gv = BlackjackGame(self.user, new_bet, self.last_p_bet, self.last_s_bet)
+        await inter.channel.send(embed=gv.build_embed(), view=gv)
+
+    @discord.ui.button(label="修改下注", style=discord.ButtonStyle.secondary)
+    async def modify_bet(self, inter, btn):
+        self.stop(); await inter.message.delete()
+        setup = SetupView(self.user, self.last_bet, self.last_p_bet, self.last_s_bet)
         await inter.channel.send(embed=setup.build_embed(), view=setup)
 
     @discord.ui.button(label="All In (全押)", style=discord.ButtonStyle.danger)
