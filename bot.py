@@ -251,6 +251,8 @@ class BlackjackGame(discord.ui.View):
                     to_remove.append(c)
             elif c.label == "投降":
                 c.disabled = len(self.p_hand) > 2 or len(self.hands) > 1
+            elif c.label == "要牌":
+                c.disabled = calculate_score(self.p_hand) >= 21
                 
         for c in to_remove:
             self.remove_item(c)
@@ -328,6 +330,7 @@ class BlackjackGame(discord.ui.View):
         total_prof = 0
         final_res_texts = []
         ds = calculate_score(self.d_hand)
+        dealer_bj = len(self.d_hand) == 2 and ds == 21
 
         for i, hand in enumerate(self.hands):
             if self.hand_results[i] is not None:
@@ -337,7 +340,17 @@ class BlackjackGame(discord.ui.View):
                 continue
                 
             ps = calculate_score(hand)
-            if ds > 21 or ps > ds:
+            player_bj = len(hand) == 2 and ps == 21 and not getattr(self, 'is_split', False)
+
+            if player_bj and not dealer_bj:
+                final_res_texts.append(f"第 {i+1} 手: 🌟 BlackJack！1.5倍賠率！" if len(self.hands)>1 else "🌟 BlackJack！1.5倍賠率！")
+                total_prof += int(self.bet * 1.5)
+            elif player_bj and dealer_bj:
+                final_res_texts.append(f"第 {i+1} 手: 🤝 雙方皆為 BlackJack！平手" if len(self.hands)>1 else "🤝 雙方皆為 BlackJack！平手")
+            elif dealer_bj:
+                final_res_texts.append(f"第 {i+1} 手: 💀 莊家 BlackJack！你輸啦～雜魚～" if len(self.hands)>1 else "💀 莊家 BlackJack！你輸啦～雜魚～")
+                total_prof -= self.bet
+            elif ds > 21 or ps > ds:
                 final_res_texts.append(f"第 {i+1} 手: 🎉 這次算你贏啦，腦殘！" if len(self.hands)>1 else "🎉 這次算你贏啦，腦殘！！")
                 total_prof += self.bet
             elif ps < ds:
@@ -384,6 +397,7 @@ class BlackjackGame(discord.ui.View):
         if stats[0] < self.bet * 2 + self.p_bet + self.s_bet:
             return await inter.response.send_message("餘額不足，無法分牌", ephemeral=True)
             
+        self.is_split = True
         c1, c2 = self.hands[0][0], self.hands[0][1]
         self.hands = [[c1, self.deck.pop()], [c2, self.deck.pop()]]
         self.hand_results = [None, None]
