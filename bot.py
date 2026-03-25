@@ -207,7 +207,8 @@ class SetupView(discord.ui.View):
             return await inter.response.send_message("餘額不足", ephemeral=True)
         self.stop(); await inter.message.delete()
         gv = BlackjackGame(self.user, self.base_bet, self.p_bet, self.s_bet)
-        await inter.channel.send(embed=gv.build_embed(), view=gv)
+        msg = await inter.channel.send(embed=gv.build_embed(), view=gv)
+        asyncio.create_task(gv.check_auto_bj(msg))
 
     @discord.ui.button(label="自訂下注金額", style=discord.ButtonStyle.primary)
     async def custom_bet(self, inter, btn):
@@ -294,49 +295,50 @@ class BlackjackGame(discord.ui.View):
             embed.add_field(name="🤖 莊家手牌", value=f"[{self.d_hand[0]['rank']}{self.d_hand[0]['suit']}] [❓]", inline=False)
         return embed
 
-    async def end(self, inter, res, prof, win=False, deferred=False):
+    async def check_auto_bj(self, message):
+        if calculate_score(self.p_hand) == 21:
+            await asyncio.sleep(1.5)
+            await self.advance_hand(message_obj=message)
+
+    async def end(self, res, prof, win=False, message_obj=None):
         for c in self.children: c.disabled = True
         update_game_result(self.user.id, prof, win)
         nv = NewGameView(self.user, self.bet, self.p_bet, self.s_bet, get_user_stats(self.user.id)[0])
         emb = self.build_embed(True, res, prof)
-        if deferred: await inter.message.edit(embed=emb, view=nv)
-        else:
-            if not inter.response.is_done(): await inter.response.edit_message(embed=emb, view=nv)
-            else: await inter.followup.edit_message(inter.message.id, embed=emb, view=nv)
+        if message_obj: await message_obj.edit(embed=emb, view=nv)
 
-    async def advance_hand(self, inter, deferred=False):
+    async def advance_hand(self, message_obj=None):
         if self.current_hand < len(self.hands) - 1:
             self.current_hand += 1
             self.update_buttons()
-            msg = f"👉 換第 {self.current_hand+1} 手牌"
-            if deferred: await inter.message.edit(embed=self.build_embed(extra_msg=msg), view=self)
-            else: await inter.response.edit_message(embed=self.build_embed(extra_msg=msg), view=self)
+            msg_str = f"👉 換第 {self.current_hand+1} 手牌"
+            if message_obj:
+                await message_obj.edit(embed=self.build_embed(extra_msg=msg_str), view=self)
+            if calculate_score(self.p_hand) == 21:
+                await asyncio.sleep(1.5)
+                await self.advance_hand(message_obj=message_obj)
         else:
-            await self.resolve_dealer(inter, deferred)
+            await self.resolve_dealer(message_obj=message_obj)
 
-    async def resolve_dealer(self, inter, deferred):
+    async def resolve_dealer(self, message_obj=None):
         need_dealer = any(hand is None for hand in self.hand_results)
-        
-        if need_dealer and not deferred:
-            await inter.response.defer()
-            deferred = True
             
         for c in self.children: c.disabled = True
-        if deferred: await inter.message.edit(view=self)
-        else: await inter.response.edit_message(view=self)
+        if message_obj: await message_obj.edit(view=self)
 
         if need_dealer:
-            await inter.message.edit(embed=self.build_embed(done=False, animating=True))
+            if message_obj: await message_obj.edit(embed=self.build_embed(done=False, animating=True))
             await asyncio.sleep(1.2)
-            while calculate_score(self.d_hand) < 17:
+            while calculate_score(self.d_hand) < 17 and len(self.d_hand) < 5:
                 self.d_hand.append(self.deck.pop())
-                await inter.message.edit(embed=self.build_embed(done=False, animating=True))
+                if message_obj: await message_obj.edit(embed=self.build_embed(done=False, animating=True))
                 await asyncio.sleep(1.2)
 
         total_prof = 0
         final_res_texts = []
         ds = calculate_score(self.d_hand)
         dealer_bj = len(self.d_hand) == 2 and ds == 21
+        dealer_5_card = len(self.d_hand) == 5 and ds <= 21
 
         for i, hand in enumerate(self.hands):
             if self.hand_results[i] is not None:
@@ -347,12 +349,21 @@ class BlackjackGame(discord.ui.View):
                 
             ps = calculate_score(hand)
             player_bj = len(hand) == 2 and ps == 21
+            player_5_card = len(hand) == 5 and ps <= 21
 
-            if player_bj and not dealer_bj:
-                final_res_texts.append(f"第 {i+1} 手: 🌟 BlackJack！1.5倍賠率！" if len(self.hands)>1 else "🌟 BlackJack！1.5倍賠率！")
+            if player_5_card and dealer_5_card:
+                final_res_texts.append(f"第 {i+1} 手: 🤝 雙方皆過五關！平手" if len(self.hands)>1 else "🤝 雙方皆過五關！平手")
+            elif player_5_card:
+                final_res_texts.append(f"第 {i+1} 手: 🐉 你過五關啦！爽贏 2.5 倍！" if len(self.hands)>1 else "🐉 你過五關啦！爽贏 2.5 倍！")
                 total_prof += int(self.hand_bets[i] * 1.5)
+            elif dealer_5_card:
+                final_res_texts.append(f"第 {i+1} 手: 🐉 老子過五關啦！你這低能兒～" if len(self.hands)>1 else "🐉 老子過五關啦！你這低能兒～")
+                total_prof -= self.hand_bets[i]
             elif player_bj and dealer_bj:
                 final_res_texts.append(f"第 {i+1} 手: 🤝 雙方皆為 BlackJack！平手" if len(self.hands)>1 else "🤝 雙方皆為 BlackJack！平手")
+            elif player_bj:
+                final_res_texts.append(f"第 {i+1} 手: 🌟 BlackJack！1.5倍賠率！" if len(self.hands)>1 else "🌟 BlackJack！1.5倍賠率！")
+                total_prof += int(self.hand_bets[i] * 1.5)
             elif dealer_bj:
                 final_res_texts.append(f"第 {i+1} 手: 💀 莊家 BlackJack！你輸啦～雜魚～" if len(self.hands)>1 else "💀 莊家 BlackJack！你輸啦～雜魚～")
                 total_prof -= self.hand_bets[i]
@@ -366,7 +377,7 @@ class BlackjackGame(discord.ui.View):
                 final_res_texts.append(f"第 {i+1} 手: 🤝 就這點技術？" if len(self.hands)>1 else "🤝 就這點技術？")
 
         final_msg = "\n".join(final_res_texts)
-        await self.end(inter, final_msg, total_prof, total_prof > 0, deferred=deferred)
+        await self.end(final_msg, total_prof, total_prof > 0, message_obj=message_obj)
 
     @discord.ui.button(label="要牌", style=discord.ButtonStyle.success)
     async def hit(self, inter, btn):
@@ -377,10 +388,11 @@ class BlackjackGame(discord.ui.View):
         
         if ps > 21:
             self.hand_results[self.current_hand] = ("爆牌輸了", -self.hand_bets[self.current_hand], False)
-            await self.advance_hand(inter)
-        elif len(self.p_hand) == 5:
-            self.hand_results[self.current_hand] = ("🐉 你這傻逼一定做牌！2.5倍送你啦乞丐", int(self.hand_bets[self.current_hand]*1.5), True)
-            await self.advance_hand(inter)
+            if not inter.response.is_done(): await inter.response.defer()
+            await self.advance_hand(message_obj=inter.message)
+        elif len(self.p_hand) == 5 or ps == 21:
+            if not inter.response.is_done(): await inter.response.defer()
+            await self.advance_hand(message_obj=inter.message)
         else:
             await inter.response.edit_message(embed=self.build_embed(), view=self)
 
@@ -388,13 +400,14 @@ class BlackjackGame(discord.ui.View):
     async def stand(self, inter, btn):
         if inter.user.id != self.user.id: return
         if not inter.response.is_done(): await inter.response.defer()
-        await self.advance_hand(inter, deferred=True)
+        await self.advance_hand(message_obj=inter.message)
 
     @discord.ui.button(label="投降", style=discord.ButtonStyle.secondary)
     async def surrender(self, inter, btn):
         if inter.user.id != self.user.id: return
         self.hand_results[self.current_hand] = ("這樣就投降了嗎，雜魚～", -(self.hand_bets[self.current_hand]//2), False)
-        await self.advance_hand(inter)
+        if not inter.response.is_done(): await inter.response.defer()
+        await self.advance_hand(message_obj=inter.message)
 
     @discord.ui.button(label="雙倍", style=discord.ButtonStyle.primary)
     async def double_down(self, inter, btn):
@@ -410,11 +423,10 @@ class BlackjackGame(discord.ui.View):
         self.update_buttons()
         
         ps = calculate_score(self.p_hand)
+        if not inter.response.is_done(): await inter.response.defer()
         if ps > 21:
             self.hand_results[self.current_hand] = ("爆牌輸了", -self.hand_bets[self.current_hand], False)
-            await self.advance_hand(inter)
-        else:
-            await self.advance_hand(inter)
+        await self.advance_hand(message_obj=inter.message)
 
     @discord.ui.button(label="分牌", style=discord.ButtonStyle.primary)
     async def split(self, inter, btn):
@@ -431,6 +443,9 @@ class BlackjackGame(discord.ui.View):
         self.hand_bets = [self.bet, self.bet]
         self.update_buttons()
         await inter.response.edit_message(embed=self.build_embed(extra_msg="✌️ 你選擇了分牌！"), view=self)
+        if calculate_score(self.p_hand) == 21:
+            await asyncio.sleep(1.5)
+            await self.advance_hand(message_obj=inter.message)
 
 class ConfirmAllInView(discord.ui.View):
     def __init__(self, user, parent_msg):
@@ -456,7 +471,8 @@ class ConfirmAllInView(discord.ui.View):
         except:
             pass
         gv = BlackjackGame(self.user, stats[0], 0, 0)
-        await inter.channel.send(embed=gv.build_embed(), view=gv)
+        msg = await inter.channel.send(embed=gv.build_embed(), view=gv)
+        asyncio.create_task(gv.check_auto_bj(msg))
 
 class NewGameView(discord.ui.View):
     def __init__(self, user, last_bet, last_p_bet, last_s_bet, current_bal):
@@ -485,7 +501,8 @@ class NewGameView(discord.ui.View):
         except:
             pass
         gv = BlackjackGame(self.user, self.last_bet, self.last_p_bet, self.last_s_bet)
-        await inter.channel.send(embed=gv.build_embed(), view=gv)
+        msg = await inter.channel.send(embed=gv.build_embed(), view=gv)
+        asyncio.create_task(gv.check_auto_bj(msg))
 
     @discord.ui.button(label="雙倍再局 (Double)", style=discord.ButtonStyle.primary)
     async def double_again(self, inter, btn):
@@ -500,7 +517,8 @@ class NewGameView(discord.ui.View):
         except:
             pass
         gv = BlackjackGame(self.user, new_bet, self.last_p_bet, self.last_s_bet)
-        await inter.channel.send(embed=gv.build_embed(), view=gv)
+        msg = await inter.channel.send(embed=gv.build_embed(), view=gv)
+        asyncio.create_task(gv.check_auto_bj(msg))
 
     @discord.ui.button(label="修改下注", style=discord.ButtonStyle.secondary)
     async def modify_bet(self, inter, btn):

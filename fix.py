@@ -96,7 +96,7 @@ async def balance(interaction: discord.Interaction, member: discord.Member = Non
     embed.add_field(name="💰 目前餘額", value=f"`{bal}` 東雲幣", inline=False)
     embed.add_field(name="📈 歷史總獲利", value=f"`{total_profit}` 東雲幣", inline=False)
     embed.add_field(name="🎲 總遊玩局數", value=f"`{total_games}` 局", inline=True)
-    embed.add_field(name="🏆 勝率", value=f"`{win_rate:.1f}%` ({wins}胜)", inline=True)
+    embed.add_field(name="🏆 勝率", value=f"`{win_rate:.1f}%` ({wins}勝)", inline=True)
     
     await interaction.response.send_message(embed=embed)
 
