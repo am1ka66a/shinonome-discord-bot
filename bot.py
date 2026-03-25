@@ -143,15 +143,13 @@ def load_emoji_cache(bot_instance):
         print(f"[Emoji] 無法寫入 emojis.json: {e}")
 
 def card_back_emoji() -> str:
-    return _emoji_cache.get('BK', _emoji_cache.get('back', '\U0001f0a0'))
+    return _emoji_cache.get('card_back', '\U0001f0a0')
 
 def card_to_emoji(card) -> str:
-    """使用伺服器自定義 Emoji 顯示卡牌（格式同原圖檔名 AS, 0H, BK 等）"""
-    _RANK_CODE = {'A':'A','2':'2','3':'3','4':'4','5':'5','6':'6',
-                  '7':'7','8':'8','9':'9','10':'0','J':'J','Q':'Q','K':'K'}
-    _SUIT_CODE = {'\u2660':'S','\u2665':'H','\u2666':'D','\u2663':'C'}
-    suit = card['suit'].replace('\ufe0f', '')
-    key = _RANK_CODE.get(card['rank'], '?') + _SUIT_CODE.get(suit, 'S')
+    """使用伺服器自定義 Emoji 顯示卡牌（格式同 emoji_cards 檔名 sp_A, cu_10, card_back 等）"""
+    _SUIT_MAP = {'\u2660': 'sp', '\u2665': 'cu', '\u2666': 'lo', '\u2663': 'pb'}
+    suit = _SUIT_MAP.get(card['suit'].replace('\ufe0f', ''), 'sp')
+    key  = f"{suit}_{card['rank']}"
     # 有快取就用完整 <:name:id>，沒有就退回文字
     return _emoji_cache.get(key, f"**{card['rank']}** {card['suit']}")
 
