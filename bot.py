@@ -557,40 +557,6 @@ async def record_cmd(interaction: discord.Interaction, member: discord.Member = 
         embed.description += f"[{dt.strftime('%m/%d %H:%M')}] {reason}: `{sign}{amt}`\n"
         
     await interaction.response.send_message(embed=embed)
-    win_rate = (wins / total_games * 100) if total_games > 0 else 0
-    
-    embed = discord.Embed(title="📊 玩家戰績與帳戶餘額", color=0x2b2d31)
-    embed.description = f"**{target.mention}** 的統計資料\n"
-    embed.add_field(name="💰 目前餘額", value=f"`{bal}` 東雲幣", inline=False)
-    embed.add_field(name="📈 歷史總獲利", value=f"`{total_profit}` 東雲幣", inline=False)
-    embed.add_field(name="🎲 總遊玩局數", value=f"`{total_games}` 局", inline=True)
-    embed.add_field(name="🏆 勝率", value=f"`{win_rate:.1f}%` ({wins}胜)", inline=True)
-    
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="record", description="查詢近期所有的收入紀錄")
-@app_commands.describe(member="你想查詢的對象 (選填)")
-async def record_cmd(interaction: discord.Interaction, member: discord.Member = None):
-    target = member or interaction.user
-    
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT amount, reason, created_at FROM logs WHERE user_id=%s ORDER BY created_at DESC LIMIT 10", (str(target.id),))
-    rows = c.fetchall()
-    conn.close()
-    
-    if not rows:
-        return await interaction.response.send_message(f"{target.mention} 目前尚無任何收入紀錄！", ephemeral=True)
-    
-    embed = discord.Embed(title="📜 近期收入紀錄", color=0x2b2d31)
-    embed.description = f"**{target.mention}** 的最近 10 筆紀錄\n\n"
-    
-    for r in rows:
-        amt, reason, dt = r[0], r[1], r[2]
-        sign = "+" if amt > 0 else ""
-        embed.description += f"[{dt.strftime('%m/%d %H:%M')}] {reason}: `{sign}{amt}`\n"
-        
-    await interaction.response.send_message(embed=embed)
 @bot.tree.command(name="leaderboard", description="查看全伺服器最富有的前 10 名玩家")
 async def leaderboard(interaction: discord.Interaction):
     conn = get_db_connection(); c = conn.cursor()
