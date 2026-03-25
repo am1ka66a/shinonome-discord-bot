@@ -264,7 +264,7 @@ class BlackjackGame(discord.ui.View):
         bal, total, wins, t_prof = stats
         wr = (wins/total*100) if total>0 else 0
         embed = discord.Embed(title="🃏 21點大賽", color=0x2b2d31)
-        embed.description = f"目前餘額：{bal} | 勝率：{wr:.1f}% | 總盈虧：{t_prof}"
+        embed.description = f"目前餘額：{bal} | 勝率：{wr:.1f}% ({total}局) | 總盈虧：{t_prof}"
         
         if extra_msg:
             embed.description += f"\n\n**{extra_msg}**"
