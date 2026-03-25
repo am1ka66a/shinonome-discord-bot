@@ -449,7 +449,8 @@ class ConfirmAllInView(discord.ui.View):
         stats = get_user_stats(self.user.id)
         if stats[0] < 100:
             return await inter.response.send_message("破產仔沒資格 All In！", ephemeral=True)
-        self.stop(); await inter.message.delete()
+        self.stop()
+        await inter.response.edit_message(content="🔥 All In 已確認！正在為你開牌...", view=None)
         try:
             await self.parent_msg.delete()
         except:
@@ -477,7 +478,12 @@ class NewGameView(discord.ui.View):
         stats = get_user_stats(self.user.id)
         if stats[0] < (self.last_bet + self.last_p_bet + self.last_s_bet):
             return await inter.response.send_message("餘額不足", ephemeral=True)
-        self.stop(); await inter.message.delete()
+        self.stop()
+        await inter.response.defer()
+        try:
+            await inter.message.delete()
+        except:
+            pass
         gv = BlackjackGame(self.user, self.last_bet, self.last_p_bet, self.last_s_bet)
         await inter.channel.send(embed=gv.build_embed(), view=gv)
 
@@ -487,13 +493,23 @@ class NewGameView(discord.ui.View):
         new_bet = self.last_bet * 2
         if stats[0] < (new_bet + self.last_p_bet + self.last_s_bet):
             return await inter.response.send_message("餘額不足以雙倍下注", ephemeral=True)
-        self.stop(); await inter.message.delete()
+        self.stop()
+        await inter.response.defer()
+        try:
+            await inter.message.delete()
+        except:
+            pass
         gv = BlackjackGame(self.user, new_bet, self.last_p_bet, self.last_s_bet)
         await inter.channel.send(embed=gv.build_embed(), view=gv)
 
     @discord.ui.button(label="修改下注", style=discord.ButtonStyle.secondary)
     async def modify_bet(self, inter, btn):
-        self.stop(); await inter.message.delete()
+        self.stop()
+        await inter.response.defer()
+        try:
+            await inter.message.delete()
+        except:
+            pass
         setup = SetupView(self.user, self.last_bet, self.last_p_bet, self.last_s_bet)
         await inter.channel.send(embed=setup.build_embed(), view=setup)
 
@@ -501,6 +517,7 @@ class NewGameView(discord.ui.View):
     async def all_in(self, inter, btn):
         cv = ConfirmAllInView(self.user, inter.message)
         await inter.response.send_message("⚠️ 警告：你確定要把所有的財產全部押在主注上嗎？輸了你這個雜魚就什麼都沒了喔～", view=cv, ephemeral=True)
+
 
 # ==========================================
 # 🤖 4. 指令系統
