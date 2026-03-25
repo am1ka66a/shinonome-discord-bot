@@ -154,9 +154,8 @@ def card_to_emoji(card) -> str:
     return _emoji_cache.get(key, f"**{card['rank']}** {card['suit']}")
 
 # ==========================================
-# 🖼️ 卡牌圖片系統 (GitHub CDN + Pillow)
+# 🖼️ 卡牌圖片系統 (讀取本地端 cards/ 資料夾 + Pillow)
 # ==========================================
-CARD_IMG_BASE   = "https://raw.githubusercontent.com/am1ka66a/card-assets/main/"
 CARD_THUMB_SIZE = (88, 124)   # (W, H) 縮圖尺寸
 _card_cache: dict = {}         # { 'AS': PILImage, 'back': PILImage, ... }
 
@@ -169,26 +168,25 @@ def _card_to_code(card: dict) -> str:
     suit = card['suit'].replace('\ufe0f', '')
     return _RANK_CODE.get(card['rank'], '?') + _SUIT_CODE.get(suit, 'S')
 
-def _fetch_and_cache(code: str) -> bool:
-    """Synchronously download and cache one card thumbnail (run in thread)"""
-    import urllib.request
-    try:
-        with urllib.request.urlopen(f"{CARD_IMG_BASE}{code}.png", timeout=10) as r:
-            img = PILImage.open(BytesIO(r.read())).convert('RGBA')
-        _card_cache[code] = img.resize(CARD_THUMB_SIZE, PILImage.LANCZOS)
-        return True
-    except Exception as e:
-        print(f"[Card] Cannot load {code}: {e}")
-        return False
-
-async def preload_card_images():
-    """Preload all 53 card PNGs from GitHub concurrently at startup"""
+def preload_card_images():
+    """啟動時將所有 53 張卡牌 PNG 讀到記憶體快取，使用本地檔案，速度快且不受網路影響"""
     codes = [r+s for r in 'A23456789' for s in 'SHDC'] \
           + ['0'+s for s in 'SHDC'] \
           + [r+s for r in ['J','Q','K'] for s in 'SHDC'] \
           + ['back']
-    results = await asyncio.gather(*[asyncio.to_thread(_fetch_and_cache, c) for c in codes])
-    print(f"[Cards] Loaded {sum(results)}/53 images from GitHub")
+    
+    loaded_count = 0
+    for code in codes:
+        try:
+            path = os.path.join('cards', f"{code}.png")
+            if os.path.exists(path):
+                img = PILImage.open(path).convert('RGBA')
+                _card_cache[code] = img.resize(CARD_THUMB_SIZE, PILImage.LANCZOS)
+                loaded_count += 1
+        except Exception as e:
+            print(f"[Card] 無法載入本地圖片 {code}.png: {e}")
+            
+    print(f"[Cards] 成功從本地 cards/ 資料夾載入 {loaded_count}/53 張圖片快取")
 
 async def _send_game(channel, gv: 'BlackjackGame') -> discord.Message:
     """Send a new game message, attaching the card image if available."""
@@ -765,7 +763,7 @@ async def on_ready():
     init_db()
     await bot.tree.sync()
     load_emoji_cache(bot)               # 掃描所有伺服器的卡牌 Emoji
-    asyncio.create_task(preload_card_images())  # 從 GitHub 預載圖片（備用）
+    preload_card_images()               # 從本地資料夾讀取圖片快取
     print(f"{bot.user} 啟動並已同步斜線指令")
 
 @bot.event
