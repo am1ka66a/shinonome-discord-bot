@@ -355,7 +355,7 @@ class BlackjackGame(discord.ui.View):
                 final_res_texts.append(f"第 {i+1} 手: 🤝 雙方皆過五關！平手" if len(self.hands)>1 else "🤝 雙方皆過五關！平手")
             elif player_5_card:
                 final_res_texts.append(f"第 {i+1} 手: 🐉 你過五關啦！爽贏 2.5 倍！" if len(self.hands)>1 else "🐉 你過五關啦！爽贏 2.5 倍！")
-                total_prof += int(self.hand_bets[i] * 1.5)
+                total_prof += int(self.hand_bets[i] * 2.5)
             elif dealer_5_card:
                 final_res_texts.append(f"第 {i+1} 手: 🐉 老子過五關啦！你這低能兒～" if len(self.hands)>1 else "🐉 老子過五關啦！你這低能兒～")
                 total_prof -= self.hand_bets[i]
