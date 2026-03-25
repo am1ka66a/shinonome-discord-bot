@@ -93,6 +93,35 @@ def get_deck(num_decks=6):
     ranks = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A']
     return [{'rank': r, 'suit': s} for s in suits for r in ranks] * num_decks
 
+# Unicode 撲克牌字符對映表（iOS/macOS 渲染為實體卡牌圖示）
+_CARD_MAP = {
+    'A':  {'♠': '🂡', '♥': '🂱', '♦': '🃁', '♣': '🃑'},
+    '2':  {'♠': '🂢', '♥': '🂲', '♦': '🃂', '♣': '🃒'},
+    '3':  {'♠': '🂣', '♥': '🂳', '♦': '🃃', '♣': '🃓'},
+    '4':  {'♠': '🂤', '♥': '🂴', '♦': '🃄', '♣': '🃔'},
+    '5':  {'♠': '🂥', '♥': '🂵', '♦': '🃅', '♣': '🃕'},
+    '6':  {'♠': '🂦', '♥': '🂶', '♦': '🃆', '♣': '🃖'},
+    '7':  {'♠': '🂧', '♥': '🂷', '♦': '🃇', '♣': '🃗'},
+    '8':  {'♠': '🂨', '♥': '🂸', '♦': '🃈', '♣': '🃘'},
+    '9':  {'♠': '🂩', '♥': '🂹', '♦': '🃉', '♣': '🃙'},
+    '10': {'♠': '🂪', '♥': '🂺', '♦': '🃊', '♣': '🃚'},
+    'J':  {'♠': '🂫', '♥': '🂻', '♦': '🃋', '♣': '🃛'},
+    'Q':  {'♠': '🂭', '♥': '🂽', '♦': '🃍', '♣': '🃝'},
+    'K':  {'♠': '🂮', '♥': '🂾', '♦': '🃎', '♣': '🃞'},
+}
+CARD_BACK = '`🂠`'  # 牌背面（跨平台 inline code 外框）
+
+def card_to_emoji(card):
+    """將卡牌資料轉換為跨平台顯示格式。
+    使用 inline code 包裝，在所有 Discord 客戶端都顯示灰底方框，
+    在 iOS/macOS 上花色字符額外顯示為精美卡牌圖示。
+    """
+    suit_raw = card['suit'].replace('\ufe0f', '')  # 移除 variation selector
+    unicode_card = _CARD_MAP.get(card['rank'], {}).get(suit_raw)
+    if unicode_card:
+        return f'`{unicode_card}`'  # inline code 包裝 = 灰底方框（所有平台通用）
+    return f"`{card['rank']}{card['suit']}`"  # 備援：rank+suit emoji
+
 def calculate_score(hand):
     score, aces = 0, 0
     values = {'2':2,'3':3,'4':4,'5':5,'6':6,'7':7,'8':8,'9':9,'10':10,'J':10,'Q':10,'K':10,'A':11}
@@ -287,19 +316,19 @@ class BlackjackGame(discord.ui.View):
         bal, total, wins, t_prof = stats
         wr = (wins/total*100) if total>0 else 0
         embed = discord.Embed(title="🃏 21點大賽", color=0x2b2d31)
-        embed.description = f"目前餘額：{bal} | 勝率：{wr:.1f}% ({total}局) | 總盈虧：{t_prof}"
+        embed.description = f"目前餘額：{bal} | 勝率：{wr:.1f}% | 總場次：{total} | 總盈虧：{t_prof}"
         
         if extra_msg:
             embed.description += f"\n\n**{extra_msg}**"
             
         for i, hand in enumerate(self.hands):
-            p_cards = ' '.join([f"[{c['rank']}{c['suit']}]" for c in hand])
+            p_cards = ' '.join([card_to_emoji(c) for c in hand])
             indicator = "👉 " if i == self.current_hand and not done else ""
             title_text = f"{indicator}👤 {self.user.display_name} 的手牌 (第 {i+1} 手)" if len(self.hands)>1 else f"{indicator}👤 {self.user.display_name} 的手牌"
             embed.add_field(name=title_text, value=f"{p_cards}\n點數：{calculate_score(hand)}", inline=False)
             
         if done or animating:
-            d_cards = ' '.join([f"[{c['rank']}{c['suit']}]" for c in self.d_hand])
+            d_cards = ' '.join([card_to_emoji(c) for c in self.d_hand])
             embed.add_field(name="🤖 莊家手牌", value=f"{d_cards}\n點數：{calculate_score(self.d_hand)}", inline=False)
             if done:
                 total_profit = profit + self.side_p
@@ -310,7 +339,7 @@ class BlackjackGame(discord.ui.View):
                 res_text += f"\n💰 最新餘額：`{bal}` 東雲幣"
                 embed.add_field(name="🏆 結果", value=res_text, inline=False)
         else:
-            embed.add_field(name="🤖 莊家手牌", value=f"[{self.d_hand[0]['rank']}{self.d_hand[0]['suit']}] [❓]", inline=False)
+            embed.add_field(name="🤖 莊家手牌", value=f"{card_to_emoji(self.d_hand[0])} {CARD_BACK}\n點數：❓", inline=False)
         return embed
 
     async def check_auto_bj(self, message):
