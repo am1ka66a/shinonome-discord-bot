@@ -437,16 +437,20 @@ class BlackjackGame(discord.ui.View):
         return discord.File(fp, filename="hand.png")
 
     async def _edit(self, msg, done=False, res="", profit=0, animating=False, extra_msg="", view=None):
-        """Edit message with embed + card image."""
+        """Edit message with embed + card image. Falls back to text if image fails."""
         embed = self.build_embed(done, res, profit, animating, extra_msg)
         view  = view if view is not None else self
         fp    = self.get_image_file(done, animating)
         if fp:
             embed.set_image(url="attachment://hand.png")
-            # Message.edit() 用 files= 上傳新附件，attachments=[] 清除舊的
-            await msg.edit(embed=embed, view=view, files=[fp], attachments=[])
-        else:
-            await msg.edit(embed=embed, view=view)
+            try:
+                # discord.py 2.x: files= 新增附件，attachments=[] 移除舊附件
+                await msg.edit(embed=embed, view=view, files=[fp], attachments=[])
+                return
+            except Exception as e:
+                print(f"[Card] Image upload failed: {e}, falling back to text")
+        # Fallback: 純文字模式（圖片失敗時不卡住遊戲）
+        await msg.edit(embed=embed, view=view)
 
     async def check_auto_bj(self, message):
         if calculate_score(self.p_hand) == 21:
@@ -613,7 +617,14 @@ class BlackjackGame(discord.ui.View):
         self.hand_results = [None, None]
         self.hand_bets = [self.bet, self.bet]
         self.update_buttons()
-        await inter.response.edit_message(embed=self.build_embed(extra_msg="✌️ 你選擇了分牌！"), view=self)
+        # split 後也更新圖片
+        embed = self.build_embed(extra_msg="✌️ 你選擇了分牌！")
+        fp = self.get_image_file()
+        if fp:
+            embed.set_image(url="attachment://hand.png")
+            await inter.response.edit_message(embed=embed, view=self, attachments=[fp])
+        else:
+            await inter.response.edit_message(embed=embed, view=self)
         if calculate_score(self.p_hand) == 21:
             await asyncio.sleep(1.5)
             await self.advance_hand(message_obj=inter.message)
@@ -757,9 +768,8 @@ async def daily(interaction: discord.Interaction):
     c.execute("UPDATE users SET balance=balance+10000 WHERE user_id=%s", (str(interaction.user.id),))
     conn.commit(); conn.close()
     
-    log_transaction(interaction.user.id, 100000, "每日簽到")
-    
-    await interaction.response.send_message(f"🎉 簽到成功！獲得 10,000 東雲幣。目前餘額：{stats[0]+100000} 東雲幣")
+    log_transaction(interaction.user.id, 10000, "每日簽到")
+    await interaction.response.send_message(f"🎉 簽到成功！獲得 10,000 東雲幣。目前餘額：{stats[0]+10000} 東雲幣")
 
 @bot.tree.command(name="bj", description="開始一場 21點對決")
 @app_commands.describe(bet="你想要下注的金額 (預設 1000)")
@@ -899,7 +909,8 @@ async def adminhelp(ctx):
 `!unban @玩家` - 解除黑名單
 `!lock` - 開關賭場 (停止新的/bj)
 `!resetall_zero` - 全服餘額歸零
-`!resetall_default` - 全服重置為 50,000"""
+`!resetall_default` - 全服重置為 50,000
+`!cardstatus` - 查看卡牌圖片載入狀態"""
     await ctx.send(help_text)
 
 @bot.command()
