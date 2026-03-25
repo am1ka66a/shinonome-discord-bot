@@ -434,27 +434,57 @@ class ConfirmAllInView(discord.ui.View):
         self.user = user
         self.parent_msg = parent_msg
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user.id:
+            await interaction.response.send_message("這不是你的按鈕！", ephemeral=True)
+            return False
+        return True
+
     @discord.ui.button(label="確定 All In！", style=discord.ButtonStyle.danger)
-    @discord.ui.button(label="再一局", style=discord.ButtonStyle.success)
+    async def confirm(self, inter, btn):
+        stats = get_user_stats(self.user.id)
+        if stats[0] < 100:
+            return await inter.response.send_message("破產仔沒資格 All In！", ephemeral=True)
+        self.stop(); await inter.message.delete()
+        try:
+            await self.parent_msg.delete()
+        except:
+            pass
+        setup = SetupView(self.user, stats[0], 0, 0)
+        await inter.channel.send(embed=setup.build_embed(), view=setup)
+
+class NewGameView(discord.ui.View):
+    def __init__(self, user, last_bet, last_p_bet, last_s_bet, current_bal):
+        super().__init__(timeout=90)
+        self.user = user
+        self.last_bet = last_bet
+        self.last_p_bet = last_p_bet
+        self.last_s_bet = last_s_bet
+        self.current_bal = current_bal
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user.id:
+            await interaction.response.send_message("這不是你的牌局！", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="再來一局", style=discord.ButtonStyle.success)
     async def again(self, inter, btn):
-        if inter.user.id != self.user.id: return
         self.stop(); await inter.message.delete()
         setup = SetupView(self.user, self.last_bet, self.last_p_bet, self.last_s_bet)
         await inter.channel.send(embed=setup.build_embed(), view=setup)
 
     @discord.ui.button(label="雙倍再局 (Double)", style=discord.ButtonStyle.primary)
     async def double_again(self, inter, btn):
-        if inter.user.id != self.user.id: return
         self.stop(); await inter.message.delete()
         new_bet = self.last_bet * 2
         setup = SetupView(self.user, new_bet, self.last_p_bet, self.last_s_bet)
         await inter.channel.send(embed=setup.build_embed(), view=setup)
 
-    @discord.ui.button(label="All In (全押主注)", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="All In (全押)", style=discord.ButtonStyle.danger)
     async def all_in(self, inter, btn):
-        if inter.user.id != self.user.id: return
         cv = ConfirmAllInView(self.user, inter.message)
-        await inter.response.send_message("⚠️ 警告：你確定要把所有的財產全部押在賭博上嗎？輸了你這個雜魚就什麼都沒了喔～", view=cv, ephemeral=True)
+        await inter.response.send_message("⚠️ 警告：你確定要把所有的財產全部押在主注上嗎？輸了你這個雜魚就什麼都沒了喔～", view=cv, ephemeral=True)
 
 # ==========================================
 # 🤖 4. 指令系統
