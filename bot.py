@@ -838,6 +838,19 @@ async def test_emojis(interaction: discord.Interaction):
     embed.set_footer(text="如果某些牌顯示文字或破圖，代表該圖尚未被快取或檔名錯誤")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
+@bot.tree.command(name="update_emojis", description="[開發者] 強制重新掃描所有伺服器並更新 emojis.json 鎖定檔")
+async def update_emojis(interaction: discord.Interaction):
+    if interaction.user.id not in ALLOWED_HOST_IDS:
+        return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
+    
+    # 移除舊的鎖定檔
+    if os.path.exists("emojis.json"):
+        os.remove("emojis.json")
+    
+    # 強制再次掃描並存檔
+    load_emoji_cache(bot)
+    await interaction.response.send_message(f"✅ 成功強迫重新掃描！這一次共記錄了 {len(_emoji_cache)} 個表情符號到新檔案！", ephemeral=True)
+
 @bot.tree.command(name="balance", description="查詢個人的戰績與餘額")
 @app_commands.describe(member="你想查詢的對象 (選填)")
 async def balance(interaction: discord.Interaction, member: discord.Member = None):
