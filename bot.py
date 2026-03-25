@@ -109,18 +109,16 @@ _CARD_MAP = {
     'Q':  {'♠': '🂭', '♥': '🂽', '♦': '🃍', '♣': '🃝'},
     'K':  {'♠': '🂮', '♥': '🂾', '♦': '🃎', '♣': '🃞'},
 }
-CARD_BACK = '`🂠`'  # 牌背面（跨平台 inline code 外框）
+CARD_BACK = '**？** 🂠'  # 牌背面
 
 def card_to_emoji(card):
-    """將卡牌資料轉換為跨平台顯示格式。
-    使用 inline code 包裝，在所有 Discord 客戶端都顯示灰底方框，
-    在 iOS/macOS 上花色字符額外顯示為精美卡牌圖示。
+    """跨平台卡牌顯示：粗體點數 + 滿尺寸花色 emoji
+    桌機：♠️♥️♦️♣️ 渲染成大型 emoji，視覺清晰
+    手機：同樣完整支援，在 iOS 會額外顯示精美花色圖示
     """
-    suit_raw = card['suit'].replace('\ufe0f', '')  # 移除 variation selector
-    unicode_card = _CARD_MAP.get(card['rank'], {}).get(suit_raw)
-    if unicode_card:
-        return f'`{unicode_card}`'  # inline code 包裝 = 灰底方框（所有平台通用）
-    return f"`{card['rank']}{card['suit']}`"  # 備援：rank+suit emoji
+    rank = card['rank']
+    suit = card['suit']  # ♠️ ♥️ ♦️ ♣️ (含 variation selector，各平台皆支援)
+    return f"**{rank}** {suit}"
 
 def calculate_score(hand):
     score, aces = 0, 0
@@ -626,7 +624,7 @@ async def register(interaction: discord.Interaction):
         await interaction.response.send_message(f"🎉 {interaction.user.mention} 註冊成功，獲得 50,000 東雲幣！")
     conn.commit(); conn.close()
 
-@bot.tree.command(name="daily", description="每日簽到領取 10,000 東雲幣")
+@bot.tree.command(name="daily", description="每日簽到領取 100,000 東雲幣")
 async def daily(interaction: discord.Interaction):
     if is_blacklisted(interaction.user.id): return await interaction.response.send_message("🚫 被ban的傻屌無法簽到！", ephemeral=True)
     stats = get_user_stats(interaction.user.id)
@@ -646,9 +644,9 @@ async def daily(interaction: discord.Interaction):
     c.execute("UPDATE users SET balance=balance+10000 WHERE user_id=%s", (str(interaction.user.id),))
     conn.commit(); conn.close()
     
-    log_transaction(interaction.user.id, 10000, "每日簽到")
+    log_transaction(interaction.user.id, 100000, "每日簽到")
     
-    await interaction.response.send_message(f"🎉 簽到成功！獲得 10,000 東雲幣。目前餘額：{stats[0]+10000} 東雲幣")
+    await interaction.response.send_message(f"🎉 簽到成功！獲得 10,000 東雲幣。目前餘額：{stats[0]+100000} 東雲幣")
 
 @bot.tree.command(name="bj", description="開始一場 21點對決")
 @app_commands.describe(bet="你想要下注的金額 (預設 1000)")
