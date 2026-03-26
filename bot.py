@@ -27,6 +27,7 @@ def is_host():
 def get_db_connection():
     return pymysql.connect(
         host=os.getenv('DB_HOST'),
+        port=int(os.getenv('DB_PORT', 3306)),
         user=os.getenv('DB_USER'),
         password=os.getenv('DB_PASS'),
         database=os.getenv('DB_NAME'),
@@ -126,13 +127,8 @@ def card_to_emoji(card) -> str:
 
 
 async def _send_game(channel, gv: 'BlackjackGame') -> discord.Message:
-    """Send a new game message, attaching the card image if available."""
-    embed = gv.build_embed()
-    fp = gv.get_image_file()
-    if fp:
-        embed.set_image(url="attachment://hand.png")
-        return await channel.send(embed=embed, view=gv, file=fp)
-    return await channel.send(embed=embed, view=gv)
+    """Send a new game message using text-based (emoji) card representations."""
+    return await channel.send(embed=gv.build_embed(), view=gv)
 
 def calculate_score(hand):
     score, aces = 0, 0
@@ -678,27 +674,20 @@ async def bj(interaction: discord.Interaction, bet: int = 1000):
     sv = SetupView(interaction.user, bet)
     await interaction.response.send_message(embed=sv.build_embed(), view=sv)
 
-@bot.tree.command(name="test_emojis", description="[測試] 顯示目前讀取到的全部 53 張撲克牌圖片功能是否正常")
+@bot.tree.command(name="test_emojis", description="[測試] 顯示目前讀取到的全部撲克牌 Emoji 功能是否正常")
 async def test_emojis(interaction: discord.Interaction):
-    # 產生一副新牌
     deck = get_deck(1)
-    
     spades = [c for c in deck if c['suit'] == '♠️']
     hearts = [c for c in deck if c['suit'] == '♥️']
     diamonds = [c for c in deck if c['suit'] == '♦️']
     clubs = [c for c in deck if c['suit'] == '♣️']
-    
     msg = "**♠️ 黑桃:** " + " ".join([card_to_emoji(c) for c in spades]) + "\n\n"
     msg += "**♥️ 紅心:** " + " ".join([card_to_emoji(c) for c in hearts]) + "\n\n"
     msg += "**♦️ 方塊:** " + " ".join([card_to_emoji(c) for c in diamonds]) + "\n\n"
     msg += "**♣️ 梅花:** " + " ".join([card_to_emoji(c) for c in clubs]) + "\n\n"
     msg += "**🃏 牌背:** " + card_back_emoji()
-    
     embed = discord.Embed(title="🃏 撲克牌 Emoji 測試清單", description=msg, color=0x2b2d31)
-    embed.set_footer(text="如果某些牌顯示文字或破圖，代表該圖尚未被快取或檔名錯誤")
     await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
 
 @bot.tree.command(name="balance", description="查詢個人的戰績與餘額")
 @app_commands.describe(member="你想查詢的對象 (選填)")
@@ -706,42 +695,32 @@ async def balance(interaction: discord.Interaction, member: discord.Member = Non
     target = member or interaction.user
     stats = get_user_stats(target.id)
     if not stats: return await interaction.response.send_message(f"{target.mention} 尚未註冊！", ephemeral=True)
-    
     bal, total_games, wins, total_profit = stats
     win_rate = (wins / total_games * 100) if total_games > 0 else 0
-    
     embed = discord.Embed(title="📊 玩家戰績與帳戶餘額", color=0x2b2d31)
     embed.description = f"**{target.mention}** 的統計資料\n"
     embed.add_field(name="💰 目前餘額", value=f"`{bal}` 東雲幣", inline=False)
     embed.add_field(name="📈 歷史總獲利", value=f"`{total_profit}` 東雲幣", inline=False)
     embed.add_field(name="🎲 總遊玩局數", value=f"`{total_games}` 局", inline=True)
     embed.add_field(name="🏆 勝率", value=f"`{win_rate:.1f}%` ({wins}勝)", inline=True)
-    
     await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="record", description="查詢近期所有的收入紀錄")
 @app_commands.describe(member="你想查詢的對象 (選填)")
 async def record_cmd(interaction: discord.Interaction, member: discord.Member = None):
     target = member or interaction.user
-    
-    conn = get_db_connection()
-    c = conn.cursor()
+    conn = get_db_connection(); c = conn.cursor()
     c.execute("SELECT amount, reason, created_at FROM logs WHERE user_id=%s ORDER BY created_at DESC LIMIT 10", (str(target.id),))
-    rows = c.fetchall()
-    conn.close()
-    
-    if not rows:
-        return await interaction.response.send_message(f"{target.mention} 目前尚無任何收入紀錄！", ephemeral=True)
-    
+    rows = c.fetchall(); conn.close()
+    if not rows: return await interaction.response.send_message(f"{target.mention} 目前尚無任何收入紀錄！", ephemeral=True)
     embed = discord.Embed(title="📜 近期收入紀錄", color=0x2b2d31)
     embed.description = f"**{target.mention}** 的最近 10 筆紀錄\n\n"
-    
     for r in rows:
         amt, reason, dt = r[0], r[1], r[2]
         sign = "+" if amt > 0 else ""
         embed.description += f"[{dt.strftime('%m/%d %H:%M')}] {reason}: `{sign}{amt}`\n"
-        
     await interaction.response.send_message(embed=embed)
+
 @bot.tree.command(name="leaderboard", description="查看全伺服器最富有的前 10 名玩家")
 async def leaderboard(interaction: discord.Interaction):
     conn = get_db_connection(); c = conn.cursor()
@@ -761,6 +740,22 @@ async def give(ctx, member: discord.Member, amount: int):
     conn.commit(); conn.close()
     log_transaction(member.id, amount, "管理員發放")
     await ctx.send(f"💸 已成功發放 **{amount}** 東雲幣給 {member.mention}！")
+
+@bot.command()
+@is_host()
+async def take(ctx, member: discord.Member, amount: int):
+    if amount <= 0: return await ctx.send("金額必須大於 0")
+    conn = get_db_connection(); c = conn.cursor()
+    c.execute("SELECT balance FROM users WHERE user_id=%s", (str(member.id),))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return await ctx.send(f"⚠️ {member.mention} 尚未註冊！")
+    new_bal = max(0, row[0] - amount)
+    c.execute("UPDATE users SET balance=%s WHERE user_id=%s", (new_bal, str(member.id)))
+    conn.commit(); conn.close()
+    log_transaction(member.id, -(row[0] - new_bal), "管理員扣除")
+    await ctx.send(f"📉 已成功從 {member.mention} 帳戶中扣除 **{amount}** 東雲幣！現在餘額：{new_bal}")
 
 @bot.command()
 @is_host()
@@ -803,23 +798,6 @@ async def resetall_default(ctx):
 
 @bot.command()
 @is_host()
-async def take(ctx, member: discord.Member, amount: int):
-    if amount <= 0: return await ctx.send("金額必須大於 0")
-    conn = get_db_connection(); c = conn.cursor()
-    c.execute("SELECT balance FROM users WHERE user_id=%s", (str(member.id),))
-    row = c.fetchone()
-    if not row:
-        conn.close()
-        return await ctx.send(f"⚠️ {member.mention} 尚未註冊！")
-    
-    new_bal = max(0, row[0] - amount)
-    c.execute("UPDATE users SET balance=%s WHERE user_id=%s", (new_bal, str(member.id)))
-    conn.commit(); conn.close()
-    log_transaction(member.id, -(row[0] - new_bal), "管理員扣除")
-    await ctx.send(f"📉 已成功從 {member.mention} 帳戶中扣除 **{amount}** 東雲幣！現在餘額：{new_bal}")
-
-@bot.command()
-@is_host()
 async def adminhelp(ctx):
     help_text = """**👑 管理員專屬指令清單 (Prefix 限制)**
 `!give @玩家 <數量>` - 發放東雲幣
@@ -828,20 +806,7 @@ async def adminhelp(ctx):
 `!unban @玩家` - 解除黑名單
 `!lock` - 開關賭場 (停止新的/bj)
 `!resetall_zero` - 全服餘額歸零
-`!resetall_default` - 全服重置為 50,000
-`!cardstatus` - 查看卡牌圖片載入狀態"""
+`!resetall_default` - 全服重置為 50,000"""
     await ctx.send(help_text)
 
-@bot.command()
-@is_host()
-async def cardstatus(ctx):
-    loaded = len(_card_cache)
-    all_codes = ([r+s for r in 'A23456789' for s in 'SHDC']
-                 + ['0'+s for s in 'SHDC']
-                 + [r+s for r in ['J','Q','K'] for s in 'SHDC']
-                 + ['back'])
-    missing = [c for c in all_codes if c not in _card_cache]
-    status = "ALL OK" if not missing else f"MISSING: {', '.join(missing[:10])}"
-    await ctx.send(f"**Card Cache**: {loaded}/53\n`{status}`\nURL: `{CARD_IMG_BASE}AS.png`")
-
-bot.run(os.getenv('DISCORD_TOKEN'))
+bot.run(os.getenv('DISCORD_TOKEN'))
