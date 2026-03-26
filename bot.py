@@ -314,7 +314,7 @@ class BlackjackGame(discord.ui.View):
         else: bal, total, wins, t_prof = 0, 0, 0, 0
         wr = (wins/total*100) if total>0 else 0
         embed = discord.Embed(title="🃏 21點大賽", color=0x2b2d31)
-        main_ui = f"💰 餘額：{bal} | 🏆 勝場：{wins} | 🎲 總局數：{total} | 📈 勝率：{wr:.1f}%\n"
+        main_ui = f"💰 餘額：{bal} | 🏆 勝場：{wins} | 🎲 總局數：{total} | 📈 勝率：{wr:.1f}% | 💸 總盈虧：{t_prof}\n"
         if extra_msg: main_ui += f"**{extra_msg}**\n"
         for i, hand in enumerate(self.hands):
             indicator = "👉 " if i == self.current_hand and not done else ""
@@ -639,7 +639,8 @@ async def balance(interaction: discord.Interaction, member: discord.Member = Non
     msg += f"💰 目前餘額：`{bal}`\n"
     msg += f"🎲 總遊玩局數：`{total}` 局\n"
     msg += f"🏆 勝利場次：`{wins}` 場\n"
-    msg += f"📈 勝率：`{wr:.1f}%`"
+    msg += f"📈 勝率：`{wr:.1f}%`\n"
+    msg += f"💸 歷史總盈虧：`{t_prof}`"
     await interaction.response.send_message(msg)
 
 @bot.tree.command(name="record", description="最後 10 筆紀錄")
