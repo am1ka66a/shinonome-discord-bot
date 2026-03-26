@@ -314,7 +314,7 @@ class BlackjackGame(discord.ui.View):
         else: bal, total, wins, t_prof = 0, 0, 0, 0
         wr = (wins/total*100) if total>0 else 0
         embed = discord.Embed(title="🃏 21點大賽", color=0x2b2d31)
-        main_ui = f"目前餘額：{bal} | 勝率：{wr:.1f}%\n"
+        main_ui = f"💰 餘額：{bal} | 🏆 勝場：{wins} | 🎲 總局數：{total} | 📈 勝率：{wr:.1f}%\n"
         if extra_msg: main_ui += f"**{extra_msg}**\n"
         for i, hand in enumerate(self.hands):
             indicator = "👉 " if i == self.current_hand and not done else ""
@@ -600,7 +600,7 @@ async def beg(interaction: discord.Interaction):
     if row[1] and (now - row[1]).total_seconds() < 120: return await interaction.response.send_message("太快了", ephemeral=True)
     earn = random.randint(100, 600)
     if random.random() < 0.3: await interaction.response.send_message("沒人鳥你 乞丐"); c.execute("UPDATE users SET last_beg=%s WHERE user_id=%s", (now, str(interaction.user.id)))
-    else: c.execute("UPDATE users SET balance=balance+%s, last_beg=%s WHERE user_id=%s", (earn, now, str(interaction.user.id))); log_transaction(interaction.user.id, earn, "乞討所得"); await interaction.response.send_message(f"老闆發錢啦！獲得 {earn} 元")
+    else: c.execute("UPDATE users SET balance=balance+%s, last_beg=%s WHERE user_id=%s", (earn, now, str(interaction.user.id))); log_transaction(interaction.user.id, earn, "乞討所得"); await interaction.response.send_message(f"你被施捨了！獲得 {earn} 元")
     conn.commit(); conn.close()
 
 @bot.tree.command(name="rescue", description="[極致救濟] 餘額為 0 元時可領 1,000 (每人限領 10 次)")
@@ -629,11 +629,18 @@ async def bj(interaction: discord.Interaction, bet: int = 1000):
     if get_user_stats(interaction.user.id) is None: return await interaction.response.send_message("未註冊", ephemeral=True)
     sv = SetupView(interaction.user, bet); await interaction.response.send_message(embed=sv.build_embed(), view=sv)
 
-@bot.tree.command(name="balance", description="查詢餘額")
+@bot.tree.command(name="balance", description="查詢個人的戰績與餘額")
 async def balance(interaction: discord.Interaction, member: discord.Member = None):
     target = member or interaction.user; stats = get_user_stats(target.id)
     if not stats: return await interaction.response.send_message("未註冊", ephemeral=True)
-    await interaction.response.send_message(f"{target.mention} 餘額: `{stats[0]}`")
+    bal, total, wins, t_prof = stats
+    wr = (wins/total*100) if total > 0 else 0
+    msg = f"📊 **{target.mention} 的統計資料**\n"
+    msg += f"💰 目前餘額：`{bal}`\n"
+    msg += f"🎲 總遊玩局數：`{total}` 局\n"
+    msg += f"🏆 勝利場次：`{wins}` 場\n"
+    msg += f"📈 勝率：`{wr:.1f}%`"
+    await interaction.response.send_message(msg)
 
 @bot.tree.command(name="record", description="最後 10 筆紀錄")
 async def record_cmd(interaction: discord.Interaction):
@@ -652,7 +659,7 @@ async def leaderboard(interaction: discord.Interaction):
 @bot.command()
 @is_host()
 async def give(ctx, member: discord.Member, amount: int):
-    conn = get_db_connection(); c = conn.cursor(); c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (amount, str(member.id))); conn.commit(); conn.close(); await ctx.send(f"發放 {amount}")
+    conn = get_db_connection(); c = conn.cursor(); c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (amount, str(member.id))); conn.commit(); conn.close(); log_transaction(member.id, amount, "管理員發放"); await ctx.send(f"老闆發錢啦！已發放 **{amount}** 東雲幣給 {member.mention}！")
 
 @bot.command()
 @is_host()
