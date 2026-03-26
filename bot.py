@@ -97,63 +97,27 @@ def get_deck(num_decks=6):
 
 # Unicode 撲克牌字符對映表（iOS/macOS 渲染為實體卡牌圖示）
 # ==========================================
-# 🖼️ 系統 Discord 表符 (Emoji - 原生模式)
+# 🃏 系統 文本渲染模式 (Text Mode - 最穩定)
 # ==========================================
-_EMOJI_CACHE = {}  # {guild_id: {card_code: emoji_string}}
-
-def get_card_code(card) -> str:
-    """將卡牌轉換為 emoji_cards 資料夾對應的代碼 (例如 sp_A, pb_10)"""
-    # ♠️=sp, ♥️=cu (Cœur), ♦️=lo (Losange), ♣️=pb
-    suit_map = {'♠️': 'sp', '♥️': 'cu', '♦️': 'lo', '♣️': 'pb'}
-    # 有時 suit 會夾雜 \ufe0f (變體選擇符)
-    s = card['suit'].replace('\ufe0f', '')
-    if s == '♠': ps = 'sp'
-    elif s == '♥': ps = 'cu'
-    elif s == '♦': ps = 'lo'
-    elif s == '♣': ps = 'pb'
-    else: ps = suit_map.get(card['suit'], 'sp')
-    return f"{ps}_{card['rank']}"
-
 def card_to_emoji(card, guild_id=None) -> str:
-    """取得伺服器自訂 Emoji 表符，若無則回退文字"""
-    code = get_card_code(card)
-    if guild_id and guild_id in _EMOJI_CACHE:
-        emoji = _EMOJI_CACHE[guild_id].get(code)
-        if emoji: return emoji
-    return f"**{card['rank']}**{card['suit']} "
+    """將卡牌轉換為簡單易讀的文字與標準花色 (例如 **A**♠)"""
+    # 移除變量選擇符以獲得最乾淨的顯示
+    suit = card['suit'].replace('\ufe0f', '')
+    return f"`{card['rank']}{suit}`"
 
 async def sync_guild_emojis(guild: discord.Guild):
-    """自動同步卡牌圖片至伺服器作為自訂表符"""
-    if guild.id not in _EMOJI_CACHE:
-        _EMOJI_CACHE[guild.id] = {e.name: str(e) for e in guild.emojis}
-    if len([k for k in _EMOJI_CACHE[guild.id] if '_' in k]) >= 52: return
-    if len(guild.emojis) >= guild.emoji_limit: return
-    folder = "emoji_cards"
-    if not os.path.exists(folder): return
-    print(f"🔄 正在為 {guild.name} 同步卡牌表符...")
-    files = [f for f in os.listdir(folder) if f.endswith('.png')]
-    for filename in files:
-        name = filename.replace('.png', '')
-        if name not in _EMOJI_CACHE[guild.id]:
-            if len(guild.emojis) >= guild.emoji_limit: break
-            try:
-                with open(os.path.join(folder, filename), "rb") as f:
-                    new_emoji = await guild.create_custom_emoji(name=name, image=f.read())
-                    _EMOJI_CACHE[guild.id][name] = str(new_emoji)
-            except: break
+    """文本模式下停用 Emoji 同步"""
+    pass
 
 def card_back_emoji(guild_id=None) -> str:
-    if guild_id and guild_id in _EMOJI_CACHE:
-        emoji = _EMOJI_CACHE[guild_id].get('card_back')
-        if emoji: return emoji
-    return "🎴"
+    """文本模式下的牌背"""
+    return "`??`"
 
-async def _send_game(channel, gv: 'BlackjackGame', interaction: discord.Interaction = None, message_obj: discord.Message = None, view=None) -> discord.Message:
-    """使用 Discord 原生表符渲染遊戲畫面"""
-    if channel.guild:
-        await sync_guild_emojis(channel.guild)
-    
-    embed = gv.build_embed(guild_id=channel.guild.id if channel.guild else None)
+async def _send_game(channel, gv: 'BlackjackGame', interaction: discord.Interaction = None, message_obj: discord.Message = None, view=None, 
+                     done=False, res="", profit=0, animating=False, extra_msg="") -> discord.Message:
+    """使用純文本 Embed 渲染遊戲畫面"""
+    # 文本模式無需同步
+    embed = gv.build_embed(done=done, res=res, profit=profit, animating=animating, extra_msg=extra_msg, guild_id=channel.guild.id if channel.guild else None)
     current_view = view if view is not None else gv
 
     if interaction:
@@ -333,14 +297,17 @@ class BlackjackGame(discord.ui.View):
         self.last_action = now
         return True
 
-    async def _edit(self, message=None, extra_msg="", interaction: discord.Interaction = None):
-        """核心渲染工具：統一經由 _send_game 更新看板圖"""
+    async def _edit(self, message=None, extra_msg="", interaction: discord.Interaction = None, done=False, res="", profit=0, animating=False):
+        """核心渲染工具：統一經由 _send_game 更新畫面"""
         try:
             # 優先使用交互進行響應
             if interaction:
-                await _send_game(interaction.channel, self, interaction=interaction)
+                await _send_game(interaction.channel, self, interaction=interaction, done=done, res=res, profit=profit, animating=animating, extra_msg=extra_msg)
             elif message:
-                await _send_game(message.channel, self, message_obj=message)
+                await _send_game(message.channel, self, message_obj=message, done=done, res=res, profit=profit, animating=animating, extra_msg=extra_msg)
+            else:
+                # 若都沒有，至少印出警告避免靜默失敗
+                print("⚠️ _edit 找不到任何可更新的目標 (interaction/message 都為 None)")
         except Exception as e:
             print(f"❌ 渲染錯誤: {e}")
 
@@ -367,7 +334,9 @@ class BlackjackGame(discord.ui.View):
 
     def build_embed(self, done=False, res="", profit=0, animating=False, extra_msg="", guild_id=None):
         stats = get_user_stats(self.user.id)
-        bal, total, wins, t_prof = stats
+        if stats: bal, total, wins, t_prof = stats
+        else: bal, total, wins, t_prof = 0, 0, 0, 0
+        
         wr = (wins/total*100) if total>0 else 0
         embed = discord.Embed(title="🃏 21點大賽", color=0x2b2d31)
         embed.description = f"目前餘額：{bal} | 勝率：{wr:.1f}% | 總場次：{total} | 總盈虧：{t_prof}"
@@ -411,11 +380,11 @@ class BlackjackGame(discord.ui.View):
         if getattr(self, '_game_over', False): return
         self._game_over = True
         for c in self.children: c.disabled = True
-        update_game_result(self.user.id, prof + getattr(self, 'side_p', 0), win, is_push)
-        nv  = NewGameView(self.user, self.bet, self.p_bet, self.s_bet, get_user_stats(self.user.id)[0])
-        self.hand_results[self.current_hand] = (res, prof, win) # 確保結束時有結果，用於渲染
-        # 結束時切換到「新遊戲」的 View (nv)
-        await _send_game(message_obj.channel if message_obj else interaction.channel, self, interaction=interaction, message_obj=message_obj, view=nv)
+        stats = get_user_stats(self.user.id)
+        nv  = NewGameView(self.user, self.bet, self.p_bet, self.s_bet, stats[0] if stats else 0)
+        await _send_game(message_obj.channel if message_obj else interaction.channel, self, 
+                         interaction=interaction, message_obj=message_obj, view=nv, 
+                         done=True, res=res, profit=prof)
 
     async def advance_hand(self, message_obj=None, interaction=None):
         if getattr(self, '_game_over', False): return
@@ -435,14 +404,13 @@ class BlackjackGame(discord.ui.View):
             
         for c in self.children: c.disabled = True
         
-        # 使用傳入的交互或訊息進行更新
-        await self._edit(message=message_obj, interaction=interaction)
-
+        # 開始翻開莊家牌，顯示點數
+        await self._edit(message=message_obj, interaction=interaction, animating=True)
         if need_dealer:
             await asyncio.sleep(1.2)
             while calculate_score(self.d_hand) < 17 and len(self.d_hand) < 5:
                 self.d_hand.append(self.deck.pop())
-                await self._edit(message=message_obj, interaction=None) # 後續動畫不需要 interaction
+                await self._edit(message=message_obj, interaction=None, animating=True) # 後續動畫不需要 interaction
                 await asyncio.sleep(1.2)
 
         total_prof = 0
