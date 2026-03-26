@@ -680,6 +680,47 @@ async def ban(ctx, member: discord.Member):
 
 @bot.command()
 @is_host()
+async def take(ctx, member: discord.Member, amount: int):
+    conn = get_db_connection(); c = conn.cursor()
+    c.execute("UPDATE users SET balance=GREATEST(0, balance-%s) WHERE user_id=%s", (amount, str(member.id)))
+    conn.commit(); conn.close(); log_transaction(member.id, -amount, "管理員扣除"); await ctx.send(f"💸 已從 {member.mention} 帳戶扣除 **{amount}**！")
+
+@bot.command()
+@is_host()
+async def unban(ctx, member: discord.Member):
+    conn = get_db_connection(); c = conn.cursor()
+    c.execute("DELETE FROM blacklist WHERE user_id=%s", (str(member.id),))
+    conn.commit(); conn.close(); await ctx.send(f"✅ {member.mention} 已解鎖。")
+
+@bot.command()
+@is_host()
+async def resetall_zero(ctx):
+    conn = get_db_connection(); c = conn.cursor(); c.execute("UPDATE users SET balance=0")
+    conn.commit(); conn.close(); await ctx.send("💥 經濟大崩潰：全伺服器帳戶餘額已清零！")
+
+@bot.command()
+@is_host()
+async def resetall_default(ctx):
+    conn = get_db_connection(); c = conn.cursor()
+    c.execute("UPDATE users SET balance=50000, rescue_count=0, total_games=0, wins=0, total_profit=0")
+    conn.commit(); conn.close(); await ctx.send("🔄 已經為所有人重新發放 50,000 啟動資金，並重置所有統計數據。")
+
+@bot.command()
+@is_host()
+async def adminhelp(ctx):
+    help_text = """**👑 賭場管理員密令清單**
+`!give @玩家 <數量>` - 老闆發錢
+`!take @玩家 <數量>` - 扣除資金
+`!ban @玩家` - 設為黑名單
+`!unban @玩家` - 解除黑名單
+`!lock` - 暫停/開放賭場營業
+`!resetall_zero` - [危險] 全服餘額清零
+`!resetall_default` - [重置] 全服重置為 50,000
+`/say text:內容 channel:#頻道` - 代位發聲(斜線指令)"""
+    await ctx.send(help_text)
+
+@bot.command()
+@is_host()
 async def lock(ctx):
     global IS_EVENT_ACTIVE; IS_EVENT_ACTIVE = not IS_EVENT_ACTIVE; await ctx.send(f"狀態: {IS_EVENT_ACTIVE}")
 
