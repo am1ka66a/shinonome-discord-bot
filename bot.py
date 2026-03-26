@@ -346,6 +346,11 @@ class BlackjackGame(discord.ui.View):
     async def end(self, res, prof, win=False, is_push=False, message_obj=None, interaction=None):
         if getattr(self, '_game_over', False): return
         self._game_over = True
+        
+        # 關鍵修正：將結果更新至資料庫 (主注盈虧 + 旁注盈虧)
+        total_p = prof + getattr(self, 'side_p', 0)
+        update_game_result(self.user.id, total_p, win, is_push)
+        
         for c in self.children: c.disabled = True
         stats = get_user_stats(self.user.id)
         nv  = NewGameView(self.user, self.bet, self.p_bet, self.s_bet, stats[0] if stats else 0)
@@ -594,8 +599,8 @@ async def beg(interaction: discord.Interaction):
     now = datetime.datetime.now()
     if row[1] and (now - row[1]).total_seconds() < 120: return await interaction.response.send_message("太快了", ephemeral=True)
     earn = random.randint(100, 600)
-    if random.random() < 0.3: await interaction.response.send_message("沒人理你"); c.execute("UPDATE users SET last_beg=%s WHERE user_id=%s", (now, str(interaction.user.id)))
-    else: c.execute("UPDATE users SET balance=balance+%s, last_beg=%s WHERE user_id=%s", (earn, now, str(interaction.user.id))); log_transaction(interaction.user.id, earn, "乞討所得"); await interaction.response.send_message(f"獲得 {earn} 元")
+    if random.random() < 0.3: await interaction.response.send_message("沒人鳥你 乞丐"); c.execute("UPDATE users SET last_beg=%s WHERE user_id=%s", (now, str(interaction.user.id)))
+    else: c.execute("UPDATE users SET balance=balance+%s, last_beg=%s WHERE user_id=%s", (earn, now, str(interaction.user.id))); log_transaction(interaction.user.id, earn, "乞討所得"); await interaction.response.send_message(f"老闆發錢啦！獲得 {earn} 元")
     conn.commit(); conn.close()
 
 @bot.tree.command(name="rescue", description="[極致救濟] 餘額為 0 元時可領 1,000 (每人限領 10 次)")
