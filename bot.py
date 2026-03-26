@@ -7,6 +7,7 @@ import os
 import asyncio
 import datetime
 import time
+import typing
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -642,6 +643,16 @@ async def balance(interaction: discord.Interaction, member: discord.Member = Non
     msg += f"📈 勝率：`{wr:.1f}%`\n"
     msg += f"💸 歷史總盈虧：`{t_prof}`"
     await interaction.response.send_message(msg)
+
+@bot.tree.command(name="say", description="[管理員] 指定機器人對特定頻道發送內容")
+@app_commands.describe(text="你要機器人說什麼？", channel="指定發送到哪個頻道？(選填)")
+@app_commands.default_permissions(manage_messages=True)
+async def say_slash(interaction: discord.Interaction, text: str, channel: discord.TextChannel = None):
+    if interaction.user.id not in ALLOWED_HOST_IDS:
+        return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
+    target_channel = channel or interaction.channel
+    await target_channel.send(text)
+    await interaction.response.send_message(f"✅ 訊息已發送到 {target_channel.mention}！", ephemeral=True)
 
 @bot.tree.command(name="record", description="最後 10 筆紀錄")
 async def record_cmd(interaction: discord.Interaction):
