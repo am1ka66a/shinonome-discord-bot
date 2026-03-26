@@ -97,13 +97,11 @@ def get_deck(num_decks=6):
 
 # Unicode 撲克牌字符對映表（iOS/macOS 渲染為實體卡牌圖示）
 # ==========================================
-# 🃏 系統 文本渲染模式 (Text Mode - 最穩定)
+# 🃏 系統 文本渲染模式 (Classic Bracket Mode)
 # ==========================================
 def card_to_emoji(card, guild_id=None) -> str:
-    """將卡牌轉換為簡單易讀的文字與標準花色 (例如 **A**♠)"""
-    # 移除變量選擇符以獲得最乾淨的顯示
-    suit = card['suit'].replace('\ufe0f', '')
-    return f"`{card['rank']}{suit}`"
+    """將卡牌轉換為經典括號樣式與標準花色 (例如 [A ♦️])"""
+    return f"**[{card['rank']} {card['suit']}]**"
 
 async def sync_guild_emojis(guild: discord.Guild):
     """文本模式下停用 Emoji 同步"""
@@ -111,7 +109,7 @@ async def sync_guild_emojis(guild: discord.Guild):
 
 def card_back_emoji(guild_id=None) -> str:
     """文本模式下的牌背"""
-    return "`??`"
+    return "**[??]**"
 
 async def _send_game(channel, gv: 'BlackjackGame', interaction: discord.Interaction = None, message_obj: discord.Message = None, view=None, 
                      done=False, res="", profit=0, animating=False, extra_msg="") -> discord.Message:
@@ -339,29 +337,32 @@ class BlackjackGame(discord.ui.View):
         
         wr = (wins/total*100) if total>0 else 0
         embed = discord.Embed(title="🃏 21點大賽", color=0x2b2d31)
-        embed.description = f"目前餘額：{bal} | 勝率：{wr:.1f}% | 總場次：{total} | 總盈虧：{t_prof}"
-        if extra_msg:
-            embed.description += f"\n\n**{extra_msg}**"
+        
+        # 使用 Markdown 標題語法 (###) 來放大顯示玩家與莊家手牌
+        main_ui = f"目前餘額：{bal} | 勝率：{wr:.1f}%\n"
+        if extra_msg: main_ui += f"**{extra_msg}**\n"
+        
         for i, hand in enumerate(self.hands):
             indicator = "👉 " if i == self.current_hand and not done else ""
             title_text = f"{indicator}👤 {self.user.display_name} 的手牌"
             if len(self.hands) > 1: title_text += f" (第 {i+1} 手)"
-            
             p_cards = ' '.join([card_to_emoji(c, guild_id) for c in hand])
-            embed.add_field(name=title_text, value=f"{p_cards}\n點數：**{calculate_score(hand)}**", inline=False)
+            main_ui += f"### {title_text}\n### {p_cards} (點數: **{calculate_score(hand)}**)\n"
+            
         if done or animating:
             d_cards = ' '.join([card_to_emoji(c, guild_id) for c in self.d_hand])
-            embed.add_field(name="🤖 莊家手牌", value=f"{d_cards}\n點數：**{calculate_score(self.d_hand)}**", inline=False)
+            main_ui += f"### 🤖 莊家手牌\n### {d_cards} (點數: **{calculate_score(self.d_hand)}**)\n"
             if done:
                 total_profit = profit + self.side_p
-                res_text = f"**{res}**\n{self.side_m}\n"
-                if total_profit > 0: res_text += f"\n📈 本局總計：`+{total_profit}` 東雲幣"
-                elif total_profit < 0: res_text += f"\n📉 本局總計：`{total_profit}` 東雲幣"
-                else: res_text += f"\n➖ 本局無輸贏"
-                res_text += f"\n💰 最新餘額：`{bal}` 東雲幣"
-                embed.add_field(name="🏆 結果", value=res_text, inline=False)
+                res_line = f"### 🏆 {res}\n{self.side_m}\n"
+                if total_profit > 0: res_line += f"📈 總盈虧：`+{total_profit}` | 💰 餘額：`{bal}`\n"
+                elif total_profit < 0: res_line += f"📉 總盈虧：`{total_profit}` | 💰 餘額：`{bal}`\n"
+                else: res_line += f"➖ 無輸贏 | 💰 餘額：`{bal}`\n"
+                main_ui += res_line
         else:
-            embed.add_field(name="🤖 莊家手牌", value=f"{card_to_emoji(self.d_hand[0], guild_id)} {card_back_emoji(guild_id)}\n點數：**❓**", inline=False)
+            main_ui += f"### 🤖 莊家手牌\n### {card_to_emoji(self.d_hand[0], guild_id)} {card_back_emoji(guild_id)} (點數: **❓**)\n"
+        
+        embed.description = main_ui
         return embed
 
 
