@@ -95,40 +95,81 @@ def get_deck(num_decks=6):
     return [{'rank': r, 'suit': s} for s in suits for r in ranks] * num_decks
 
 # Unicode 撲克牌字符對映表（iOS/macOS 渲染為實體卡牌圖示）
-_CARD_MAP = {
-    'A':  {'♠': '🂡', '♥': '🂱', '♦': '🃁', '♣': '🃑'},
-    '2':  {'♠': '🂢', '♥': '🂲', '♦': '🃂', '♣': '🃒'},
-    '3':  {'♠': '🂣', '♥': '🂳', '♦': '🃃', '♣': '🃓'},
-    '4':  {'♠': '🂤', '♥': '🂴', '♦': '🃄', '♣': '🃔'},
-    '5':  {'♠': '🂥', '♥': '🂵', '♦': '🃅', '♣': '🃕'},
-    '6':  {'♠': '🂦', '♥': '🂶', '♦': '🃆', '♣': '🃖'},
-    '7':  {'♠': '🂧', '♥': '🂷', '♦': '🃇', '♣': '🃗'},
-    '8':  {'♠': '🂨', '♥': '🂸', '♦': '🃈', '♣': '🃘'},
-    '9':  {'♠': '🂩', '♥': '🂹', '♦': '🃉', '♣': '🃙'},
-    '10': {'♠': '🂪', '♥': '🂺', '♦': '🃊', '♣': '🃚'},
-    'J':  {'♠': '🂫', '♥': '🂻', '♦': '🃋', '♣': '🃛'},
-    'Q':  {'♠': '🂭', '♥': '🂽', '♦': '🃍', '♣': '🃝'},
-    'K':  {'♠': '🂮', '♥': '🂾', '♦': '🃎', '♣': '🃞'},
-}
 # ==========================================
-# 🖼️ 卡牌顯示系統 (Discord 內建 Unicode Emoji)
+# 🖼️ 系統 Emoji 快取
 # ==========================================
+_EMOJI_CACHE = {}  # {guild_id: {card_code: emoji_string}}
 
-def card_back_emoji() -> str:
-    return '🃏'  # 原有的牌背符號，使用小丑完美還原
+def get_card_code(card) -> str:
+    """將卡牌轉換為 emoji_cards 資料夾對應的代碼 (例如 sp_A, pb_10)"""
+    # ♠️=sp, ♥️=cu (Cœur), ♦️=lo (Losange), ♣️=pb
+    suit_map = {'♠️': 'sp', '♥️': 'cu', '♦️': 'lo', '♣️': 'pb'}
+    # 有時 suit 會夾雜 \ufe0f
+    s = card['suit'].replace('\ufe0f', '')
+    if s == '♠': ps = 'sp'
+    elif s == '♥': ps = 'cu'
+    elif s == '♦': ps = 'lo'
+    elif s == '♣': ps = 'pb'
+    else: ps = suit_map.get(card['suit'], 'sp')
+    return f"{ps}_{card['rank']}"
 
-def card_to_emoji(card) -> str:
-    """完美還原極簡風格：直接使用 Discord 內建高品質的撲克牌 Unicode Emoji"""
-    suit = card['suit'].replace('\ufe0f', '')
-    return _CARD_MAP.get(card['rank'], {}).get(suit, f"**{card['rank']}** {suit}")
+def card_to_emoji(card, guild_id=None) -> str:
+    """嘗試取得伺服器自訂 Emoji，若無則回退至文字"""
+    code = get_card_code(card)
+    if guild_id and guild_id in _EMOJI_CACHE:
+        emoji = _EMOJI_CACHE[guild_id].get(code)
+        if emoji: return emoji
+    return f"**{card['rank']}**{card['suit']} "
 
-# 不需要再從 _emoji_cache 裡拿了
+async def sync_guild_emojis(guild: discord.Guild):
+    """將 emoji_cards 資料夾中的圖片自動上傳到伺服器作為自訂 Emoji"""
+    if guild.id not in _EMOJI_CACHE:
+        _EMOJI_CACHE[guild.id] = {}
+        # 更新目前已有的 emoji
+        existing = {e.name: str(e) for e in guild.emojis}
+        _EMOJI_CACHE[guild.id].update(existing)
+    
+    current_count = len([k for k in _EMOJI_CACHE[guild.id] if '_' in k or k == 'card_back'])
+    if current_count >= 53: return
 
+    # 檢查剩餘額度
+    limit = guild.emoji_limit
+    if len(guild.emojis) >= limit: return
 
+    folder = "emoji_cards"
+    if not os.path.exists(folder): return
 
+    print(f"🔄 正在為 {guild.name} 上傳缺失的卡牌 Emoji (剩餘額度: {limit - len(guild.emojis)})...")
+    
+    # 遍歷資料夾中的所有圖片
+    files = [f for f in os.listdir(folder) if f.endswith('.png')]
+    count = 0
+    for filename in files:
+        name = filename.replace('.png', '')
+        if name not in _EMOJI_CACHE[guild.id]:
+            if len(guild.emojis) >= limit: break
+            try:
+                with open(os.path.join(folder, filename), "rb") as f:
+                    img = f.read()
+                    new_emoji = await guild.create_custom_emoji(name=name, image=img, reason="Blackjack Card Icons")
+                    _EMOJI_CACHE[guild.id][name] = str(new_emoji)
+                    count += 1
+            except Exception as e:
+                print(f"⚠️ 無法上傳 {name}: {e}")
+                break # 可能遇到 Rate Limit 或權限問題
+    if count > 0: print(f"✅ 成功上傳 {count} 張卡牌 Emoji 至 {guild.name}")
+
+def card_back_emoji(guild_id=None) -> str:
+    """嘗試取得伺服器自訂牌背 Emoji，若無則回退至萬國碼"""
+    if guild_id and guild_id in _EMOJI_CACHE:
+        emoji = _EMOJI_CACHE[guild_id].get('card_back')
+        if emoji: return emoji
+    return "🎴"
 async def _send_game(channel, gv: 'BlackjackGame') -> discord.Message:
-    """Send a new game message using text-based (emoji) card representations."""
-    return await channel.send(embed=gv.build_embed(), view=gv)
+    """完美還原：傳送遊戲訊息並優先使用伺服器自訂卡牌 Emoji"""
+    if channel.guild:
+        await sync_guild_emojis(channel.guild)
+    return await channel.send(embed=gv.build_embed(guild_id=channel.guild.id if channel.guild else None), view=gv)
 
 def calculate_score(hand):
     score, aces = 0, 0
@@ -276,10 +317,9 @@ class BlackjackGame(discord.ui.View):
         self.d_hand = [self.deck.pop(), self.deck.pop()]
         self.current_hand = 0
         self.hand_results = [None]
-        
-        # 結算旁注 (只用初始第一手計算)
         self.side_p, self.side_m = check_sidebets(self.hands[0], self.d_hand[0], p_bet, s_bet)
         self.update_buttons()
+
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.user.id:
@@ -293,6 +333,18 @@ class BlackjackGame(discord.ui.View):
             
         self.last_action = now
         return True
+
+    async def _edit(self, message, done=False, res="", profit=0, animating=False, extra_msg="", view=None):
+        """核心渲染工具：統一更新腳本，修復 Stand 按鈕死機問題"""
+        try:
+            guild_id = message.guild.id if message.guild else None
+            embed = self.build_embed(done=done, res=res, profit=profit, animating=animating, extra_msg=extra_msg, guild_id=guild_id)
+            if view is not None:
+                await message.edit(embed=embed, view=view)
+            else:
+                await message.edit(embed=embed, view=self)
+        except Exception as e:
+            print(f"❌ 渲染錯誤: {e}")
 
     @property
     def p_hand(self):
@@ -315,7 +367,7 @@ class BlackjackGame(discord.ui.View):
         for c in to_remove:
             self.remove_item(c)
 
-    def build_embed(self, done=False, res="", profit=0, animating=False, extra_msg=""):
+    def build_embed(self, done=False, res="", profit=0, animating=False, extra_msg="", guild_id=None):
         stats = get_user_stats(self.user.id)
         bal, total, wins, t_prof = stats
         wr = (wins/total*100) if total>0 else 0
@@ -326,10 +378,10 @@ class BlackjackGame(discord.ui.View):
         for i, hand in enumerate(self.hands):
             indicator = "👉 " if i == self.current_hand and not done else ""
             title_text = f"{indicator}👤 {self.user.display_name} 的手牌 (第 {i+1} 手)" if len(self.hands)>1 else f"{indicator}👤 {self.user.display_name} 的手牌"
-            p_cards = ' '.join([card_to_emoji(c) for c in hand])
+            p_cards = ' '.join([card_to_emoji(c, guild_id) for c in hand])
             embed.add_field(name=title_text, value=f"{p_cards}\n點數：{calculate_score(hand)}", inline=False)
         if done or animating:
-            d_cards = ' '.join([card_to_emoji(c) for c in self.d_hand])
+            d_cards = ' '.join([card_to_emoji(c, guild_id) for c in self.d_hand])
             embed.add_field(name="🤖 莊家手牌", value=f"{d_cards}\n點數：{calculate_score(self.d_hand)}", inline=False)
             if done:
                 total_profit = profit + self.side_p
@@ -340,7 +392,7 @@ class BlackjackGame(discord.ui.View):
                 res_text += f"\n💰 最新餘額：`{bal}` 東雲幣"
                 embed.add_field(name="🏆 結果", value=res_text, inline=False)
         else:
-            embed.add_field(name="🤖 莊家手牌", value=f"{card_to_emoji(self.d_hand[0])} {card_back_emoji()}\n點數：❓", inline=False)
+            embed.add_field(name="🤖 莊家手牌", value=f"{card_to_emoji(self.d_hand[0], guild_id)} {card_back_emoji(guild_id)}\n點數：❓", inline=False)
         return embed
 
 
@@ -641,7 +693,7 @@ async def register(interaction: discord.Interaction):
         await interaction.response.send_message(f"🎉 {interaction.user.mention} 註冊成功，獲得 50,000 東雲幣！")
     conn.commit(); conn.close()
 
-@bot.tree.command(name="daily", description="每日簽到領取 100,000 東雲幣")
+@bot.tree.command(name="daily", description="每日簽到領取 10,000 東雲幣")
 async def daily(interaction: discord.Interaction):
     if is_blacklisted(interaction.user.id): return await interaction.response.send_message("🚫 被ban的傻屌無法簽到！", ephemeral=True)
     stats = get_user_stats(interaction.user.id)
