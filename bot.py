@@ -188,20 +188,23 @@ def card_back_emoji(guild_id=None) -> str:
         if emoji: return emoji
     return "🎴"
 
-async def _send_game(channel, gv: 'BlackjackGame', interaction: discord.Interaction = None) -> discord.Message:
-    """傳送遊戲訊息，回歸使用 Discord 原生表符 (Emoji) 顯示"""
+async def _send_game(channel, gv: 'BlackjackGame', interaction: discord.Interaction = None, message_obj: discord.Message = None, view=None) -> discord.Message:
+    """傳送或更新遊戲訊息，回歸使用 Discord 原生表符 (Emoji) 顯示"""
     if channel.guild:
         await sync_guild_emojis(channel.guild)
     
     embed = gv.build_embed(guild_id=channel.guild.id if channel.guild else None)
-    
+    current_view = view if view is not None else gv
+
     if interaction:
         if interaction.response.is_done():
-            return await interaction.edit_original_response(embed=embed, view=gv, attachments=[])
+            return await interaction.edit_original_response(embed=embed, view=current_view)
         else:
-            await interaction.response.edit_message(embed=embed, view=gv, attachments=[])
+            await interaction.response.edit_message(embed=embed, view=current_view)
             return await interaction.original_response()
-    return await channel.send(embed=embed, view=gv)
+    elif message_obj:
+        return await message_obj.edit(embed=embed, view=current_view)
+    return await channel.send(embed=embed, view=current_view)
 
 def calculate_score(hand):
     score, aces = 0, 0
@@ -377,7 +380,7 @@ class BlackjackGame(discord.ui.View):
             if interaction:
                 await _send_game(interaction.channel, self, interaction=interaction)
             elif message:
-                await _send_game(message.channel, self)
+                await _send_game(message.channel, self, message_obj=message)
         except Exception as e:
             print(f"❌ 渲染錯誤: {e}")
 
@@ -450,7 +453,9 @@ class BlackjackGame(discord.ui.View):
         for c in self.children: c.disabled = True
         update_game_result(self.user.id, prof + getattr(self, 'side_p', 0), win, is_push)
         nv  = NewGameView(self.user, self.bet, self.p_bet, self.s_bet, get_user_stats(self.user.id)[0])
-        await _send_game(message_obj.channel if message_obj else interaction.channel, self, interaction=interaction)
+        self.hand_results[self.current_hand] = (res, prof, win) # 確保結束時有結果，用於渲染
+        # 結束時切換到「新遊戲」的 View (nv)
+        await _send_game(message_obj.channel if message_obj else interaction.channel, self, interaction=interaction, message_obj=message_obj, view=nv)
 
     async def advance_hand(self, message_obj=None, interaction=None):
         if getattr(self, '_game_over', False): return
@@ -525,7 +530,7 @@ class BlackjackGame(discord.ui.View):
         final_msg = "\n".join(final_res_texts)
         # 計算含旁注的總盈虧以判定勝負與是否平手
         total_combined = total_prof + getattr(self, 'side_p', 0)
-        await self.end(final_msg, total_prof, total_combined > 0, total_combined == 0, message_obj=message_obj)
+        await self.end(final_msg, total_prof, total_combined > 0, total_combined == 0, message_obj=message_obj, interaction=interaction)
 
     @discord.ui.button(label="要牌", style=discord.ButtonStyle.success)
     async def hit(self, inter, btn):
