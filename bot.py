@@ -6,6 +6,8 @@ import pymysql
 import os
 import asyncio
 import datetime
+from PIL import Image, ImageDraw, ImageFont
+import io
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -121,63 +123,84 @@ def card_to_emoji(card, guild_id=None) -> str:
         if emoji: return emoji
     return f"**{card['rank']}**{card['suit']} "
 
-async def sync_guild_emojis(guild: discord.Guild):
-    """將 emoji_cards 資料夾中的圖片自動上傳到伺服器作為自訂 Emoji"""
-    if guild.id not in _EMOJI_CACHE:
-        _EMOJI_CACHE[guild.id] = {}
-        # 更新目前已有的 emoji
-        existing = {e.name: str(e) for e in guild.emojis}
-        _EMOJI_CACHE[guild.id].update(existing)
+# ==========================================
+# 🖼️ 系統 圖片合成器 (Pillow)
+# ==========================================
+def get_card_image(card) -> Image.Image:
+    """從 emoji_cards 讀取單張卡牌圖片"""
+    code = get_card_code(card)
+    path = f"emoji_cards/{code}.png"
+    if not os.path.exists(path):
+        # 建立一個測試用的色塊，以防缺檔
+        return Image.new('RGBA', (150, 210), (100, 100, 100))
+    return Image.open(path).convert("RGBA")
+
+def combine_hand_images(hand, hidden=False) -> Image.Image:
+    """將手牌合成一張橫向排列的圖片"""
+    cw, ch = 150, 210  # 單張卡牌尺寸
+    gap = 20           # 卡牌間隙
+    n = len(hand)
+    board_w = (cw * n) + (gap * (n - 1))
+    img = Image.new('RGBA', (board_w, ch), (0,0,0,0))
     
-    current_count = len([k for k in _EMOJI_CACHE[guild.id] if '_' in k or k == 'card_back'])
-    if current_count >= 53: return
+    for i, card in enumerate(hand):
+        if hidden and i == 1:
+            c_img = Image.open("emoji_cards/card_back.png").convert("RGBA")
+        else:
+            c_img = get_card_image(card)
+        img.paste(c_img, (i * (cw + gap), 0), c_img)
+    return img
 
-    # 檢查剩餘額度
-    limit = guild.emoji_limit
-    if len(guild.emojis) >= limit: return
-
-    folder = "emoji_cards"
-    if not os.path.exists(folder): return
-
-    print(f"🔄 正在為 {guild.name} 上傳缺失的卡牌 Emoji (剩餘額度: {limit - len(guild.emojis)})...")
+def create_game_board(dealer_hand, player_hands, current_hand=0, done=False) -> io.BytesIO:
+    """整合莊與玩家所有手牌的最終看板 (左右對手感)"""
+    # 簡化版：將莊家與玩家目前作用的手牌上下排列並存入 BytesIO
+    cw, ch = 150, 210
+    gap = 30
     
-    # 遍歷資料夾中的所有圖片
-    files = [f for f in os.listdir(folder) if f.endswith('.png')]
-    count = 0
-    for filename in files:
-        name = filename.replace('.png', '')
-        if name not in _EMOJI_CACHE[guild.id]:
-            if len(guild.emojis) >= limit: break
-            try:
-                with open(os.path.join(folder, filename), "rb") as f:
-                    img = f.read()
-                    new_emoji = await guild.create_custom_emoji(name=name, image=img, reason="Blackjack Card Icons")
-                    _EMOJI_CACHE[guild.id][name] = str(new_emoji)
-                    count += 1
-            except Exception as e:
-                print(f"⚠️ 無法上傳 {name}: {e}")
-                break # 可能遇到 Rate Limit 或權限問題
-    if count > 0: print(f"✅ 成功上傳 {count} 張卡牌 Emoji 至 {guild.name}")
+    # 取得莊家圖
+    d_img = combine_hand_images(dealer_hand, hidden=not done)
+    # 取得玩家目前手牌圖
+    p_img = combine_hand_images(player_hands[current_hand])
+    
+    # 計算總寬高 (以莊/玩最寬的為準)
+    tw = max(d_img.width, p_img.width)
+    th = ch * 2 + gap + 40 # 40 是標籤空間
+    
+    final = Image.new('RGBA', (tw, th), (0,0,0,0))
+    draw = ImageDraw.Draw(final)
+    
+    try: font = ImageFont.truetype("arial.ttf", 24)
+    except: font = ImageFont.load_default()
+    
+    # 繪製莊家部分
+    draw.text((0, 0), "BOT DEALER", fill="white", font=font)
+    final.paste(d_img, (0, 30), d_img)
+    
+    # 繪製玩家部分
+    draw.text((0, ch + gap + 10), "PLAYER HAND", fill="white", font=font)
+    final.paste(p_img, (0, ch + gap + 40), p_img)
+    
+    buf = io.BytesIO()
+    final.save(buf, format='PNG')
+    buf.seek(0)
+    return buf
 
-def card_back_emoji(guild_id=None) -> str:
-    """嘗試取得伺服器自訂牌背 Emoji，若無則回退至萬國碼"""
-    if guild_id and guild_id in _EMOJI_CACHE:
-        emoji = _EMOJI_CACHE[guild_id].get('card_back')
-        if emoji: return emoji
-    return "🎴"
 async def _send_game(channel, gv: 'BlackjackGame', interaction: discord.Interaction = None) -> discord.Message:
-    """傳送遊戲訊息，並優先使用伺服器自訂卡牌 Emoji"""
-    if channel.guild:
-        await sync_guild_emojis(channel.guild)
+    """傳送遊戲訊息，合成一張精美的高畫質看板圖片"""
+    # 生成看板圖
+    board_buf = create_game_board(gv.d_hand, gv.hands, gv.current_hand, done=(gv.hand_results[gv.current_hand] is not None or getattr(gv, '_game_over', False)))
+    file = discord.File(board_buf, filename="game_board.png")
     
     embed = gv.build_embed(guild_id=channel.guild.id if channel.guild else None)
+    embed.set_image(url="attachment://game_board.png")
+    
     if interaction:
         if interaction.response.is_done():
-            return await interaction.edit_original_response(embed=embed, view=gv)
+            return await interaction.edit_original_response(embed=embed, view=gv, attachments=[file])
         else:
-            await interaction.response.edit_message(embed=embed, view=gv)
+            await interaction.response.edit_message(embed=embed, view=gv, attachments=[file])
             return await interaction.original_response()
-    return await channel.send(embed=embed, view=gv)
+    return await channel.send(embed=embed, view=gv, file=file)
 
 def calculate_score(hand):
     score, aces = 0, 0
@@ -391,13 +414,9 @@ class BlackjackGame(discord.ui.View):
             indicator = "👉 " if i == self.current_hand and not done else ""
             title_text = f"{indicator}👤 {self.user.display_name} 的手牌"
             if len(self.hands) > 1: title_text += f" (第 {i+1} 手)"
-            
-            p_cards = ' '.join([card_to_emoji(c, guild_id) for c in hand])
-            # 使用 Markdown 標題語法 (###) 讓 Emoji 稍微變大一點
-            embed.add_field(name=title_text, value=f"### {p_cards}\n點數：**{calculate_score(hand)}**", inline=False)
+            embed.add_field(name=title_text, value=f"點數：**{calculate_score(hand)}**", inline=False)
         if done or animating:
-            d_cards = ' '.join([card_to_emoji(c, guild_id) for c in self.d_hand])
-            embed.add_field(name="🤖 莊家手牌", value=f"### {d_cards}\n點數：**{calculate_score(self.d_hand)}**", inline=False)
+            embed.add_field(name="🤖 莊家手牌", value=f"點數：**{calculate_score(self.d_hand)}**", inline=False)
             if done:
                 total_profit = profit + self.side_p
                 res_text = f"**{res}**\n{self.side_m}\n"
@@ -407,7 +426,7 @@ class BlackjackGame(discord.ui.View):
                 res_text += f"\n💰 最新餘額：`{bal}` 東雲幣"
                 embed.add_field(name="🏆 結果", value=res_text, inline=False)
         else:
-            embed.add_field(name="🤖 莊家手牌", value=f"### {card_to_emoji(self.d_hand[0], guild_id)} {card_back_emoji(guild_id)}\n點數：**❓**", inline=False)
+            embed.add_field(name="🤖 莊家手牌", value=f"點數：**❓**", inline=False)
         return embed
 
 
