@@ -165,11 +165,19 @@ def card_back_emoji(guild_id=None) -> str:
         emoji = _EMOJI_CACHE[guild_id].get('card_back')
         if emoji: return emoji
     return "🎴"
-async def _send_game(channel, gv: 'BlackjackGame') -> discord.Message:
-    """完美還原：傳送遊戲訊息並優先使用伺服器自訂卡牌 Emoji"""
+async def _send_game(channel, gv: 'BlackjackGame', interaction: discord.Interaction = None) -> discord.Message:
+    """傳送遊戲訊息，並優先使用伺服器自訂卡牌 Emoji"""
     if channel.guild:
         await sync_guild_emojis(channel.guild)
-    return await channel.send(embed=gv.build_embed(guild_id=channel.guild.id if channel.guild else None), view=gv)
+    
+    embed = gv.build_embed(guild_id=channel.guild.id if channel.guild else None)
+    if interaction:
+        if interaction.response.is_done():
+            return await interaction.edit_original_response(embed=embed, view=gv)
+        else:
+            await interaction.response.edit_message(embed=embed, view=gv)
+            return await interaction.original_response()
+    return await channel.send(embed=embed, view=gv)
 
 def calculate_score(hand):
     score, aces = 0, 0
@@ -291,14 +299,18 @@ class SetupView(discord.ui.View):
     @discord.ui.button(label="開始遊戲 (再來一局)", style=discord.ButtonStyle.success)
     async def start(self, inter, btn):
         if inter.user.id != self.user.id: return
+        # 立即延遲響應，避免上傳 Emoji 時超時導致按鈕「消失」
+        await inter.response.defer()
+        
         stats = get_user_stats(self.user.id)
-        if not stats:
-            return await inter.response.send_message("請先使用 /register 註冊！", ephemeral=True)
+        if not stats: return await inter.followup.send("請先使用 /register 註冊！", ephemeral=True)
         if stats[0] < (self.base_bet + self.p_bet + self.s_bet):
-            return await inter.response.send_message("餘額不足", ephemeral=True)
-        self.stop(); await inter.message.delete()
+            return await inter.followup.send("餘額不足", ephemeral=True)
+            
+        self.stop()
         gv = BlackjackGame(self.user, self.base_bet, self.p_bet, self.s_bet)
-        msg = await _send_game(inter.channel, gv)
+        await _send_game(inter.channel, gv, interaction=inter)
+        msg = await inter.original_response()
         asyncio.create_task(gv.check_auto_bj(msg))
 
     @discord.ui.button(label="自訂下注金額", style=discord.ButtonStyle.primary)
@@ -377,12 +389,15 @@ class BlackjackGame(discord.ui.View):
             embed.description += f"\n\n**{extra_msg}**"
         for i, hand in enumerate(self.hands):
             indicator = "👉 " if i == self.current_hand and not done else ""
-            title_text = f"{indicator}👤 {self.user.display_name} 的手牌 (第 {i+1} 手)" if len(self.hands)>1 else f"{indicator}👤 {self.user.display_name} 的手牌"
+            title_text = f"{indicator}👤 {self.user.display_name} 的手牌"
+            if len(self.hands) > 1: title_text += f" (第 {i+1} 手)"
+            
             p_cards = ' '.join([card_to_emoji(c, guild_id) for c in hand])
-            embed.add_field(name=title_text, value=f"{p_cards}\n點數：{calculate_score(hand)}", inline=False)
+            # 使用 Markdown 標題語法 (###) 讓 Emoji 稍微變大一點
+            embed.add_field(name=title_text, value=f"### {p_cards}\n點數：**{calculate_score(hand)}**", inline=False)
         if done or animating:
             d_cards = ' '.join([card_to_emoji(c, guild_id) for c in self.d_hand])
-            embed.add_field(name="🤖 莊家手牌", value=f"{d_cards}\n點數：{calculate_score(self.d_hand)}", inline=False)
+            embed.add_field(name="🤖 莊家手牌", value=f"### {d_cards}\n點數：**{calculate_score(self.d_hand)}**", inline=False)
             if done:
                 total_profit = profit + self.side_p
                 res_text = f"**{res}**\n{self.side_m}\n"
@@ -392,7 +407,7 @@ class BlackjackGame(discord.ui.View):
                 res_text += f"\n💰 最新餘額：`{bal}` 東雲幣"
                 embed.add_field(name="🏆 結果", value=res_text, inline=False)
         else:
-            embed.add_field(name="🤖 莊家手牌", value=f"{card_to_emoji(self.d_hand[0], guild_id)} {card_back_emoji(guild_id)}\n點數：❓", inline=False)
+            embed.add_field(name="🤖 莊家手牌", value=f"### {card_to_emoji(self.d_hand[0], guild_id)} {card_back_emoji(guild_id)}\n點數：**❓**", inline=False)
         return embed
 
 
@@ -620,35 +635,34 @@ class NewGameView(discord.ui.View):
 
     @discord.ui.button(label="再來一局", style=discord.ButtonStyle.success)
     async def again(self, inter, btn):
-        stats = get_user_stats(self.user.id)
-        if not stats:
-            return await inter.response.send_message("請先使用 /register 註冊！", ephemeral=True)
-        if stats[0] < (self.last_bet + self.last_p_bet + self.last_s_bet):
-            return await inter.response.send_message("餘額不足", ephemeral=True)
-        self.stop()
+        if inter.user.id != self.user.id: return
         await inter.response.defer()
-        try:
-            await inter.message.delete()
-        except:
-            pass
+        
+        stats = get_user_stats(self.user.id)
+        if not stats: return await inter.followup.send("請先使用 /register 註冊！", ephemeral=True)
+        if stats[0] < (self.last_bet + self.last_p_bet + self.last_s_bet):
+            return await inter.followup.send("餘額不足", ephemeral=True)
+            
+        self.stop()
         gv = BlackjackGame(self.user, self.last_bet, self.last_p_bet, self.last_s_bet)
-        msg = await _send_game(inter.channel, gv)
+        await _send_game(inter.channel, gv, interaction=inter)
+        msg = await inter.original_response()
         asyncio.create_task(gv.check_auto_bj(msg))
 
     @discord.ui.button(label="雙倍再局 (Double)", style=discord.ButtonStyle.primary)
     async def double_again(self, inter, btn):
+        if inter.user.id != self.user.id: return
+        await inter.response.defer()
+        
         stats = get_user_stats(self.user.id)
         new_bet = self.last_bet * 2
         if stats[0] < (new_bet + self.last_p_bet + self.last_s_bet):
-            return await inter.response.send_message("餘額不足以雙倍下注", ephemeral=True)
+            return await inter.followup.send("餘額不足以雙倍下注", ephemeral=True)
+            
         self.stop()
-        await inter.response.defer()
-        try:
-            await inter.message.delete()
-        except:
-            pass
         gv = BlackjackGame(self.user, new_bet, self.last_p_bet, self.last_s_bet)
-        msg = await _send_game(inter.channel, gv)
+        await _send_game(inter.channel, gv, interaction=inter)
+        msg = await inter.original_response()
         asyncio.create_task(gv.check_auto_bj(msg))
 
     @discord.ui.button(label="修改下注", style=discord.ButtonStyle.secondary)
