@@ -7,6 +7,8 @@ import os
 import asyncio
 import datetime
 import time
+from PIL import Image, ImageDraw, ImageFont
+import io
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -113,87 +115,74 @@ def get_card_code(card) -> str:
     elif s == '♣': ps = 'pb'
     else: ps = suit_map.get(card['suit'], 'sp')
     return f"{ps}_{card['rank']}"
-
-def card_to_emoji(card, guild_id=None) -> str:
-    """嘗試取得伺服器自訂 Emoji，若無則回退至文字"""
-    code = get_card_code(card)
-    if guild_id and guild_id in _EMOJI_CACHE:
-        emoji = _EMOJI_CACHE[guild_id].get(code)
-        if emoji: return emoji
-    return f"**{card['rank']}**{card['suit']} "
-
 # ==========================================
-# 🖼️ 系統 Emoji 快取與同步
+# 🖼️ 系統 圖片合成器 (Pillow - 看板模式)
 # ==========================================
-_EMOJI_CACHE = {}  # {guild_id: {card_code: emoji_string}}
+_EMOJI_CACHE = {}  # 僅作代碼兼容使用
 
-def get_card_code(card) -> str:
-    """將卡牌轉換為 emoji_cards 資料夾對應的代碼 (例如 sp_A, pb_10)"""
-    # ♠️=sp, ♥️=cu (Cœur), ♦️=lo (Losange), ♣️=pb
-    suit_map = {'♠️': 'sp', '♥️': 'cu', '♦️': 'lo', '♣️': 'pb'}
-    # 有時 suit 會夾雜 \ufe0f
-    s = card['suit'].replace('\ufe0f', '')
-    if s == '♠': ps = 'sp'
-    elif s == '♥': ps = 'cu'
-    elif s == '♦': ps = 'lo'
-    elif s == '♣': ps = 'pb'
-    else: ps = suit_map.get(card['suit'], 'sp')
-    return f"{ps}_{card['rank']}"
-
-def card_to_emoji(card, guild_id=None) -> str:
-    """嘗試取得伺服器自訂 Emoji，若無則回退至文字"""
+def get_card_image(card) -> Image.Image:
     code = get_card_code(card)
-    if guild_id and guild_id in _EMOJI_CACHE:
-        emoji = _EMOJI_CACHE[guild_id].get(code)
-        if emoji: return emoji
-    return f"**{card['rank']}**{card['suit']} "
+    path = f"emoji_cards/{code}.png"
+    if not os.path.exists(path): return Image.new('RGBA', (150, 210), (100, 100, 100))
+    return Image.open(path).convert("RGBA")
 
-async def sync_guild_emojis(guild: discord.Guild):
-    """將 emoji_cards 資料夾中的圖片自動上傳到伺服器作為自訂 Emoji"""
-    if guild.id not in _EMOJI_CACHE:
-        _EMOJI_CACHE[guild.id] = {e.name: str(e) for e in guild.emojis}
+def combine_hand_images(hand, hidden=False) -> Image.Image:
+    cw, ch = 150, 210
+    gap = 15
+    n = len(hand)
+    board_w = (cw * n) + (gap * (n - 1))
+    img = Image.new('RGBA', (board_w, ch), (0,0,0,0))
+    for i, card in enumerate(hand):
+        c_img = Image.open("emoji_cards/card_back.png").convert("RGBA") if (hidden and i == 1) else get_card_image(card)
+        img.paste(c_img, (i * (cw + gap), 0), c_img)
+    return img
+
+def create_game_board(dealer_hand, player_hands, current_hand=0, done=False) -> io.BytesIO:
+    """整合看板圖：透過調整畫布寬度來達到『單圖發表符』的視覺大小"""
+    cw, ch = 150, 210
+    gap = 20
     
-    # 檢查是否已經有足夠的卡牌 Emoji
-    current_count = len([k for k in _EMOJI_CACHE[guild.id] if '_' in k or k == 'card_back'])
-    if current_count >= 53: return
-
-    # 檢查剩餘額度
-    limit = guild.emoji_limit
-    if len(guild.emojis) >= limit: return
-
-    folder = "emoji_cards"
-    if not os.path.exists(folder): return
-
-    print(f"🔄 正在為 {guild.name} 上傳缺失的卡牌 Emoji...")
-    files = [f for f in os.listdir(folder) if f.endswith('.png')]
-    count = 0
-    for filename in files:
-        name = filename.replace('.png', '')
-        if name not in _EMOJI_CACHE[guild.id]:
-            if len(guild.emojis) >= limit: break
-            try:
-                with open(os.path.join(folder, filename), "rb") as f:
-                    img = f.read()
-                    new_emoji = await guild.create_custom_emoji(name=name, image=img, reason="Blackjack Card Icons")
-                    _EMOJI_CACHE[guild.id][name] = str(new_emoji)
-                    count += 1
-            except Exception as e:
-                print(f"⚠️ 無法上傳 {name}: {e}")
-                break
-    if count > 0: print(f"✅ 成功上傳 {count} 張卡牌 Emoji 至 {guild.name}")
-
-def card_back_emoji(guild_id=None) -> str:
-    if guild_id and guild_id in _EMOJI_CACHE:
-        emoji = _EMOJI_CACHE[guild_id].get('card_back')
-        if emoji: return emoji
-    return "🎴"
+    d_img = combine_hand_images(dealer_hand, hidden=not done)
+    p_img = combine_hand_images(player_hands[current_hand])
+    
+    # 計算內容尺寸
+    content_w = max(d_img.width, p_img.width)
+    content_h = ch * 2 + 100
+    
+    # 🎯 核心縮放技巧： canvas_w 越寬，在 Discord 中卡牌看起來就越小
+    # 若要像『單圖 Emoji』大小，寬度建議設為內容物的 3 到 3.5 倍
+    canvas_w = int(content_w * 3.2) 
+    canvas_h = content_h
+    
+    final = Image.new('RGBA', (canvas_w, canvas_h), (0,0,0,0))
+    draw = ImageDraw.Draw(final)
+    
+    try: font = ImageFont.truetype("arial.ttf", 30)
+    except: font = ImageFont.load_default()
+    
+    # 莊家 (上半部)
+    draw.text((0, 0), "BOT DEALER", fill="#AAAAAA", font=font)
+    final.paste(d_img, (0, 50), d_img)
+    
+    # 玩家 (下半部)
+    draw.text((0, ch + 80), "PLAYER HAND", fill="#AAAAAA", font=font)
+    final.paste(p_img, (0, ch + 130), p_img)
+    
+    buf = io.BytesIO()
+    final.save(buf, format='PNG')
+    buf.seek(0)
+    return buf
 
 async def _send_game(channel, gv: 'BlackjackGame', interaction: discord.Interaction = None, message_obj: discord.Message = None, view=None) -> discord.Message:
-    """傳送或更新遊戲訊息，回歸使用 Discord 原生表符 (Emoji) 顯示"""
-    if channel.guild:
-        await sync_guild_emojis(channel.guild)
+    """傳送或更新看板，合併 embed 與看板圖"""
+    current_done = (gv.hand_results[gv.current_hand] is not None or getattr(gv, '_game_over', False))
+    board_buf = create_game_board(gv.d_hand, gv.hands, gv.current_hand, done=current_done)
+    
+    filename = f"board_{int(time.time() * 1000)}.png"
+    file = discord.File(board_buf, filename=filename)
     
     embed = gv.build_embed(guild_id=channel.guild.id if channel.guild else None)
+    embed.set_image(url=f"attachment://{filename}")
     current_view = view if view is not None else gv
 
     if interaction:
@@ -417,12 +406,9 @@ class BlackjackGame(discord.ui.View):
             indicator = "👉 " if i == self.current_hand and not done else ""
             title_text = f"{indicator}👤 {self.user.display_name} 的手牌"
             if len(self.hands) > 1: title_text += f" (第 {i+1} 手)"
-            
-            p_cards = ' '.join([card_to_emoji(c, guild_id) for c in hand])
-            embed.add_field(name=title_text, value=f"{p_cards}\n點數：**{calculate_score(hand)}**", inline=False)
+            embed.add_field(name=title_text, value=f"點數：**{calculate_score(hand)}**", inline=False)
         if done or animating:
-            d_cards = ' '.join([card_to_emoji(c, guild_id) for c in self.d_hand])
-            embed.add_field(name="🤖 莊家手牌", value=f"{d_cards}\n點數：**{calculate_score(self.d_hand)}**", inline=False)
+            embed.add_field(name="🤖 莊家手牌", value=f"點數：**{calculate_score(self.d_hand)}**", inline=False)
             if done:
                 total_profit = profit + self.side_p
                 res_text = f"**{res}**\n{self.side_m}\n"
@@ -432,7 +418,7 @@ class BlackjackGame(discord.ui.View):
                 res_text += f"\n💰 最新餘額：`{bal}` 東雲幣"
                 embed.add_field(name="🏆 結果", value=res_text, inline=False)
         else:
-            embed.add_field(name="🤖 莊家手牌", value=f"{card_to_emoji(self.d_hand[0], guild_id)} {card_back_emoji(guild_id)}\n點數：**❓**", inline=False)
+            embed.add_field(name="🤖 莊家手牌", value=f"點數：**❓**", inline=False)
         return embed
 
 
@@ -535,6 +521,7 @@ class BlackjackGame(discord.ui.View):
     @discord.ui.button(label="要牌", style=discord.ButtonStyle.success)
     async def hit(self, inter, btn):
         if inter.user.id != self.user.id: return
+        await inter.response.defer()
         self.p_hand.append(self.deck.pop())
         self.update_buttons() 
         ps = calculate_score(self.p_hand)
@@ -542,29 +529,32 @@ class BlackjackGame(discord.ui.View):
         if ps >= 21 or len(self.p_hand) == 5:
             if ps > 21:
                 self.hand_results[self.current_hand] = ("爆牌輸了", -self.hand_bets[self.current_hand], False)
-            await self.advance_hand(interaction=inter)
+            await self.advance_hand(interaction=inter, message_obj=inter.message)
         else:
             await self._edit(interaction=inter)
 
     @discord.ui.button(label="停牌", style=discord.ButtonStyle.danger)
     async def stand(self, inter, btn):
         if inter.user.id != self.user.id: return
-        await self.advance_hand(interaction=inter)
+        await inter.response.defer()
+        await self.advance_hand(interaction=inter, message_obj=inter.message)
 
     @discord.ui.button(label="投降", style=discord.ButtonStyle.secondary)
     async def surrender(self, inter, btn):
         if inter.user.id != self.user.id: return
+        await inter.response.defer()
         self.hand_results[self.current_hand] = ("這樣就投降了嗎，雜魚～", -(self.hand_bets[self.current_hand]//2), False)
-        await self.advance_hand(interaction=inter)
+        await self.advance_hand(interaction=inter, message_obj=inter.message)
 
     @discord.ui.button(label="雙倍", style=discord.ButtonStyle.primary)
     async def double_down(self, inter, btn):
         if inter.user.id != self.user.id: return
+        await inter.response.defer()
         stats = get_user_stats(self.user.id)
         available_balance = stats[0] + min(0, getattr(self, 'side_p', 0))
         extra_needed = self.hand_bets[self.current_hand]
         if available_balance < sum(self.hand_bets) + extra_needed:
-            return await inter.response.send_message("餘額不足，無法雙倍下注", ephemeral=True)
+            return await inter.followup.send("餘額不足，無法雙倍下注", ephemeral=True)
             
         self.hand_bets[self.current_hand] *= 2
         self.p_hand.append(self.deck.pop())
@@ -573,16 +563,17 @@ class BlackjackGame(discord.ui.View):
         ps = calculate_score(self.p_hand)
         if ps > 21:
             self.hand_results[self.current_hand] = ("你爆牌囉～小丑～", -self.hand_bets[self.current_hand], False)
-        await self.advance_hand(interaction=inter)
+        await self.advance_hand(interaction=inter, message_obj=inter.message)
 
     @discord.ui.button(label="分牌", style=discord.ButtonStyle.primary)
     async def split(self, inter, btn):
         if inter.user.id != self.user.id: return
+        await inter.response.defer()
         stats = get_user_stats(self.user.id)
         available_balance = stats[0] + min(0, getattr(self, 'side_p', 0))
         current_max_loss = sum(self.hand_bets) + self.bet
         if available_balance < current_max_loss:
-            return await inter.response.send_message("餘額不足，無法分牌", ephemeral=True)
+            return await inter.followup.send("餘額不足，無法分牌", ephemeral=True)
             
         self.is_split = True
         c1, c2 = self.hands[0][0], self.hands[0][1]
