@@ -1084,10 +1084,11 @@ async def redpacket(interaction: discord.Interaction, total_amount: int, count: 
 @stock_group.command(name="quote", description="查詢台股個股資訊")
 @app_commands.describe(symbol="股票代號或名稱")
 async def stock_quote(interaction: discord.Interaction, symbol: str):
+    await interaction.response.defer(thinking=True)
     try:
         rows = await fetch_stock_day_all()
     except Exception as e:
-        return await interaction.response.send_message(f"台股資料暫時無法取得：{e}", ephemeral=True)
+        return await interaction.followup.send(f"台股資料暫時無法取得：{e}", ephemeral=True)
 
     key = symbol.strip().upper()
     picked = None
@@ -1105,13 +1106,13 @@ async def stock_quote(interaction: discord.Interaction, symbol: str):
                 picked = row
                 break
     if picked is None:
-        return await interaction.response.send_message("找不到該股票代號/名稱", ephemeral=True)
+        return await interaction.followup.send("找不到該股票代號/名稱", ephemeral=True)
 
     code = str(picked.get("Code", "")).strip()
     try:
         quotes = await fetch_mis_quotes(build_mis_channels_for_code(code))
     except Exception as e:
-        return await interaction.response.send_message(f"即時資料暫時無法取得：{e}", ephemeral=True)
+        return await interaction.followup.send(f"即時資料暫時無法取得：{e}", ephemeral=True)
     real = None
     for q in quotes:
         if q["code"] == code and q["price"] > 0:
@@ -1120,23 +1121,32 @@ async def stock_quote(interaction: discord.Interaction, symbol: str):
     if real is None and quotes:
         real = quotes[0]
     if not real or real["price"] <= 0:
-        return await interaction.response.send_message("目前查無即時成交資訊", ephemeral=True)
+        return await interaction.followup.send("目前查無即時成交資訊", ephemeral=True)
 
-    embed = discord.Embed(title=f"📈 {picked.get('Code')} {picked.get('Name')}", color=0x2b2d31)
+    open_price = to_float(picked.get("OpeningPrice", "0"))
+    high_price = to_float(picked.get("HighestPrice", "0"))
+    low_price = to_float(picked.get("LowestPrice", "0"))
+    ref_price = real["prev_close"]
+    color = 0x2ecc71 if real["change"] > 0 else (0xe74c3c if real["change"] < 0 else 0x95a5a6)
+    embed = discord.Embed(title=f"📈 {picked.get('Name')} ({picked.get('Code')})", color=color)
     embed.add_field(name="即時價", value=f"`{real['price']:.2f}`")
     embed.add_field(name="漲跌", value=f"`{real['change']:+.2f}` ({real['pct']:+.2f}%)")
     embed.add_field(name="成交量", value=f"`{real['volume']:,}`")
+    embed.add_field(name="開盤", value=f"`{open_price:.2f}`")
+    embed.add_field(name="最高 / 最低", value=f"`{high_price:.2f}` / `{low_price:.2f}`")
+    embed.add_field(name="昨收(參考)", value=f"`{ref_price:.2f}`")
     embed.set_footer(text=f"即時來源: TWSE MIS | 時間: {real['time'] or 'N/A'}")
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 @stock_group.command(name="movers", description="台股漲跌排行")
 @app_commands.describe(top_n="排行筆數(1-10)")
 async def stock_movers(interaction: discord.Interaction, top_n: int = 5):
+    await interaction.response.defer(thinking=True)
     top_n = max(1, min(10, top_n))
     try:
         rows = await fetch_stock_day_all()
     except Exception as e:
-        return await interaction.response.send_message(f"台股資料暫時無法取得：{e}", ephemeral=True)
+        return await interaction.followup.send(f"台股資料暫時無法取得：{e}", ephemeral=True)
 
     # 先挑成交值前段，避免一次抓全市場即時資料造成過重負載
     candidates = []
@@ -1144,7 +1154,7 @@ async def stock_movers(interaction: discord.Interaction, top_n: int = 5):
         trade_value = to_float(row.get("TradeValue", "0"))
         if trade_value > 0:
             candidates.append((trade_value, str(row.get("Code", "")).strip(), str(row.get("Name", "")).strip()))
-    candidates = sorted(candidates, key=lambda x: x[0], reverse=True)[:120]
+    candidates = sorted(candidates, key=lambda x: x[0], reverse=True)[:60]
     channels = []
     code_name_map = {}
     for _, code, name in candidates:
@@ -1155,7 +1165,7 @@ async def stock_movers(interaction: discord.Interaction, top_n: int = 5):
     try:
         quotes = await fetch_mis_quotes(channels)
     except Exception as e:
-        return await interaction.response.send_message(f"即時資料暫時無法取得：{e}", ephemeral=True)
+        return await interaction.followup.send(f"即時資料暫時無法取得：{e}", ephemeral=True)
 
     best_by_code = {}
     for q in quotes:
@@ -1173,7 +1183,7 @@ async def stock_movers(interaction: discord.Interaction, top_n: int = 5):
         q["name"] = code_name_map.get(code, q["name"] or code)
         scored.append((q["pct"], q))
     if not scored:
-        return await interaction.response.send_message("目前無法計算排行", ephemeral=True)
+        return await interaction.followup.send("目前無法計算排行", ephemeral=True)
 
     gainers = sorted(scored, key=lambda x: x[0], reverse=True)[:top_n]
     losers = sorted(scored, key=lambda x: x[0])[:top_n]
@@ -1183,7 +1193,7 @@ async def stock_movers(interaction: discord.Interaction, top_n: int = 5):
     embed.add_field(name="漲幅前段", value=up_text or "無資料", inline=False)
     embed.add_field(name="跌幅前段", value=down_text or "無資料", inline=False)
     embed.set_footer(text="即時來源: TWSE MIS（熱門成交值樣本）")
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="say", description="[管理員] 指定機器人對特定頻道發送內容")
 @app_commands.describe(text="你要機器人說什麼？", channel="指定發送到哪個頻道？(選填)")
