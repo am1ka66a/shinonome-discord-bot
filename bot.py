@@ -246,7 +246,8 @@ async def fetch_stock_day_all():
     if now - cache_obj["ts"] < STOCK_CACHE_SECONDS and cache_obj["data"]:
         return cache_obj["data"]
     url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-    async with aiohttp.ClientSession() as session:
+    connector = aiohttp.TCPConnector(ssl=False)
+    async with aiohttp.ClientSession(connector=connector) as session:
         async with session.get(url, timeout=15) as resp:
             if resp.status != 200:
                 raise RuntimeError(f"TWSE API 錯誤: {resp.status}")
@@ -290,7 +291,8 @@ async def fetch_mis_quotes(channels):
     ts = int(time.time() * 1000)
     url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={ex_ch}&json=1&delay=0&_={ts}"
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://mis.twse.com.tw/stock/index.jsp"}
-    async with aiohttp.ClientSession(headers=headers) as session:
+    connector = aiohttp.TCPConnector(ssl=False)
+    async with aiohttp.ClientSession(headers=headers, connector=connector) as session:
         async with session.get(url, timeout=15) as resp:
             if resp.status != 200:
                 raise RuntimeError(f"MIS API 錯誤: {resp.status}")
@@ -740,11 +742,11 @@ class RedPacketView(discord.ui.View):
         self.total_amount = total_amount
         self.count = count
         self.left_amount = total_amount
+        self.left_count = count
         self.claimed_users = set()
-        self.remaining = build_random_splits(total_amount, count)
 
     def summary_text(self):
-        claimed = self.count - len(self.remaining)
+        claimed = self.count - self.left_count
         return (
             f"🧧 紅包編號 #{self.packet_id}\n"
             f"總金額：`{self.total_amount}` | 份數：`{self.count}`\n"
@@ -757,11 +759,16 @@ class RedPacketView(discord.ui.View):
             return await interaction.response.send_message("機器人不能搶紅包", ephemeral=True)
         if interaction.user.id in self.claimed_users:
             return await interaction.response.send_message("你已經搶過這包了", ephemeral=True)
-        if not self.remaining:
+        if self.left_count <= 0 or self.left_amount <= 0:
             return await interaction.response.send_message("紅包已搶完", ephemeral=True)
 
-        amount = self.remaining.pop()
+        if self.left_count == 1:
+            amount = self.left_amount
+        else:
+            max_pick = self.left_amount - (self.left_count - 1)
+            amount = random.randint(1, max_pick)
         self.left_amount -= amount
+        self.left_count -= 1
         self.claimed_users.add(interaction.user.id)
 
         conn = get_db_connection()
@@ -774,7 +781,7 @@ class RedPacketView(discord.ui.View):
         conn.close()
         log_transaction(interaction.user.id, amount, f"搶紅包 #{self.packet_id}")
 
-        if not self.remaining:
+        if self.left_count <= 0 or self.left_amount <= 0:
             for child in self.children:
                 child.disabled = True
             await interaction.response.edit_message(content=self.summary_text() + "\n✅ 紅包已被搶完！", view=self)
