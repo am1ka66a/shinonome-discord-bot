@@ -9,6 +9,7 @@ import asyncio
 import datetime
 import time
 import typing
+import json
 from urllib.parse import urlparse
 from dotenv import load_dotenv
 
@@ -287,18 +288,28 @@ def _to_mis_quote(item):
 async def fetch_mis_quotes(channels):
     if not channels:
         return []
-    ex_ch = "|".join(channels)
-    ts = int(time.time() * 1000)
-    url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={ex_ch}&json=1&delay=0&_={ts}"
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://mis.twse.com.tw/stock/index.jsp"}
     connector = aiohttp.TCPConnector(ssl=False)
+    all_quotes = []
+    # MIS 在 ex_ch 過長時常回 HTML；分批可避免 URL 過長與超時
+    chunk_size = 20
     async with aiohttp.ClientSession(headers=headers, connector=connector) as session:
-        async with session.get(url, timeout=15) as resp:
-            if resp.status != 200:
-                raise RuntimeError(f"MIS API 錯誤: {resp.status}")
-            payload = await resp.json()
-    items = payload.get("msgArray") or []
-    return [_to_mis_quote(item) for item in items if item]
+        for i in range(0, len(channels), chunk_size):
+            chunk = channels[i:i + chunk_size]
+            ex_ch = "|".join(chunk)
+            ts = int(time.time() * 1000)
+            url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={ex_ch}&json=1&delay=0&_={ts}"
+            async with session.get(url, timeout=15) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"MIS API 錯誤: {resp.status}")
+                text_body = await resp.text()
+                try:
+                    payload = json.loads(text_body)
+                except Exception:
+                    raise RuntimeError("MIS 回傳非 JSON（可能是請求過大或被擋）")
+                items = payload.get("msgArray") or []
+                all_quotes.extend([_to_mis_quote(item) for item in items if item])
+    return all_quotes
 
 def build_mis_channels_for_code(code):
     c = str(code).strip().upper()
@@ -861,13 +872,8 @@ async def on_message(message):
         row = c.fetchone()
         if row and (row[2] is None or (now - row[2]).total_seconds() >= EXP_COOLDOWN_SECONDS):
             exp_gain = random.randint(12, 20)
-            lv_info = add_user_exp(user_id, exp_gain)
+            add_user_exp(user_id, exp_gain)
             c.execute("UPDATE activity_stats SET last_exp_reward=%s WHERE user_id=%s", (now, user_id))
-            if lv_info and lv_info[1] > lv_info[0]:
-                try:
-                    await message.channel.send(f"🎉 {message.author.mention} 升到 **Lv.{lv_info[1]}**！")
-                except:
-                    pass
         if row and row[0] >= 10:
             if row[1] is None or (now - row[1]).total_seconds() >= 1800:
                 c.execute("INSERT INTO users (user_id, balance) VALUES (%s, 500) ON DUPLICATE KEY UPDATE balance=balance+500", (user_id,))
