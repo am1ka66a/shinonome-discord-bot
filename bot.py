@@ -1085,9 +1085,26 @@ async def redpacket(interaction: discord.Interaction, total_amount: int, count: 
     except:
         pass
 
+async def stock_symbol_autocomplete(interaction: discord.Interaction, current: str):
+    try:
+        rows = await fetch_stock_day_all()
+    except:
+        return []
+    key = (current or "").strip().upper()
+    choices = []
+    for row in rows:
+        code = str(row.get("Code", "")).upper()
+        name = str(row.get("Name", ""))
+        if not key or key in code or (current or "").strip() in name:
+            label = f"{code} {name}".strip()
+            choices.append(app_commands.Choice(name=label[:100], value=code[:100]))
+            if len(choices) >= 25:
+                break
+    return choices
+
 @stock_group.command(name="quote", description="查詢台股個股資訊")
 @app_commands.describe(symbol="股票代號或名稱")
-@app_commands.autocomplete(symbol=lambda interaction, current: stock_symbol_autocomplete(interaction, current))
+@app_commands.autocomplete(symbol=stock_symbol_autocomplete)
 async def stock_quote(interaction: discord.Interaction, symbol: str):
     await interaction.response.defer(thinking=True)
     try:
@@ -1159,23 +1176,6 @@ async def stock_quote(interaction: discord.Interaction, symbol: str):
     embed.add_field(name="昨收(參考)", value=f"`{ref_price:.2f}`")
     embed.set_footer(text=f"即時來源: TWSE MIS | 時間: {real['time'] or 'N/A'}")
     await interaction.followup.send(embed=embed)
-
-async def stock_symbol_autocomplete(interaction: discord.Interaction, current: str):
-    try:
-        rows = await fetch_stock_day_all()
-    except:
-        return []
-    key = (current or "").strip().upper()
-    choices = []
-    for row in rows:
-        code = str(row.get("Code", "")).upper()
-        name = str(row.get("Name", ""))
-        if not key or key in code or (current or "").strip() in name:
-            label = f"{code} {name}".strip()
-            choices.append(app_commands.Choice(name=label[:100], value=code[:100]))
-            if len(choices) >= 25:
-                break
-    return choices
 
 @stock_group.command(name="list", description="列出可查詢股票（可翻頁）")
 @app_commands.describe(keyword="股票代號或名稱關鍵字（選填）", page="頁碼（從 1 開始）")
