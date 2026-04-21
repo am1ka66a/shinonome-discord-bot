@@ -847,6 +847,62 @@ class RedPacketView(discord.ui.View):
         except:
             pass
 
+class StockPagerView(discord.ui.View):
+    def __init__(self, owner_id, title, lines, page_size=10, start_page=1, color=0x2b2d31, footer_prefix=""):
+        super().__init__(timeout=180)
+        self.owner_id = owner_id
+        self.title = title
+        self.lines = lines
+        self.page_size = max(1, page_size)
+        self.total_pages = max(1, (len(lines) + self.page_size - 1) // self.page_size)
+        self.page = max(1, min(start_page, self.total_pages))
+        self.color = color
+        self.footer_prefix = footer_prefix
+        self.message = None
+        self._refresh_buttons()
+
+    def _refresh_buttons(self):
+        self.prev_btn.disabled = self.page <= 1
+        self.next_btn.disabled = self.page >= self.total_pages
+
+    def build_embed(self):
+        start = (self.page - 1) * self.page_size
+        end = start + self.page_size
+        body = "\n".join(self.lines[start:end]) or "無資料"
+        embed = discord.Embed(title=self.title, description=body, color=self.color)
+        footer = f"第 {self.page}/{self.total_pages} 頁"
+        if self.footer_prefix:
+            footer += f" | {self.footer_prefix}"
+        embed.set_footer(text=footer)
+        return embed
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("這不是你的翻頁面板。", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="上一頁", style=discord.ButtonStyle.secondary)
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page = max(1, self.page - 1)
+        self._refresh_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="下一頁", style=discord.ButtonStyle.secondary)
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page = min(self.total_pages, self.page + 1)
+        self._refresh_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        try:
+            if self.message:
+                await self.message.edit(view=self)
+        except:
+            pass
+
 # --- 4. 指令系統 ---
 intents = discord.Intents.default(); intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
@@ -1220,7 +1276,7 @@ async def stock_quote(interaction: discord.Interaction, symbol: str):
 @stock_group.command(name="list", description="列出可查詢股票（可翻頁）")
 @app_commands.describe(keyword="股票代號或名稱關鍵字（選填）", page="頁碼（從 1 開始）")
 async def stock_list(interaction: discord.Interaction, keyword: str = "", page: int = 1):
-    await interaction.response.defer(thinking=True, ephemeral=True)
+    await interaction.response.defer(thinking=True)
     try:
         rows = await fetch_stock_day_all()
     except Exception as e:
@@ -1242,12 +1298,17 @@ async def stock_list(interaction: discord.Interaction, keyword: str = "", page: 
     start = (page - 1) * page_size
     end = start + page_size
     preview = filtered[start:end]
-    lines = [f"{r.get('Code')} {r.get('Name')}" for r in preview]
-    await interaction.followup.send(
-        f"共找到 `{len(filtered)}` 檔 | 第 `{page}/{total_pages}` 頁（每頁 {page_size} 檔）\n"
-        + "\n".join([f"- `{x}`" for x in lines]),
-        ephemeral=True
+    all_lines = [f"{i+1}. `{r.get('Code')} {r.get('Name')}`" for i, r in enumerate(filtered)]
+    view = StockPagerView(
+        owner_id=interaction.user.id,
+        title=f"📚 可查詢股票（關鍵字：{keyword or '全部'}）",
+        lines=all_lines,
+        page_size=page_size,
+        start_page=page,
+        footer_prefix=f"共 {len(filtered)} 檔"
     )
+    msg = await interaction.followup.send(embed=view.build_embed(), view=view)
+    view.message = msg
 
 @stock_group.command(name="movers", description="台股漲跌排行（精簡）")
 @app_commands.describe(top_n="排行筆數(1-20)")
@@ -1286,12 +1347,17 @@ async def stock_gainers(interaction: discord.Interaction, limit: int = 50, page:
     page_size = 10
     total_pages = max(1, (len(ranked) + page_size - 1) // page_size)
     page = max(1, min(page, total_pages))
-    seg = ranked[(page - 1) * page_size: page * page_size]
-    base_idx = (page - 1) * page_size
-    text = "\n".join([f"{base_idx+i+1}. {r['code']} {r['name']} `{p:+.2f}%`" for i, (p, r) in enumerate(seg)])
-    embed = discord.Embed(title="📈 台股即時漲幅榜", description=text or "無資料", color=0x2b2d31)
-    embed.set_footer(text=f"第 {page}/{total_pages} 頁 | 共 {len(ranked)} 名 | 來源: TWSE MIS")
-    await interaction.followup.send(embed=embed)
+    all_lines = [f"{i+1}. {r['code']} {r['name']} `{p:+.2f}%`" for i, (p, r) in enumerate(ranked)]
+    view = StockPagerView(
+        owner_id=interaction.user.id,
+        title="📈 台股即時漲幅榜",
+        lines=all_lines,
+        page_size=page_size,
+        start_page=page,
+        footer_prefix=f"共 {len(ranked)} 名 | 來源: TWSE MIS"
+    )
+    msg = await interaction.followup.send(embed=view.build_embed(), view=view)
+    view.message = msg
 
 @stock_group.command(name="losers", description="台股即時跌幅榜（可翻頁）")
 @app_commands.describe(limit="總共要看幾名(1-100)", page="頁碼（每頁10名）")
@@ -1308,12 +1374,17 @@ async def stock_losers(interaction: discord.Interaction, limit: int = 50, page: 
     page_size = 10
     total_pages = max(1, (len(ranked) + page_size - 1) // page_size)
     page = max(1, min(page, total_pages))
-    seg = ranked[(page - 1) * page_size: page * page_size]
-    base_idx = (page - 1) * page_size
-    text = "\n".join([f"{base_idx+i+1}. {r['code']} {r['name']} `{p:+.2f}%`" for i, (p, r) in enumerate(seg)])
-    embed = discord.Embed(title="📉 台股即時跌幅榜", description=text or "無資料", color=0x2b2d31)
-    embed.set_footer(text=f"第 {page}/{total_pages} 頁 | 共 {len(ranked)} 名 | 來源: TWSE MIS")
-    await interaction.followup.send(embed=embed)
+    all_lines = [f"{i+1}. {r['code']} {r['name']} `{p:+.2f}%`" for i, (p, r) in enumerate(ranked)]
+    view = StockPagerView(
+        owner_id=interaction.user.id,
+        title="📉 台股即時跌幅榜",
+        lines=all_lines,
+        page_size=page_size,
+        start_page=page,
+        footer_prefix=f"共 {len(ranked)} 名 | 來源: TWSE MIS"
+    )
+    msg = await interaction.followup.send(embed=view.build_embed(), view=view)
+    view.message = msg
 
 @stock_group.command(name="topvolume", description="台股成交量排行（可翻頁）")
 @app_commands.describe(limit="總共要看幾名(1-100)", page="頁碼（每頁10名）")
@@ -1335,12 +1406,17 @@ async def stock_topvolume(interaction: discord.Interaction, limit: int = 50, pag
     page_size = 10
     total_pages = max(1, (len(ranked) + page_size - 1) // page_size)
     page = max(1, min(page, total_pages))
-    seg = ranked[(page - 1) * page_size: page * page_size]
-    base_idx = (page - 1) * page_size
-    text = "\n".join([f"{base_idx+i+1}. {c} {n} `{v:,}`" for i, (v, c, n) in enumerate(seg)])
-    embed = discord.Embed(title="📊 台股成交量排行", description=text or "無資料", color=0x2b2d31)
-    embed.set_footer(text=f"第 {page}/{total_pages} 頁 | 共 {len(ranked)} 名 | 來源: TWSE openapi")
-    await interaction.followup.send(embed=embed)
+    all_lines = [f"{i+1}. {c} {n} `{v:,}`" for i, (v, c, n) in enumerate(ranked)]
+    view = StockPagerView(
+        owner_id=interaction.user.id,
+        title="📊 台股成交量排行",
+        lines=all_lines,
+        page_size=page_size,
+        start_page=page,
+        footer_prefix=f"共 {len(ranked)} 名 | 來源: TWSE openapi"
+    )
+    msg = await interaction.followup.send(embed=view.build_embed(), view=view)
+    view.message = msg
 
 @stock_group.command(name="market", description="台股市場摘要")
 async def stock_market(interaction: discord.Interaction):
