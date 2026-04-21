@@ -892,9 +892,7 @@ async def register(interaction: discord.Interaction):
 async def daily(interaction: discord.Interaction):
     stats = get_user_stats(interaction.user.id)
     if not stats: return await interaction.response.send_message("未註冊", ephemeral=True)
-    lv_row = get_level_stats(interaction.user.id)
-    level_num = int(lv_row[1] or 1) if lv_row else 1
-    daily_reward = 100000 + level_num * 1000
+    daily_reward = 100000
     # 設定台灣時間 (UTC+8)
     tz = datetime.timezone(datetime.timedelta(hours=8))
     now_tw = datetime.datetime.now(tz)
@@ -921,7 +919,7 @@ async def daily(interaction: discord.Interaction):
     next_claim_dt = datetime.datetime.combine(tomorrow_tw, datetime.time.min, tzinfo=tz)
     ts = int(next_claim_dt.timestamp())
     await interaction.response.send_message(
-        f"🎉 簽到成功！獲得 **{daily_reward}** 東雲幣！（Lv.{level_num} 加成）目前餘額：`{new_bal}`\n"
+        f"🎉 簽到成功！獲得 **{daily_reward}** 東雲幣！目前餘額：`{new_bal}`\n"
         f"下次領取時間：<t:{ts}:f> (<t:{ts}:R>)"
     )
 
@@ -935,7 +933,7 @@ async def hourly(interaction: discord.Interaction):
         return await interaction.response.send_message("資料初始化失敗", ephemeral=True)
     level_num = bank_info["level"]
     bank = bank_info["bank"]
-    reward_per_slot = 1000 + level_num * 100
+    reward_per_slot = 1000
     if bank <= 0:
         sec = bank_info["next_in_seconds"]
         mins = max(1, int(sec // 60))
@@ -1092,6 +1090,7 @@ async def stock_quote(interaction: discord.Interaction, symbol: str):
 
     key = symbol.strip().upper()
     picked = None
+    partial_matches = []
     for row in rows:
         code = str(row.get("Code", "")).upper()
         name = str(row.get("Name", ""))
@@ -1103,10 +1102,23 @@ async def stock_quote(interaction: discord.Interaction, symbol: str):
             code = str(row.get("Code", "")).upper()
             name = str(row.get("Name", ""))
             if key in code or symbol.strip() in name:
-                picked = row
-                break
+                partial_matches.append(row)
+        if partial_matches:
+            picked = partial_matches[0]
     if picked is None:
-        return await interaction.followup.send("找不到該股票代號/名稱", ephemeral=True)
+        suggestions = []
+        for row in rows[:12]:
+            suggestions.append(f"{row.get('Code')} {row.get('Name')}")
+        return await interaction.followup.send(
+            "找不到該股票代號/名稱。\n你可以查詢例如：\n" + "\n".join([f"- `{s}`" for s in suggestions]),
+            ephemeral=True
+        )
+    if len(partial_matches) > 1:
+        candidates = [f"{row.get('Code')} {row.get('Name')}" for row in partial_matches[:10]]
+        await interaction.followup.send(
+            "🔎 找到多筆相近股票，先顯示第一筆。\n你也可以改查：\n" + "\n".join([f"- `{c}`" for c in candidates]),
+            ephemeral=True
+        )
 
     code = str(picked.get("Code", "")).strip()
     try:
@@ -1137,6 +1149,32 @@ async def stock_quote(interaction: discord.Interaction, symbol: str):
     embed.add_field(name="昨收(參考)", value=f"`{ref_price:.2f}`")
     embed.set_footer(text=f"即時來源: TWSE MIS | 時間: {real['time'] or 'N/A'}")
     await interaction.followup.send(embed=embed)
+
+@stock_group.command(name="list", description="列出可查詢股票（可輸入關鍵字）")
+@app_commands.describe(keyword="股票代號或名稱關鍵字（選填）")
+async def stock_list(interaction: discord.Interaction, keyword: str = ""):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    try:
+        rows = await fetch_stock_day_all()
+    except Exception as e:
+        return await interaction.followup.send(f"台股資料暫時無法取得：{e}", ephemeral=True)
+
+    key = keyword.strip().upper()
+    filtered = []
+    for row in rows:
+        code = str(row.get("Code", "")).upper()
+        name = str(row.get("Name", ""))
+        if not key or key in code or keyword.strip() in name:
+            filtered.append(row)
+    if not filtered:
+        return await interaction.followup.send("沒有符合的股票。", ephemeral=True)
+
+    preview = filtered[:20]
+    lines = [f"{r.get('Code')} {r.get('Name')}" for r in preview]
+    await interaction.followup.send(
+        f"共找到 `{len(filtered)}` 檔，先列前 `{len(preview)}` 檔：\n" + "\n".join([f"- `{x}`" for x in lines]),
+        ephemeral=True
+    )
 
 @stock_group.command(name="movers", description="台股漲跌排行")
 @app_commands.describe(top_n="排行筆數(1-10)")
