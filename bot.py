@@ -8,6 +8,7 @@ import asyncio
 import datetime
 import time
 import typing
+from urllib.parse import urlparse
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -27,12 +28,25 @@ def is_host():
 # 🗄️ 1. 資料庫系統 (MySQL)
 # ==========================================
 def get_db_connection():
+    mysql_url = os.getenv('MYSQL_URL') or os.getenv('DATABASE_URL')
+    if mysql_url:
+        parsed = urlparse(mysql_url)
+        if parsed.scheme.startswith('mysql'):
+            return pymysql.connect(
+                host=parsed.hostname,
+                port=parsed.port or 3306,
+                user=parsed.username,
+                password=parsed.password,
+                database=(parsed.path or '/').lstrip('/'),
+                charset='utf8mb4'
+            )
+
     return pymysql.connect(
-        host=os.getenv('DB_HOST'),
-        port=int(os.getenv('DB_PORT', 3306)),
-        user=os.getenv('DB_USER'),
-        password=os.getenv('DB_PASS'),
-        database=os.getenv('DB_NAME'),
+        host=os.getenv('MYSQLHOST') or os.getenv('DB_HOST'),
+        port=int(os.getenv('MYSQLPORT') or os.getenv('DB_PORT', 3306)),
+        user=os.getenv('MYSQLUSER') or os.getenv('DB_USER'),
+        password=os.getenv('MYSQLPASSWORD') or os.getenv('DB_PASS'),
+        database=os.getenv('MYSQLDATABASE') or os.getenv('DB_NAME'),
         charset='utf8mb4'
     )
 

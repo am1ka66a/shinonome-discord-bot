@@ -15,3 +15,6 @@ ENV/
 # IDE files
 .vscode/
 .idea/
+
+# Local package artifacts
+*.whl
