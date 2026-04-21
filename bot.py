@@ -799,7 +799,17 @@ bot.tree.add_command(stock_group)
 
 @bot.event
 async def on_ready():
-    init_db(); await bot.tree.sync(); bot.loop.create_task(vc_reward_task())
+    try:
+        init_db()
+        print("✅ 資料庫初始化完成")
+    except Exception as e:
+        print(f"❌ init_db 失敗: {e}")
+    try:
+        synced = await bot.tree.sync()
+        print(f"✅ Slash 指令同步完成: {len(synced)}")
+    except Exception as e:
+        print(f"❌ Slash 同步失敗: {e}")
+    bot.loop.create_task(vc_reward_task())
     print(f"{bot.user} 啟動！")
 
 async def vc_reward_task():
@@ -825,27 +835,35 @@ async def vc_reward_task():
 
 @bot.event
 async def on_message(message):
-    if message.author.bot or not message.guild: return
-    user_id, now = str(message.author.id), datetime.datetime.now()
-    conn = get_db_connection(); c = conn.cursor()
-    c.execute("INSERT INTO activity_stats (user_id, msg_count) VALUES (%s, 1) ON DUPLICATE KEY UPDATE msg_count=msg_count+1", (user_id,))
-    c.execute("SELECT msg_count, last_msg_reward, last_exp_reward FROM activity_stats WHERE user_id=%s", (user_id,))
-    row = c.fetchone()
-    if row and (row[2] is None or (now - row[2]).total_seconds() >= EXP_COOLDOWN_SECONDS):
-        exp_gain = random.randint(12, 20)
-        lv_info = add_user_exp(user_id, exp_gain)
-        c.execute("UPDATE activity_stats SET last_exp_reward=%s WHERE user_id=%s", (now, user_id))
-        if lv_info and lv_info[1] > lv_info[0]:
-            try:
-                await message.channel.send(f"🎉 {message.author.mention} 升到 **Lv.{lv_info[1]}**！")
-            except:
-                pass
-    if row and row[0] >= 10:
-        if row[1] is None or (now - row[1]).total_seconds() >= 1800:
-            c.execute("INSERT INTO users (user_id, balance) VALUES (%s, 500) ON DUPLICATE KEY UPDATE balance=balance+500", (user_id,))
-            c.execute("UPDATE activity_stats SET msg_count=0, last_msg_reward=%s WHERE user_id=%s", (now, user_id))
-            log_transaction(user_id, 500, "聊天活躍獎勵 (10句)")
-    conn.commit(); conn.close(); await bot.process_commands(message)
+    if message.author.bot:
+        return
+    try:
+        if not message.guild:
+            return
+        user_id, now = str(message.author.id), datetime.datetime.now()
+        conn = get_db_connection(); c = conn.cursor()
+        c.execute("INSERT INTO activity_stats (user_id, msg_count) VALUES (%s, 1) ON DUPLICATE KEY UPDATE msg_count=msg_count+1", (user_id,))
+        c.execute("SELECT msg_count, last_msg_reward, last_exp_reward FROM activity_stats WHERE user_id=%s", (user_id,))
+        row = c.fetchone()
+        if row and (row[2] is None or (now - row[2]).total_seconds() >= EXP_COOLDOWN_SECONDS):
+            exp_gain = random.randint(12, 20)
+            lv_info = add_user_exp(user_id, exp_gain)
+            c.execute("UPDATE activity_stats SET last_exp_reward=%s WHERE user_id=%s", (now, user_id))
+            if lv_info and lv_info[1] > lv_info[0]:
+                try:
+                    await message.channel.send(f"🎉 {message.author.mention} 升到 **Lv.{lv_info[1]}**！")
+                except:
+                    pass
+        if row and row[0] >= 10:
+            if row[1] is None or (now - row[1]).total_seconds() >= 1800:
+                c.execute("INSERT INTO users (user_id, balance) VALUES (%s, 500) ON DUPLICATE KEY UPDATE balance=balance+500", (user_id,))
+                c.execute("UPDATE activity_stats SET msg_count=0, last_msg_reward=%s WHERE user_id=%s", (now, user_id))
+                log_transaction(user_id, 500, "聊天活躍獎勵 (10句)")
+        conn.commit(); conn.close()
+    except Exception as e:
+        print(f"❌ on_message 錯誤: {e}")
+    finally:
+        await bot.process_commands(message)
 
 # --- Slash ---
 @bot.tree.command(name="register", description="獲得 50,000 啟動資金")
