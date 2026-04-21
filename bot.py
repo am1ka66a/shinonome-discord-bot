@@ -1289,6 +1289,18 @@ async def leaderboard(interaction: discord.Interaction):
     conn = get_db_connection(); c = conn.cursor(); c.execute("SELECT user_id, balance FROM users ORDER BY balance DESC LIMIT 10"); data = c.fetchall(); conn.close()
     msg = "\n".join([f"{i+1}. <@{uid}>: {bal}" for i, (uid, bal) in enumerate(data)]); await interaction.response.send_message(embed=discord.Embed(title="🏆 排行榜", description=msg))
 
+@bot.tree.command(name="lvleaderboard", description="等級排行榜前 10 名")
+async def lvleaderboard(interaction: discord.Interaction):
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT user_id, level, exp FROM users ORDER BY level DESC, exp DESC LIMIT 10")
+    data = c.fetchall()
+    conn.close()
+    if not data:
+        return await interaction.response.send_message("目前沒有等級資料", ephemeral=True)
+    msg = "\n".join([f"{i+1}. <@{uid}>: Lv.{lv} | EXP {exp}" for i, (uid, lv, exp) in enumerate(data)])
+    await interaction.response.send_message(embed=discord.Embed(title="🧠 Lv 排行榜", description=msg))
+
 # Admin
 @bot.command()
 @is_host()
