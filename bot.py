@@ -99,20 +99,36 @@ def get_user_stats(user_id):
     conn.close()
     return res
 
-def update_game_result(user_id, profit, is_win, is_push=False):
+def try_deduct_balance(user_id, amount, reason):
+    if amount <= 0:
+        return True
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute(
+        "UPDATE users SET balance=balance-%s WHERE user_id=%s AND balance >= %s",
+        (amount, str(user_id), amount)
+    )
+    ok = c.rowcount > 0
+    conn.commit()
+    conn.close()
+    if ok:
+        log_transaction(user_id, -amount, reason)
+    return ok
+
+def update_game_result(user_id, balance_delta, profit_delta, is_win, is_push=False):
     conn = get_db_connection()
     c = conn.cursor()
     win_int = 1 if is_win else 0
     if is_push:
         c.execute("UPDATE users SET balance=balance+%s, total_profit=total_profit+%s WHERE user_id=%s",
-                  (profit, profit, str(user_id)))
+                  (balance_delta, profit_delta, str(user_id)))
     else:
         c.execute("UPDATE users SET balance=balance+%s, total_profit=total_profit+%s, total_games=total_games+1, wins=wins+%s WHERE user_id=%s",
-                  (profit, profit, win_int, str(user_id)))
+                  (balance_delta, profit_delta, win_int, str(user_id)))
     conn.commit()
     conn.close()
-    if profit != 0:
-        log_transaction(user_id, profit, "21點遊戲結算")
+    if balance_delta != 0:
+        log_transaction(user_id, balance_delta, "21點遊戲結算")
 
 # ==========================================
 # 🃏 2. 核心遊戲邏輯 (6副牌)
@@ -259,9 +275,11 @@ class SetupView(discord.ui.View):
         await inter.response.defer()
         stats = get_user_stats(self.user.id)
         if not stats: return await inter.followup.send("請先使用 /register 註冊！", ephemeral=True)
-        if stats[0] < (self.base_bet + self.p_bet + self.s_bet): return await inter.followup.send("餘額不足", ephemeral=True)
+        total_cost = self.base_bet + self.p_bet + self.s_bet
+        if not try_deduct_balance(self.user.id, total_cost, "21點開局扣款"):
+            return await inter.followup.send("餘額不足", ephemeral=True)
         self.stop()
-        gv = BlackjackGame(self.user, self.base_bet, self.p_bet, self.s_bet)
+        gv = BlackjackGame(self.user, self.base_bet, self.p_bet, self.s_bet, upfront_cost=total_cost)
         await _send_game(inter.channel, gv, interaction=inter)
         msg = await inter.original_response()
         asyncio.create_task(gv.check_auto_bj(msg))
@@ -272,9 +290,10 @@ class SetupView(discord.ui.View):
         await inter.response.send_modal(BetModal(self))
 
 class BlackjackGame(discord.ui.View):
-    def __init__(self, user, bet, p_bet, s_bet):
+    def __init__(self, user, bet, p_bet, s_bet, upfront_cost=0):
         super().__init__(timeout=90)
         self.user, self.bet, self.p_bet, self.s_bet = user, bet, p_bet, s_bet
+        self.total_deducted = upfront_cost
         self.hand_bets = [bet]
         self.deck = get_deck()
         random.shuffle(self.deck)
@@ -320,7 +339,7 @@ class BlackjackGame(discord.ui.View):
             elif c.label == "投降":
                 c.disabled = len(self.p_hand) > 2 or len(self.hands) > 1
             elif c.label == "要牌":
-                c.disabled = calculate_score(self.p_hand) >= 21
+                c.disabled = calculate_score(self.p_hand) > 21
         for c in to_remove: self.remove_item(c)
 
     def build_embed(self, done=False, res="", profit=0, animating=False, extra_msg="", guild_id=None):
@@ -353,7 +372,7 @@ class BlackjackGame(discord.ui.View):
         return embed
 
     async def check_auto_bj(self, message):
-        if calculate_score(self.p_hand) == 21:
+        if len(self.p_hand) == 2 and calculate_score(self.p_hand) == 21:
             await asyncio.sleep(1.5)
             try: await self.advance_hand(message_obj=message)
             except: pass
@@ -362,9 +381,9 @@ class BlackjackGame(discord.ui.View):
         if getattr(self, '_game_over', False): return
         self._game_over = True
         
-        # 關鍵修正：將結果更新至資料庫 (主注盈虧 + 旁注盈虧)
         total_p = prof + getattr(self, 'side_p', 0)
-        update_game_result(self.user.id, total_p, win, is_push)
+        settlement_credit = self.total_deducted + total_p
+        update_game_result(self.user.id, settlement_credit, total_p, win, is_push)
         
         for c in self.children: c.disabled = True
         stats = get_user_stats(self.user.id)
@@ -379,7 +398,7 @@ class BlackjackGame(discord.ui.View):
             self.current_hand += 1
             self.update_buttons()
             await self._edit(message=message_obj, interaction=interaction, extra_msg=f"👉 換第 {self.current_hand+1} 手牌")
-            if calculate_score(self.p_hand) == 21:
+            if len(self.p_hand) == 2 and calculate_score(self.p_hand) == 21:
                 await asyncio.sleep(1.5)
                 await self.advance_hand(message_obj=message_obj, interaction=interaction)
         else:
@@ -428,7 +447,7 @@ class BlackjackGame(discord.ui.View):
         self.p_hand.append(self.deck.pop())
         self.update_buttons() 
         ps = calculate_score(self.p_hand)
-        if ps >= 21 or len(self.p_hand) == 5:
+        if ps > 21 or len(self.p_hand) == 5:
             if ps > 21: self.hand_results[self.current_hand] = ("爆牌輸了", -self.hand_bets[self.current_hand], False)
             await self.advance_hand(interaction=inter, message_obj=inter.message)
         else: await self._edit(interaction=inter)
@@ -448,8 +467,10 @@ class BlackjackGame(discord.ui.View):
     async def double_down(self, inter, btn):
         if inter.user.id != self.user.id: return
         await inter.response.defer()
-        stats = get_user_stats(self.user.id)
-        if stats[0] < sum(self.hand_bets) + self.hand_bets[self.current_hand]: return await inter.followup.send("餘額不足", ephemeral=True)
+        extra_cost = self.hand_bets[self.current_hand]
+        if not try_deduct_balance(self.user.id, extra_cost, "21點雙倍加注"):
+            return await inter.followup.send("餘額不足", ephemeral=True)
+        self.total_deducted += extra_cost
         self.hand_bets[self.current_hand] *= 2
         self.p_hand.append(self.deck.pop())
         if calculate_score(self.p_hand) > 21: self.hand_results[self.current_hand] = ("你爆牌囉～小丑～", -self.hand_bets[self.current_hand], False)
@@ -459,8 +480,9 @@ class BlackjackGame(discord.ui.View):
     async def split(self, inter, btn):
         if inter.user.id != self.user.id: return
         await inter.response.defer()
-        stats = get_user_stats(self.user.id)
-        if stats[0] < sum(self.hand_bets) + self.bet: return await inter.followup.send("餘額不足", ephemeral=True)
+        if not try_deduct_balance(self.user.id, self.bet, "21點分牌加注"):
+            return await inter.followup.send("餘額不足", ephemeral=True)
+        self.total_deducted += self.bet
         self.is_split, c1, c2 = True, self.hands[0][0], self.hands[0][1]
         self.hands, self.hand_results, self.hand_bets = [[c1, self.deck.pop()], [c2, self.deck.pop()]], [None, None], [self.bet, self.bet]
         self.update_buttons(); await self._edit(interaction=inter, extra_msg="✌️ 你選擇了分牌！")
@@ -495,18 +517,21 @@ class NewGameView(discord.ui.View):
     async def again(self, inter, btn):
         if inter.user.id != self.user.id: return
         await inter.response.defer()
-        stats = get_user_stats(self.user.id)
-        if stats[0] < (self.last_bet + self.last_p_bet + self.last_s_bet): return await inter.followup.send("餘額不足", ephemeral=True)
-        self.stop(); gv = BlackjackGame(self.user, self.last_bet, self.last_p_bet, self.last_s_bet)
+        total_cost = self.last_bet + self.last_p_bet + self.last_s_bet
+        if not try_deduct_balance(self.user.id, total_cost, "21點開局扣款"):
+            return await inter.followup.send("餘額不足", ephemeral=True)
+        self.stop(); gv = BlackjackGame(self.user, self.last_bet, self.last_p_bet, self.last_s_bet, upfront_cost=total_cost)
         await _send_game(inter.channel, gv, interaction=inter)
         msg = await inter.original_response(); asyncio.create_task(gv.check_auto_bj(msg))
     @discord.ui.button(label="雙倍再局 (Double)", style=discord.ButtonStyle.primary)
     async def double_again(self, inter, btn):
         if inter.user.id != self.user.id: return
         await inter.response.defer()
-        stats, new_bet = get_user_stats(self.user.id), self.last_bet * 2
-        if stats[0] < (new_bet + self.last_p_bet + self.last_s_bet): return await inter.followup.send("餘額不足", ephemeral=True)
-        self.stop(); gv = BlackjackGame(self.user, new_bet, self.last_p_bet, self.last_s_bet)
+        new_bet = self.last_bet * 2
+        total_cost = new_bet + self.last_p_bet + self.last_s_bet
+        if not try_deduct_balance(self.user.id, total_cost, "21點開局扣款"):
+            return await inter.followup.send("餘額不足", ephemeral=True)
+        self.stop(); gv = BlackjackGame(self.user, new_bet, self.last_p_bet, self.last_s_bet, upfront_cost=total_cost)
         await _send_game(inter.channel, gv, interaction=inter)
         msg = await inter.original_response(); asyncio.create_task(gv.check_auto_bj(msg))
     @discord.ui.button(label="修改下注", style=discord.ButtonStyle.secondary)
@@ -657,6 +682,38 @@ async def balance(interaction: discord.Interaction, member: discord.Member = Non
     msg += f"📈 勝率：`{wr:.1f}%`\n"
     msg += f"💸 歷史總盈虧：`{t_prof}`"
     await interaction.response.send_message(msg)
+
+@bot.tree.command(name="transfer", description="轉帳給其他玩家")
+@app_commands.describe(member="要轉帳給誰", amount="轉帳金額")
+async def transfer(interaction: discord.Interaction, member: discord.Member, amount: int):
+    if amount <= 0:
+        return await interaction.response.send_message("金額必須大於 0", ephemeral=True)
+    if member.bot:
+        return await interaction.response.send_message("不能轉帳給機器人", ephemeral=True)
+    if member.id == interaction.user.id:
+        return await interaction.response.send_message("不能轉帳給自己", ephemeral=True)
+    if get_user_stats(interaction.user.id) is None:
+        return await interaction.response.send_message("你還沒註冊，請先使用 /register", ephemeral=True)
+    if get_user_stats(member.id) is None:
+        return await interaction.response.send_message("對方尚未註冊", ephemeral=True)
+
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute(
+        "UPDATE users SET balance=balance-%s WHERE user_id=%s AND balance >= %s",
+        (amount, str(interaction.user.id), amount)
+    )
+    if c.rowcount == 0:
+        conn.close()
+        return await interaction.response.send_message("餘額不足，無法轉帳", ephemeral=True)
+
+    c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (amount, str(member.id)))
+    conn.commit()
+    conn.close()
+
+    log_transaction(interaction.user.id, -amount, f"轉帳給 {member.id}")
+    log_transaction(member.id, amount, f"收到 {interaction.user.id} 的轉帳")
+    await interaction.response.send_message(f"✅ 已轉帳 **{amount}** 給 {member.mention}")
 
 @bot.tree.command(name="say", description="[管理員] 指定機器人對特定頻道發送內容")
 @app_commands.describe(text="你要機器人說什麼？", channel="指定發送到哪個頻道？(選填)")
