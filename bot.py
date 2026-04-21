@@ -809,6 +809,13 @@ async def on_ready():
         print(f"✅ Slash 指令同步完成: {len(synced)}")
     except Exception as e:
         print(f"❌ Slash 同步失敗: {e}")
+    # 在每個伺服器做 guild sync，讓新指令幾乎即時可用
+    for guild in bot.guilds:
+        try:
+            gsynced = await bot.tree.sync(guild=guild)
+            print(f"✅ Guild 同步完成 {guild.id}: {len(gsynced)}")
+        except Exception as e:
+            print(f"❌ Guild 同步失敗 {guild.id}: {e}")
     bot.loop.create_task(vc_reward_task())
     print(f"{bot.user} 啟動！")
 
