@@ -1087,6 +1087,7 @@ async def redpacket(interaction: discord.Interaction, total_amount: int, count: 
 
 @stock_group.command(name="quote", description="查詢台股個股資訊")
 @app_commands.describe(symbol="股票代號或名稱")
+@app_commands.autocomplete(symbol=lambda interaction, current: stock_symbol_autocomplete(interaction, current))
 async def stock_quote(interaction: discord.Interaction, symbol: str):
     await interaction.response.defer(thinking=True)
     try:
@@ -1094,7 +1095,8 @@ async def stock_quote(interaction: discord.Interaction, symbol: str):
     except Exception as e:
         return await interaction.followup.send(f"台股資料暫時無法取得：{e}", ephemeral=True)
 
-    key = symbol.strip().upper()
+    raw_key = symbol.strip()
+    key = raw_key.upper()
     picked = None
     partial_matches = []
     for row in rows:
@@ -1107,9 +1109,17 @@ async def stock_quote(interaction: discord.Interaction, symbol: str):
         for row in rows:
             code = str(row.get("Code", "")).upper()
             name = str(row.get("Name", ""))
-            if key in code or symbol.strip() in name:
+            if key in code or raw_key in name:
                 partial_matches.append(row)
         if partial_matches:
+            # 模糊關鍵字命中多檔時，先回候選清單給使用者再精準查
+            if len(partial_matches) > 1:
+                candidates = [f"{row.get('Code')} {row.get('Name')}" for row in partial_matches[:20]]
+                return await interaction.followup.send(
+                    "🔎 找到多筆相近股票，請改輸入更完整代號或名稱：\n"
+                    + "\n".join([f"- `{c}`" for c in candidates]),
+                    ephemeral=True
+                )
             picked = partial_matches[0]
     if picked is None:
         suggestions = []
@@ -1117,12 +1127,6 @@ async def stock_quote(interaction: discord.Interaction, symbol: str):
             suggestions.append(f"{row.get('Code')} {row.get('Name')}")
         return await interaction.followup.send(
             "找不到該股票代號/名稱。\n你可以查詢例如：\n" + "\n".join([f"- `{s}`" for s in suggestions]),
-            ephemeral=True
-        )
-    if len(partial_matches) > 1:
-        candidates = [f"{row.get('Code')} {row.get('Name')}" for row in partial_matches[:10]]
-        await interaction.followup.send(
-            "🔎 找到多筆相近股票，先顯示第一筆。\n你也可以改查：\n" + "\n".join([f"- `{c}`" for c in candidates]),
             ephemeral=True
         )
 
@@ -1156,9 +1160,26 @@ async def stock_quote(interaction: discord.Interaction, symbol: str):
     embed.set_footer(text=f"即時來源: TWSE MIS | 時間: {real['time'] or 'N/A'}")
     await interaction.followup.send(embed=embed)
 
-@stock_group.command(name="list", description="列出可查詢股票（可輸入關鍵字）")
-@app_commands.describe(keyword="股票代號或名稱關鍵字（選填）")
-async def stock_list(interaction: discord.Interaction, keyword: str = ""):
+async def stock_symbol_autocomplete(interaction: discord.Interaction, current: str):
+    try:
+        rows = await fetch_stock_day_all()
+    except:
+        return []
+    key = (current or "").strip().upper()
+    choices = []
+    for row in rows:
+        code = str(row.get("Code", "")).upper()
+        name = str(row.get("Name", ""))
+        if not key or key in code or (current or "").strip() in name:
+            label = f"{code} {name}".strip()
+            choices.append(app_commands.Choice(name=label[:100], value=code[:100]))
+            if len(choices) >= 25:
+                break
+    return choices
+
+@stock_group.command(name="list", description="列出可查詢股票（可翻頁）")
+@app_commands.describe(keyword="股票代號或名稱關鍵字（選填）", page="頁碼（從 1 開始）")
+async def stock_list(interaction: discord.Interaction, keyword: str = "", page: int = 1):
     await interaction.response.defer(thinking=True, ephemeral=True)
     try:
         rows = await fetch_stock_day_all()
@@ -1175,10 +1196,16 @@ async def stock_list(interaction: discord.Interaction, keyword: str = ""):
     if not filtered:
         return await interaction.followup.send("沒有符合的股票。", ephemeral=True)
 
-    preview = filtered[:20]
+    page_size = 20
+    total_pages = max(1, (len(filtered) + page_size - 1) // page_size)
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * page_size
+    end = start + page_size
+    preview = filtered[start:end]
     lines = [f"{r.get('Code')} {r.get('Name')}" for r in preview]
     await interaction.followup.send(
-        f"共找到 `{len(filtered)}` 檔，先列前 `{len(preview)}` 檔：\n" + "\n".join([f"- `{x}`" for x in lines]),
+        f"共找到 `{len(filtered)}` 檔 | 第 `{page}/{total_pages}` 頁（每頁 {page_size} 檔）\n"
+        + "\n".join([f"- `{x}`" for x in lines]),
         ephemeral=True
     )
 
