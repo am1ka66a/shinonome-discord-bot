@@ -93,6 +93,12 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS blacklist (user_id VARCHAR(255) PRIMARY KEY)''')
     c.execute('''CREATE TABLE IF NOT EXISTS daily_claims (user_id VARCHAR(255) PRIMARY KEY, last_claim DATE)''')
     c.execute('''CREATE TABLE IF NOT EXISTS logs (id INT AUTO_INCREMENT PRIMARY KEY, user_id VARCHAR(255), amount BIGINT, reason VARCHAR(255), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS stock_watchlist (
+                 user_id VARCHAR(255),
+                 symbol VARCHAR(32),
+                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                 PRIMARY KEY (user_id, symbol)
+                 )''')
     conn.commit()
     conn.close()
 
@@ -314,6 +320,38 @@ async def fetch_mis_quotes(channels):
 def build_mis_channels_for_code(code):
     c = str(code).strip().upper()
     return [f"tse_{c}.tw", f"otc_{c}.tw"]
+
+async def get_realtime_rank_data(sample_size=220):
+    rows = await fetch_stock_day_all()
+    candidates = []
+    for row in rows:
+        trade_value = to_float(row.get("TradeValue", "0"))
+        if trade_value > 0:
+            candidates.append((trade_value, str(row.get("Code", "")).strip(), str(row.get("Name", "")).strip()))
+    candidates = sorted(candidates, key=lambda x: x[0], reverse=True)[:sample_size]
+    channels = []
+    code_name_map = {}
+    for _, code, name in candidates:
+        if not code:
+            continue
+        code_name_map[code] = name
+        channels.extend(build_mis_channels_for_code(code))
+    quotes = await fetch_mis_quotes(channels)
+    best_by_code = {}
+    for q in quotes:
+        code = q["code"]
+        if not code:
+            continue
+        prev = best_by_code.get(code)
+        if prev is None or q["price"] > prev["price"]:
+            best_by_code[code] = q
+    scored = []
+    for code, q in best_by_code.items():
+        if q["price"] <= 0 or q["prev_close"] <= 0:
+            continue
+        q["name"] = code_name_map.get(code, q["name"] or code)
+        scored.append((q["pct"], q))
+    return scored, rows
 
 # ==========================================
 # 🃏 2. 核心遊戲邏輯 (6副牌)
@@ -1063,15 +1101,17 @@ async def transfer(interaction: discord.Interaction, member: discord.Member, amo
     log_transaction(member.id, amount, f"收到 {interaction.user.id} 的轉帳")
     await interaction.response.send_message(f"✅ 已轉帳 **{amount}** 給 {member.mention}")
 
-@bot.tree.command(name="redpacket", description="[管理員] 發送可搶紅包")
+@bot.tree.command(name="redpacket", description="發送可搶紅包（會扣自己的錢）")
 @app_commands.describe(total_amount="紅包總金額", count="份數", seconds="有效秒數(最少10秒)")
 async def redpacket(interaction: discord.Interaction, total_amount: int, count: int, seconds: int = 60):
-    if interaction.user.id not in ALLOWED_HOST_IDS:
-        return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
+    if get_user_stats(interaction.user.id) is None:
+        return await interaction.response.send_message("你還沒註冊，請先使用 /register", ephemeral=True)
     if total_amount < count or total_amount <= 0:
         return await interaction.response.send_message("總金額需大於 0，且至少要能每包 1 元。", ephemeral=True)
     if count < 1 or count > 100:
         return await interaction.response.send_message("份數需介於 1 到 100。", ephemeral=True)
+    if not try_deduct_balance(interaction.user.id, total_amount, "發送紅包扣款"):
+        return await interaction.response.send_message("餘額不足，無法發紅包", ephemeral=True)
     timeout_seconds = max(RED_PACKET_MIN_SECONDS, seconds)
     view = RedPacketView(interaction.user.id, total_amount, count)
     view.timeout = timeout_seconds
@@ -1209,50 +1249,15 @@ async def stock_list(interaction: discord.Interaction, keyword: str = "", page: 
         ephemeral=True
     )
 
-@stock_group.command(name="movers", description="台股漲跌排行")
-@app_commands.describe(top_n="排行筆數(1-10)")
+@stock_group.command(name="movers", description="台股漲跌排行（精簡）")
+@app_commands.describe(top_n="排行筆數(1-20)")
 async def stock_movers(interaction: discord.Interaction, top_n: int = 5):
     await interaction.response.defer(thinking=True)
-    top_n = max(1, min(10, top_n))
+    top_n = max(1, min(20, top_n))
     try:
-        rows = await fetch_stock_day_all()
-    except Exception as e:
-        return await interaction.followup.send(f"台股資料暫時無法取得：{e}", ephemeral=True)
-
-    # 先挑成交值前段，避免一次抓全市場即時資料造成過重負載
-    candidates = []
-    for row in rows:
-        trade_value = to_float(row.get("TradeValue", "0"))
-        if trade_value > 0:
-            candidates.append((trade_value, str(row.get("Code", "")).strip(), str(row.get("Name", "")).strip()))
-    candidates = sorted(candidates, key=lambda x: x[0], reverse=True)[:60]
-    channels = []
-    code_name_map = {}
-    for _, code, name in candidates:
-        if not code:
-            continue
-        code_name_map[code] = name
-        channels.extend(build_mis_channels_for_code(code))
-    try:
-        quotes = await fetch_mis_quotes(channels)
+        scored, _ = await get_realtime_rank_data()
     except Exception as e:
         return await interaction.followup.send(f"即時資料暫時無法取得：{e}", ephemeral=True)
-
-    best_by_code = {}
-    for q in quotes:
-        code = q["code"]
-        if not code:
-            continue
-        prev = best_by_code.get(code)
-        if prev is None or q["price"] > prev["price"]:
-            best_by_code[code] = q
-
-    scored = []
-    for code, q in best_by_code.items():
-        if q["price"] <= 0 or q["prev_close"] <= 0:
-            continue
-        q["name"] = code_name_map.get(code, q["name"] or code)
-        scored.append((q["pct"], q))
     if not scored:
         return await interaction.followup.send("目前無法計算排行", ephemeral=True)
 
@@ -1265,6 +1270,174 @@ async def stock_movers(interaction: discord.Interaction, top_n: int = 5):
     embed.add_field(name="跌幅前段", value=down_text or "無資料", inline=False)
     embed.set_footer(text="即時來源: TWSE MIS（熱門成交值樣本）")
     await interaction.followup.send(embed=embed)
+
+@stock_group.command(name="gainers", description="台股即時漲幅榜（可翻頁）")
+@app_commands.describe(limit="總共要看幾名(1-100)", page="頁碼（每頁10名）")
+async def stock_gainers(interaction: discord.Interaction, limit: int = 50, page: int = 1):
+    await interaction.response.defer(thinking=True)
+    limit = max(1, min(100, limit))
+    try:
+        scored, _ = await get_realtime_rank_data()
+    except Exception as e:
+        return await interaction.followup.send(f"即時資料暫時無法取得：{e}", ephemeral=True)
+    if not scored:
+        return await interaction.followup.send("目前無法計算排行", ephemeral=True)
+    ranked = sorted(scored, key=lambda x: x[0], reverse=True)[:limit]
+    page_size = 10
+    total_pages = max(1, (len(ranked) + page_size - 1) // page_size)
+    page = max(1, min(page, total_pages))
+    seg = ranked[(page - 1) * page_size: page * page_size]
+    base_idx = (page - 1) * page_size
+    text = "\n".join([f"{base_idx+i+1}. {r['code']} {r['name']} `{p:+.2f}%`" for i, (p, r) in enumerate(seg)])
+    embed = discord.Embed(title="📈 台股即時漲幅榜", description=text or "無資料", color=0x2b2d31)
+    embed.set_footer(text=f"第 {page}/{total_pages} 頁 | 共 {len(ranked)} 名 | 來源: TWSE MIS")
+    await interaction.followup.send(embed=embed)
+
+@stock_group.command(name="losers", description="台股即時跌幅榜（可翻頁）")
+@app_commands.describe(limit="總共要看幾名(1-100)", page="頁碼（每頁10名）")
+async def stock_losers(interaction: discord.Interaction, limit: int = 50, page: int = 1):
+    await interaction.response.defer(thinking=True)
+    limit = max(1, min(100, limit))
+    try:
+        scored, _ = await get_realtime_rank_data()
+    except Exception as e:
+        return await interaction.followup.send(f"即時資料暫時無法取得：{e}", ephemeral=True)
+    if not scored:
+        return await interaction.followup.send("目前無法計算排行", ephemeral=True)
+    ranked = sorted(scored, key=lambda x: x[0])[:limit]
+    page_size = 10
+    total_pages = max(1, (len(ranked) + page_size - 1) // page_size)
+    page = max(1, min(page, total_pages))
+    seg = ranked[(page - 1) * page_size: page * page_size]
+    base_idx = (page - 1) * page_size
+    text = "\n".join([f"{base_idx+i+1}. {r['code']} {r['name']} `{p:+.2f}%`" for i, (p, r) in enumerate(seg)])
+    embed = discord.Embed(title="📉 台股即時跌幅榜", description=text or "無資料", color=0x2b2d31)
+    embed.set_footer(text=f"第 {page}/{total_pages} 頁 | 共 {len(ranked)} 名 | 來源: TWSE MIS")
+    await interaction.followup.send(embed=embed)
+
+@stock_group.command(name="topvolume", description="台股成交量排行（可翻頁）")
+@app_commands.describe(limit="總共要看幾名(1-100)", page="頁碼（每頁10名）")
+async def stock_topvolume(interaction: discord.Interaction, limit: int = 50, page: int = 1):
+    await interaction.response.defer(thinking=True)
+    limit = max(1, min(100, limit))
+    try:
+        rows = await fetch_stock_day_all()
+    except Exception as e:
+        return await interaction.followup.send(f"台股資料暫時無法取得：{e}", ephemeral=True)
+    ranked = []
+    for row in rows:
+        vol = int(to_float(row.get("TradeVolume", "0")))
+        if vol > 0:
+            ranked.append((vol, str(row.get("Code", "")), str(row.get("Name", ""))))
+    ranked = sorted(ranked, key=lambda x: x[0], reverse=True)[:limit]
+    if not ranked:
+        return await interaction.followup.send("目前無法取得成交量排行", ephemeral=True)
+    page_size = 10
+    total_pages = max(1, (len(ranked) + page_size - 1) // page_size)
+    page = max(1, min(page, total_pages))
+    seg = ranked[(page - 1) * page_size: page * page_size]
+    base_idx = (page - 1) * page_size
+    text = "\n".join([f"{base_idx+i+1}. {c} {n} `{v:,}`" for i, (v, c, n) in enumerate(seg)])
+    embed = discord.Embed(title="📊 台股成交量排行", description=text or "無資料", color=0x2b2d31)
+    embed.set_footer(text=f"第 {page}/{total_pages} 頁 | 共 {len(ranked)} 名 | 來源: TWSE openapi")
+    await interaction.followup.send(embed=embed)
+
+@stock_group.command(name="market", description="台股市場摘要")
+async def stock_market(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+    try:
+        scored, rows = await get_realtime_rank_data()
+    except Exception as e:
+        return await interaction.followup.send(f"市場摘要暫時無法取得：{e}", ephemeral=True)
+    if not scored:
+        return await interaction.followup.send("目前無法計算市場摘要", ephemeral=True)
+    up = len([1 for p, _ in scored if p > 0])
+    down = len([1 for p, _ in scored if p < 0])
+    flat = len(scored) - up - down
+    total_value = 0
+    for row in rows:
+        total_value += int(to_float(row.get("TradeValue", "0")))
+    embed = discord.Embed(title="🧭 台股市場摘要", color=0x2b2d31)
+    embed.add_field(name="上漲 / 下跌 / 平盤", value=f"`{up}` / `{down}` / `{flat}`", inline=False)
+    embed.add_field(name="成交值(全市場日資料)", value=f"`{total_value:,}`", inline=False)
+    embed.set_footer(text="即時漲跌樣本: TWSE MIS | 成交值: TWSE openapi")
+    await interaction.followup.send(embed=embed)
+
+@stock_group.command(name="watch_add", description="加入自選股")
+@app_commands.describe(symbol="股票代號")
+async def stock_watch_add(interaction: discord.Interaction, symbol: str):
+    code = symbol.strip().upper()
+    if not code:
+        return await interaction.response.send_message("請輸入股票代號", ephemeral=True)
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("INSERT IGNORE INTO stock_watchlist (user_id, symbol) VALUES (%s, %s)", (str(interaction.user.id), code))
+    conn.commit()
+    conn.close()
+    await interaction.response.send_message(f"✅ 已加入自選股：`{code}`", ephemeral=True)
+
+@stock_group.command(name="watch_remove", description="移除自選股")
+@app_commands.describe(symbol="股票代號")
+async def stock_watch_remove(interaction: discord.Interaction, symbol: str):
+    code = symbol.strip().upper()
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("DELETE FROM stock_watchlist WHERE user_id=%s AND symbol=%s", (str(interaction.user.id), code))
+    conn.commit()
+    conn.close()
+    await interaction.response.send_message(f"🗑️ 已移除自選股：`{code}`", ephemeral=True)
+
+@stock_group.command(name="watch_list", description="查看自選股清單")
+async def stock_watch_list(interaction: discord.Interaction):
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT symbol FROM stock_watchlist WHERE user_id=%s ORDER BY created_at DESC", (str(interaction.user.id),))
+    rows = c.fetchall()
+    conn.close()
+    if not rows:
+        return await interaction.response.send_message("你還沒有自選股，先用 `/stock watch_add` 新增。", ephemeral=True)
+    items = [r[0] for r in rows]
+    await interaction.response.send_message("⭐ 你的自選股：\n" + "\n".join([f"- `{x}`" for x in items]), ephemeral=True)
+
+@stock_group.command(name="watchquote", description="自選股即時報價")
+async def stock_watchquote(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT symbol FROM stock_watchlist WHERE user_id=%s ORDER BY created_at DESC LIMIT 20", (str(interaction.user.id),))
+    rows = c.fetchall()
+    conn.close()
+    if not rows:
+        return await interaction.followup.send("你還沒有自選股，先用 `/stock watch_add` 新增。", ephemeral=True)
+    symbols = [r[0] for r in rows]
+    channels = []
+    for code in symbols:
+        channels.extend(build_mis_channels_for_code(code))
+    try:
+        quotes = await fetch_mis_quotes(channels)
+    except Exception as e:
+        return await interaction.followup.send(f"即時資料暫時無法取得：{e}", ephemeral=True)
+    best = {}
+    for q in quotes:
+        code = q["code"]
+        if code in symbols and (code not in best or q["price"] > best[code]["price"]):
+            best[code] = q
+    lines = []
+    for code in symbols:
+        q = best.get(code)
+        if not q:
+            lines.append(f"{code} `N/A`")
+        else:
+            lines.append(f"{code} `{q['price']:.2f}` ({q['pct']:+.2f}%)")
+    embed = discord.Embed(title="⭐ 自選股即時報價", description="\n".join(lines), color=0x2b2d31)
+    embed.set_footer(text="來源: TWSE MIS")
+    await interaction.followup.send(embed=embed)
+
+@stock_group.command(name="txchart", description="台指期圖表連結")
+async def stock_txchart(interaction: discord.Interaction):
+    embed = discord.Embed(title="📉 台指期圖表", color=0x2b2d31)
+    embed.description = "可直接開這個連結看台指期連續合約圖：\nhttps://www.tradingview.com/chart/?symbol=TAIFEX%3ATX1%21"
+    await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="say", description="[管理員] 指定機器人對特定頻道發送內容")
 @app_commands.describe(text="你要機器人說什麼？", channel="指定發送到哪個頻道？(選填)")
