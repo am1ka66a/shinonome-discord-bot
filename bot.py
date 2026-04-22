@@ -19,7 +19,7 @@ load_dotenv()
 # ==========================================
 # ⚙️ 系統設定與全局變數
 # ==========================================
-ALLOWED_HOST_IDS = [531308526262550528, 600177596088582185]  # ⚠️ 填入你的 Discord ID
+ALLOWED_HOST_IDS = [531308526262550528, 600177596088582185, 1027248561177509919]  # ⚠️ 填入你的 Discord ID
 SIDE_BET_RATIO = 0.5                     # 側注上限 (主注的 50%)
 IS_EVENT_ACTIVE = True                   # 賭場狀態
 MAX_LEVEL = 100
@@ -28,6 +28,7 @@ STOCK_CACHE_SECONDS = 20
 RED_PACKET_MIN_SECONDS = 10
 red_packet_seq = 0
 stock_cache = {"day_all": {"ts": 0.0, "data": []}}
+STOCK_API_INSECURE_SSL = str(os.getenv("STOCK_API_INSECURE_SSL", "0")).strip().lower() in ("1", "true", "yes", "on")
 
 def is_host():
     def predicate(ctx): return ctx.author.id in ALLOWED_HOST_IDS
@@ -109,6 +110,8 @@ def init_db():
                  )''')
     try: c.execute("ALTER TABLE tournament_players ADD COLUMN player_discord_id VARCHAR(255) NULL")
     except: pass
+    try: c.execute("CREATE UNIQUE INDEX uq_tournament_players_discord_id ON tournament_players (player_discord_id)")
+    except: pass
     c.execute('''CREATE TABLE IF NOT EXISTS tournament_config (
                  id INT PRIMARY KEY,
                  reg_start TIMESTAMP NULL,
@@ -166,6 +169,16 @@ def get_user_stats(user_id):
     res = c.fetchone()
     conn.close()
     return res
+
+def ensure_user_exists(user_id, startup_balance=50000):
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute(
+        "INSERT IGNORE INTO users (user_id, balance) VALUES (%s, %s)",
+        (str(user_id), int(startup_balance))
+    )
+    conn.commit()
+    conn.close()
 
 def try_deduct_balance(user_id, amount, reason):
     if amount <= 0:
@@ -294,7 +307,7 @@ async def fetch_stock_day_all():
     if now - cache_obj["ts"] < STOCK_CACHE_SECONDS and cache_obj["data"]:
         return cache_obj["data"]
     url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-    connector = aiohttp.TCPConnector(ssl=False)
+    connector = aiohttp.TCPConnector(ssl=False if STOCK_API_INSECURE_SSL else None)
     async with aiohttp.ClientSession(connector=connector) as session:
         async with session.get(url, timeout=15) as resp:
             if resp.status != 200:
@@ -336,7 +349,7 @@ async def fetch_mis_quotes(channels):
     if not channels:
         return []
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://mis.twse.com.tw/stock/index.jsp"}
-    connector = aiohttp.TCPConnector(ssl=False)
+    connector = aiohttp.TCPConnector(ssl=False if STOCK_API_INSECURE_SSL else None)
     all_quotes = []
     # MIS 在 ex_ch 過長時常回 HTML；分批可避免 URL 過長與超時
     chunk_size = 20
@@ -487,6 +500,27 @@ def _clear_downstream_from_match(conn, round_no, match_no, total_rounds):
     )
     _clear_downstream_from_match(conn, next_round, next_match_no, total_rounds)
 
+def _refresh_champion_if_single_left(conn):
+    c = conn.cursor()
+    c.execute("SELECT status FROM tournament_meta WHERE id=1")
+    meta_row = c.fetchone()
+    if not meta_row:
+        return
+    status = meta_row[0] or "idle"
+    if status != "running":
+        return
+    c.execute("SELECT p1_player_id, p2_player_id FROM tournament_matches WHERE status <> 'completed'")
+    rows = c.fetchall()
+    alive = set()
+    for p1, p2 in rows:
+        if p1:
+            alive.add(p1)
+        if p2:
+            alive.add(p2)
+    if len(alive) == 1:
+        champion = next(iter(alive))
+        c.execute("UPDATE tournament_meta SET status='finished', champion_player_id=%s WHERE id=1", (champion,))
+
 async def get_realtime_rank_data(sample_size=220):
     rows = await fetch_stock_day_all()
     candidates = []
@@ -623,8 +657,8 @@ class BetModal(discord.ui.Modal, title='自訂下注金額'):
         max_side = int(b * SIDE_BET_RATIO)
         if p + s > max_side:
             return await interaction.response.send_message(f"旁注總和 ({p+s}) 不能超過主注的 {int(SIDE_BET_RATIO*100)}% ({max_side})", ephemeral=True)
+        ensure_user_exists(self.view.user.id, 50000)
         stats = get_user_stats(self.view.user.id)
-        if not stats: return await interaction.response.send_message("請先使用 /register 註冊！", ephemeral=True)
         if stats[0] < (b + p + s): return await interaction.response.send_message(f"餘額不足！你目前有 {stats[0]} 東雲幣", ephemeral=True)
         self.view.base_bet = b
         self.view.max_side = max_side
@@ -651,6 +685,7 @@ class SetupView(discord.ui.View):
         return True
 
     def build_embed(self, err=""):
+        ensure_user_exists(self.user.id, 50000)
         stats = get_user_stats(self.user.id)
         embed = discord.Embed(title="🃏 21點 — 下注設定", color=0x2b2d31)
         embed.description = f"{'❌ ' + err + '\n' if err else ''}主注：`{self.base_bet}`\n旁注剩餘額度：**`{self.max_side - (self.p_bet + self.s_bet)}`**\n你的餘額：`{stats[0]}`"
@@ -662,8 +697,8 @@ class SetupView(discord.ui.View):
     async def start(self, inter, btn):
         if inter.user.id != self.user.id: return
         await inter.response.defer()
+        ensure_user_exists(self.user.id, 50000)
         stats = get_user_stats(self.user.id)
-        if not stats: return await inter.followup.send("請先使用 /register 註冊！", ephemeral=True)
         total_cost = self.base_bet + self.p_bet + self.s_bet
         if not try_deduct_balance(self.user.id, total_cost, "21點開局扣款"):
             return await inter.followup.send("餘額不足", ephemeral=True)
@@ -1160,18 +1195,9 @@ async def on_message(message):
         await bot.process_commands(message)
 
 # --- Slash ---
-@bot.tree.command(name="register", description="獲得 50,000 啟動資金")
-async def register(interaction: discord.Interaction):
-    conn = get_db_connection(); c = conn.cursor()
-    c.execute("INSERT IGNORE INTO users (user_id, balance) VALUES (%s, 50000)", (str(interaction.user.id),))
-    if c.rowcount == 0: await interaction.response.send_message("你註冊過了!", ephemeral=True)
-    else: log_transaction(interaction.user.id, 50000, "註冊獎勵"); await interaction.response.send_message("註冊成功，獲得 50,000 東雲幣！")
-    conn.commit(); conn.close()
-
 @bot.tree.command(name="daily", description="每日簽到領取 100,000 東雲幣")
 async def daily(interaction: discord.Interaction):
-    stats = get_user_stats(interaction.user.id)
-    if not stats: return await interaction.response.send_message("未註冊", ephemeral=True)
+    ensure_user_exists(interaction.user.id, 50000)
     daily_reward = 100000
     # 設定台灣時間 (UTC+8)
     tz = datetime.timezone(datetime.timedelta(hours=8))
@@ -1205,9 +1231,7 @@ async def daily(interaction: discord.Interaction):
 
 @bot.tree.command(name="hourly", description="每小時簽到（可依等級累積）")
 async def hourly(interaction: discord.Interaction):
-    stats = get_user_stats(interaction.user.id)
-    if not stats:
-        return await interaction.response.send_message("未註冊", ephemeral=True)
+    ensure_user_exists(interaction.user.id, 50000)
     bank_info = refresh_hourly_bank(interaction.user.id)
     if not bank_info:
         return await interaction.response.send_message("資料初始化失敗", ephemeral=True)
@@ -1234,10 +1258,10 @@ async def hourly(interaction: discord.Interaction):
 
 @bot.tree.command(name="beg", description="街頭乞討")
 async def beg(interaction: discord.Interaction):
+    ensure_user_exists(interaction.user.id, 50000)
     conn = get_db_connection(); c = conn.cursor()
     c.execute("SELECT balance, last_beg FROM users WHERE user_id=%s", (str(interaction.user.id),))
     row = c.fetchone()
-    if not row: return await interaction.response.send_message("未註冊", ephemeral=True)
     now = datetime.datetime.now()
     if row[1] and (now - row[1]).total_seconds() < 120: return await interaction.response.send_message("太快了", ephemeral=True)
     earn = random.randint(100, 600)
@@ -1247,10 +1271,10 @@ async def beg(interaction: discord.Interaction):
 
 @bot.tree.command(name="rescue", description="[極致救濟] 餘額為 0 元時可領 1,000 (每人限領 10 次)")
 async def rescue(interaction: discord.Interaction):
+    ensure_user_exists(interaction.user.id, 50000)
     conn = get_db_connection(); c = conn.cursor()
     c.execute("SELECT balance, last_rescue, rescue_count FROM users WHERE user_id=%s", (str(interaction.user.id),))
     row = c.fetchone()
-    if not row: return await interaction.response.send_message("尚未註冊", ephemeral=True)
     if row[0] > 0: return await interaction.response.send_message(f"💰 你還有一點尊嚴（餘額: {row[0]}），請自力更生！完全歸零時再來領。", ephemeral=True)
     if row[2] >= 10: return await interaction.response.send_message("🚫 抱歉，你的救濟次數已達 10 次上限。這輩子不能再領了，去跟朋友借吧！", ephemeral=True)
     
@@ -1268,13 +1292,17 @@ async def rescue(interaction: discord.Interaction):
 async def bj(interaction: discord.Interaction, bet: int = 1000):
     if not IS_EVENT_ACTIVE: return await interaction.response.send_message("打烊", ephemeral=True)
     if bet < 100: return await interaction.response.send_message("低消 100", ephemeral=True)
-    if get_user_stats(interaction.user.id) is None: return await interaction.response.send_message("未註冊", ephemeral=True)
+    ensure_user_exists(interaction.user.id, 50000)
     sv = SetupView(interaction.user, bet); await interaction.response.send_message(embed=sv.build_embed(), view=sv)
 
 @bot.tree.command(name="balance", description="查詢個人的戰績與餘額")
 async def balance(interaction: discord.Interaction, member: discord.Member = None):
-    target = member or interaction.user; stats = get_user_stats(target.id)
-    if not stats: return await interaction.response.send_message("未註冊", ephemeral=True)
+    target = member or interaction.user
+    if target.id == interaction.user.id:
+        ensure_user_exists(target.id, 50000)
+    else:
+        ensure_user_exists(target.id, 0)
+    stats = get_user_stats(target.id)
     bal, total, wins, t_prof = stats
     wr = (wins/total*100) if total > 0 else 0
     msg = f"📊 **{target.mention} 的統計資料**\n"
@@ -1288,9 +1316,11 @@ async def balance(interaction: discord.Interaction, member: discord.Member = Non
 @bot.tree.command(name="level", description="查詢等級與經驗值")
 async def level(interaction: discord.Interaction, member: discord.Member = None):
     target = member or interaction.user
+    if target.id == interaction.user.id:
+        ensure_user_exists(target.id, 50000)
+    else:
+        ensure_user_exists(target.id, 0)
     lv_row = get_level_stats(target.id)
-    if not lv_row:
-        return await interaction.response.send_message("未註冊", ephemeral=True)
     exp = int(lv_row[0] or 0)
     level_num = int(lv_row[1] or 1)
     calc_lv, cur_progress, next_need = calc_level_from_exp(exp)
@@ -1306,18 +1336,16 @@ async def level(interaction: discord.Interaction, member: discord.Member = None)
     await interaction.response.send_message(text)
 
 @bot.tree.command(name="transfer", description="轉帳給其他玩家")
-@app_commands.describe(member="要轉帳給誰", amount="轉帳金額")
-async def transfer(interaction: discord.Interaction, member: discord.Member, amount: int):
+@app_commands.describe(member="要轉帳給誰", amount="轉帳金額", note="備註（選填）")
+async def transfer(interaction: discord.Interaction, member: discord.Member, amount: int, note: str = ""):
     if amount <= 0:
         return await interaction.response.send_message("金額必須大於 0", ephemeral=True)
     if member.bot:
         return await interaction.response.send_message("不能轉帳給機器人", ephemeral=True)
     if member.id == interaction.user.id:
         return await interaction.response.send_message("不能轉帳給自己", ephemeral=True)
-    if get_user_stats(interaction.user.id) is None:
-        return await interaction.response.send_message("你還沒註冊，請先使用 /register", ephemeral=True)
-    if get_user_stats(member.id) is None:
-        return await interaction.response.send_message("對方尚未註冊", ephemeral=True)
+    ensure_user_exists(interaction.user.id, 50000)
+    ensure_user_exists(member.id, 0)
 
     conn = get_db_connection()
     c = conn.cursor()
@@ -1333,15 +1361,25 @@ async def transfer(interaction: discord.Interaction, member: discord.Member, amo
     conn.commit()
     conn.close()
 
-    log_transaction(interaction.user.id, -amount, f"轉帳給 {member.id}")
-    log_transaction(member.id, amount, f"收到 {interaction.user.id} 的轉帳")
-    await interaction.response.send_message(f"✅ 已轉帳 **{amount}** 給 {member.mention}")
+    note_text = (note or "").strip()
+    if len(note_text) > 100:
+        note_text = note_text[:100]
+    if note_text:
+        out_reason = f"轉帳給 {member.id}（備註: {note_text}）"
+        in_reason = f"收到 {interaction.user.id} 的轉帳（備註: {note_text}）"
+        msg = f"✅ 已轉帳 **{amount}** 給 {member.mention}\n📝 備註：{note_text}"
+    else:
+        out_reason = f"轉帳給 {member.id}"
+        in_reason = f"收到 {interaction.user.id} 的轉帳"
+        msg = f"✅ 已轉帳 **{amount}** 給 {member.mention}"
+    log_transaction(interaction.user.id, -amount, out_reason)
+    log_transaction(member.id, amount, in_reason)
+    await interaction.response.send_message(msg)
 
 @bot.tree.command(name="redpacket", description="發送可搶紅包（會扣自己的錢）")
 @app_commands.describe(total_amount="紅包總金額", count="份數", seconds="有效秒數(最少10秒)")
 async def redpacket(interaction: discord.Interaction, total_amount: int, count: int, seconds: int = 60):
-    if get_user_stats(interaction.user.id) is None:
-        return await interaction.response.send_message("你還沒註冊，請先使用 /register", ephemeral=True)
+    ensure_user_exists(interaction.user.id, 50000)
     if total_amount < count or total_amount <= 0:
         return await interaction.response.send_message("總金額需大於 0，且至少要能每包 1 元。", ephemeral=True)
     if count < 1 or count > 100:
@@ -1756,7 +1794,7 @@ async def lvleaderboard(interaction: discord.Interaction):
 
 @bot.tree.command(name="check_players", description="[管理員] 查看所有報名玩家與卡組")
 async def check_players(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
+    if not interaction.guild or not interaction.user.guild_permissions.administrator:
         return await interaction.response.send_message("❌ 你沒有管理員權限。", ephemeral=True)
     conn = None
     cursor = None
@@ -1860,6 +1898,7 @@ async def publish_bracket(interaction: discord.Interaction):
 
         for rno, mno, winner in auto_winners:
             _advance_winner(conn, rno, mno, winner, total_rounds)
+        _refresh_champion_if_single_left(conn)
 
         conn.commit()
 
@@ -1896,15 +1935,17 @@ async def publish_bracket(interaction: discord.Interaction):
             conn.close()
 
 @bot.tree.command(name="tournament_register", description="報名比賽並填寫卡組")
-@app_commands.describe(player_game_id="比賽用玩家ID", deck_name="卡組名稱", deck_image_url="卡組圖片連結(必填)")
-async def tournament_register(interaction: discord.Interaction, player_game_id: str, deck_name: str, deck_image_url: str):
-    pid = player_game_id.strip()
+@app_commands.describe(deck_name="卡組名稱", deck_image_url="卡組圖片連結(必填)")
+async def tournament_register(interaction: discord.Interaction, deck_name: str, deck_image_url: str):
+    pid = str(interaction.user.id)
     dname = deck_name.strip()
     durl = deck_image_url.strip()
-    if not pid or not dname or not durl:
-        return await interaction.response.send_message("玩家ID、卡組名稱、卡組圖片連結皆為必填。", ephemeral=True)
+    if not dname or not durl:
+        return await interaction.response.send_message("卡組名稱、卡組圖片連結皆為必填。", ephemeral=True)
     reg_start, reg_end = get_tournament_window()
     now = now_tw_naive()
+    if not reg_start:
+        return await interaction.response.send_message("⛔ 目前未開放報名，請管理員先設定 `/tournament_window_set`。", ephemeral=True)
     if reg_start and now < reg_start:
         ts = tw_naive_to_discord_ts(reg_start)
         return await interaction.response.send_message(f"⏳ 報名尚未開始，開始時間：<t:{ts}:F>", ephemeral=True)
@@ -1917,20 +1958,27 @@ async def tournament_register(interaction: discord.Interaction, player_game_id: 
     exists = c.fetchone()
     if exists:
         conn.close()
-        return await interaction.response.send_message("此玩家ID已報名，請改用 `/tournament_update_deck`。", ephemeral=True)
-    c.execute(
-        "INSERT INTO tournament_players (player_game_id, player_discord_id, deck_name, deck_image_url) VALUES (%s, %s, %s, %s)",
-        (pid, str(interaction.user.id), dname, durl)
-    )
+        return await interaction.response.send_message("你已報名，請改用 `/tournament_update_deck`。", ephemeral=True)
+    c.execute("SELECT player_game_id FROM tournament_players WHERE player_discord_id=%s LIMIT 1", (str(interaction.user.id),))
+    same_user = c.fetchone()
+    if same_user:
+        conn.close()
+        return await interaction.response.send_message(f"你已報名過一次（ID：`{same_user[0]}`），每人僅可報名一次。", ephemeral=True)
+    try:
+        c.execute(
+            "INSERT INTO tournament_players (player_game_id, player_discord_id, deck_name, deck_image_url) VALUES (%s, %s, %s, %s)",
+            (pid, str(interaction.user.id), dname, durl)
+        )
+    except pymysql.err.IntegrityError:
+        conn.close()
+        return await interaction.response.send_message("你已報名過一次，每人僅可報名一次。", ephemeral=True)
     conn.commit()
     conn.close()
-    await interaction.response.send_message(f"✅ 報名成功：`{pid}` - `{dname}`")
+    await interaction.response.send_message(f"✅ 報名成功：`{pid}`（你的 Discord ID）- `{dname}`")
 
-@bot.tree.command(name="tournament_update_deck", description="[管理員] 更新玩家卡組資料")
+@bot.tree.command(name="tournament_update_deck", description="更新自己報名的卡組資料")
 @app_commands.describe(player_game_id="比賽用玩家ID", deck_name="新卡組名稱", deck_image_url="新卡組圖片連結(必填)")
 async def tournament_update_deck(interaction: discord.Interaction, player_game_id: str, deck_name: str, deck_image_url: str):
-    if not interaction.user.guild_permissions.administrator:
-        return await interaction.response.send_message("❌ 你沒有管理員權限。", ephemeral=True)
     pid = player_game_id.strip()
     dname = deck_name.strip()
     durl = deck_image_url.strip()
@@ -1938,12 +1986,23 @@ async def tournament_update_deck(interaction: discord.Interaction, player_game_i
         return await interaction.response.send_message("玩家ID、卡組名稱、卡組圖片連結皆為必填。", ephemeral=True)
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("UPDATE tournament_players SET deck_name=%s, deck_image_url=%s WHERE player_game_id=%s", (dname, durl, pid))
+    c.execute("SELECT player_game_id FROM tournament_players WHERE player_discord_id=%s LIMIT 1", (str(interaction.user.id),))
+    owned = c.fetchone()
+    if not owned:
+        conn.close()
+        return await interaction.response.send_message("你尚未報名，無法更新卡組。", ephemeral=True)
+    if owned[0] != pid:
+        conn.close()
+        return await interaction.response.send_message(f"你只能更新自己報名的 ID：`{owned[0]}`", ephemeral=True)
+    c.execute(
+        "UPDATE tournament_players SET deck_name=%s, deck_image_url=%s WHERE player_game_id=%s AND player_discord_id=%s",
+        (dname, durl, pid, str(interaction.user.id))
+    )
     conn.commit()
     affected = c.rowcount
     conn.close()
     if affected == 0:
-        return await interaction.response.send_message("找不到該玩家ID。", ephemeral=True)
+        return await interaction.response.send_message("更新失敗，請確認報名資料。", ephemeral=True)
     await interaction.response.send_message(f"✅ 已更新 `{pid}` 的卡組資料。")
 
 @bot.tree.command(name="tournament_remove", description="[管理員] 取消玩家報名")
@@ -1962,12 +2021,12 @@ async def tournament_remove(interaction: discord.Interaction, player_game_id: st
         return await interaction.response.send_message("找不到該玩家ID。", ephemeral=True)
     await interaction.response.send_message(f"🗑️ 已取消 `{pid}` 的報名。")
 
-@bot.tree.command(name="tournament_list", description="查看比賽報名名單（可翻頁）")
+@bot.tree.command(name="tournament_list", description="查看比賽報名名單 ID（可翻頁）")
 @app_commands.describe(page="頁碼（每頁 20 筆）")
 async def tournament_list(interaction: discord.Interaction, page: int = 1):
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT player_game_id, deck_name, deck_image_url, created_at FROM tournament_players ORDER BY created_at ASC")
+    c.execute("SELECT player_game_id, created_at FROM tournament_players ORDER BY created_at ASC")
     rows = c.fetchall()
     conn.close()
     if not rows:
@@ -1980,11 +2039,8 @@ async def tournament_list(interaction: discord.Interaction, page: int = 1):
     seg = rows[start:end]
     lines = []
     base = start
-    for i, (pid, dname, url, created_at) in enumerate(seg):
-        line = f"{base+i+1}. `{pid}` - `{dname}`"
-        if url:
-            line += f" [卡組]({url})"
-        lines.append(line)
+    for i, (pid, created_at) in enumerate(seg):
+        lines.append(f"{base+i+1}. `{pid}`")
     embed = discord.Embed(title="📋 比賽報名名單", description="\n".join(lines), color=0x2b2d31)
     embed.set_footer(text=f"第 {page}/{total_pages} 頁 | 共 {len(rows)} 人")
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -2016,7 +2072,7 @@ async def tournament_window_set(interaction: discord.Interaction, start_time: st
 async def tournament_window_show(interaction: discord.Interaction):
     reg_start, reg_end = get_tournament_window()
     if not reg_start and not reg_end:
-        return await interaction.response.send_message("目前尚未設定報名時間窗（預設隨時可報）。", ephemeral=True)
+        return await interaction.response.send_message("目前尚未設定報名時間窗（預設為關閉報名）。", ephemeral=True)
     s_ts = tw_naive_to_discord_ts(reg_start) if reg_start else None
     e_ts = tw_naive_to_discord_ts(reg_end) if reg_end else None
     msg = "🗓️ 目前報名時間窗：\n"
@@ -2034,13 +2090,22 @@ async def tournament_bracket(interaction: discord.Interaction):
         "SELECT round_no, match_no, p1_player_id, p2_player_id, p1_score, p2_score, winner_player_id, status FROM tournament_matches ORDER BY round_no, match_no"
     )
     rows = c.fetchall()
+    c.execute("SELECT player_game_id FROM tournament_players ORDER BY created_at ASC")
+    players = c.fetchall()
     conn.close()
-    if not rows:
-        return await interaction.response.send_message("目前尚未開賽，請管理員先使用 `/publish_bracket`。", ephemeral=True)
     status = (meta[0] if meta else "running") or "running"
     total_rounds = (meta[1] if meta else 1) or 1
     current_round = (meta[2] if meta else 1) or 1
     champion = meta[3] if meta else None
+    if not rows:
+        registered = len(players)
+        embed = discord.Embed(
+            title="🏟️ 目前賽程",
+            description=f"狀態：**{status}**（尚未開賽）\n目前報名人數：**{registered}**",
+            color=0x2b2d31
+        )
+        embed.add_field(name="提示", value="管理員可使用 `/publish_bracket` 建立賽程。", inline=False)
+        return await interaction.response.send_message(embed=embed, ephemeral=True)
     payload = [
         {
             "round_no": r[0], "match_no": r[1], "p1_player_id": r[2], "p2_player_id": r[3],
@@ -2080,10 +2145,7 @@ async def tournament_submit_score(interaction: discord.Interaction, round_no: in
     c = conn.cursor()
     c.execute("SELECT player_game_id FROM tournament_players WHERE player_discord_id=%s LIMIT 1", (str(interaction.user.id),))
     player_row = c.fetchone()
-    if not player_row:
-        conn.close()
-        return await interaction.response.send_message("你尚未報名或報名資料缺少 Discord 綁定。", ephemeral=True)
-    player_id = player_row[0]
+    player_id = player_row[0] if player_row else str(interaction.user.id)
     c.execute(
         "SELECT p1_player_id, p2_player_id, status FROM tournament_matches WHERE round_no=%s AND match_no=%s",
         (round_no, match_no)
@@ -2122,10 +2184,7 @@ async def tournament_confirm_score(interaction: discord.Interaction, round_no: i
     c = conn.cursor()
     c.execute("SELECT player_game_id FROM tournament_players WHERE player_discord_id=%s LIMIT 1", (str(interaction.user.id),))
     player_row = c.fetchone()
-    if not player_row:
-        conn.close()
-        return await interaction.response.send_message("你尚未報名或報名資料缺少 Discord 綁定。", ephemeral=True)
-    player_id = player_row[0]
+    player_id = player_row[0] if player_row else str(interaction.user.id)
     c.execute("SELECT total_rounds FROM tournament_meta WHERE id=1")
     meta = c.fetchone()
     total_rounds = (meta[0] if meta else 1) or 1
@@ -2175,6 +2234,7 @@ async def tournament_confirm_score(interaction: discord.Interaction, round_no: i
             (winner, round_no, match_no)
         )
         _advance_winner(conn, round_no, match_no, winner, total_rounds)
+        _refresh_champion_if_single_left(conn)
         c.execute(
             "SELECT MIN(round_no) FROM tournament_matches WHERE status <> 'completed'"
         )
@@ -2230,6 +2290,7 @@ async def tournament_admin_set_result(interaction: discord.Interaction, round_no
         (p1_score, p2_score, winner, f"admin:{interaction.user.id}", round_no, match_no)
     )
     _advance_winner(conn, round_no, match_no, winner, total_rounds)
+    _refresh_champion_if_single_left(conn)
     c.execute("SELECT MIN(round_no) FROM tournament_matches WHERE status <> 'completed'")
     next_round_row = c.fetchone()
     next_round = next_round_row[0] if next_round_row and next_round_row[0] else total_rounds
@@ -2279,6 +2340,7 @@ async def tournament_admin_advance(interaction: discord.Interaction, round_no: i
         (p1_score, p2_score, winner_player_id, f"admin:{interaction.user.id}:{reason[:80]}", round_no, match_no)
     )
     _advance_winner(conn, round_no, match_no, winner_player_id, total_rounds)
+    _refresh_champion_if_single_left(conn)
     c.execute("SELECT MIN(round_no) FROM tournament_matches WHERE status <> 'completed'")
     next_round_row = c.fetchone()
     next_round = next_round_row[0] if next_round_row and next_round_row[0] else total_rounds
@@ -2318,6 +2380,7 @@ async def tournament_admin_reopen_match(interaction: discord.Interaction, round_
     )
     _clear_downstream_from_match(conn, round_no, match_no, total_rounds)
     c.execute("UPDATE tournament_meta SET status='running', champion_player_id=NULL WHERE id=1")
+    _refresh_champion_if_single_left(conn)
     c.execute("SELECT MIN(round_no) FROM tournament_matches WHERE status <> 'completed'")
     next_round_row = c.fetchone()
     next_round = next_round_row[0] if next_round_row and next_round_row[0] else 1
@@ -2332,30 +2395,46 @@ def is_slash_host(interaction: discord.Interaction):
     return interaction.user.id in ALLOWED_HOST_IDS
 
 @bot.tree.command(name="give", description="[管理員] 發放東雲幣給玩家")
-@app_commands.describe(member="玩家", amount="發放數量")
-async def give_slash(interaction: discord.Interaction, member: discord.Member, amount: int):
+@app_commands.describe(member="玩家", amount="發放數量", note="備註（選填）")
+async def give_slash(interaction: discord.Interaction, member: discord.Member, amount: int, note: str = ""):
     if not is_slash_host(interaction):
         return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
     if amount <= 0:
         return await interaction.response.send_message("數量必須大於 0", ephemeral=True)
+    ensure_user_exists(member.id, 0)
     conn = get_db_connection(); c = conn.cursor()
     c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (amount, str(member.id)))
     conn.commit(); conn.close()
-    log_transaction(member.id, amount, "管理員發放")
-    await interaction.response.send_message(f"已發放 **{amount}** 東雲幣給 {member.mention}。")
+    note_text = (note or "").strip()
+    if len(note_text) > 100:
+        note_text = note_text[:100]
+    reason = f"管理員發放（備註: {note_text}）" if note_text else "管理員發放"
+    log_transaction(member.id, amount, reason)
+    if note_text:
+        await interaction.response.send_message(f"已發放 **{amount}** 東雲幣給 {member.mention}。\n📝 備註：{note_text}")
+    else:
+        await interaction.response.send_message(f"已發放 **{amount}** 東雲幣給 {member.mention}。")
 
 @bot.tree.command(name="take", description="[管理員] 扣除玩家東雲幣")
-@app_commands.describe(member="玩家", amount="扣除數量")
-async def take_slash(interaction: discord.Interaction, member: discord.Member, amount: int):
+@app_commands.describe(member="玩家", amount="扣除數量", note="備註（選填）")
+async def take_slash(interaction: discord.Interaction, member: discord.Member, amount: int, note: str = ""):
     if not is_slash_host(interaction):
         return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
     if amount <= 0:
         return await interaction.response.send_message("數量必須大於 0", ephemeral=True)
+    ensure_user_exists(member.id, 0)
     conn = get_db_connection(); c = conn.cursor()
     c.execute("UPDATE users SET balance=GREATEST(0, balance-%s) WHERE user_id=%s", (amount, str(member.id)))
     conn.commit(); conn.close()
-    log_transaction(member.id, -amount, "管理員扣除")
-    await interaction.response.send_message(f"已從 {member.mention} 扣除 **{amount}** 東雲幣。")
+    note_text = (note or "").strip()
+    if len(note_text) > 100:
+        note_text = note_text[:100]
+    reason = f"管理員扣除（備註: {note_text}）" if note_text else "管理員扣除"
+    log_transaction(member.id, -amount, reason)
+    if note_text:
+        await interaction.response.send_message(f"已從 {member.mention} 扣除 **{amount}** 東雲幣。\n📝 備註：{note_text}")
+    else:
+        await interaction.response.send_message(f"已從 {member.mention} 扣除 **{amount}** 東雲幣。")
 
 @bot.tree.command(name="ban", description="[管理員] 將玩家加入黑名單")
 @app_commands.describe(member="玩家")
