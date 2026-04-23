@@ -44,9 +44,9 @@ LEVEL_MILESTONE_COINS: typing.Dict[int, int] = {
 LEVEL_MILESTONE_FLAVOR: typing.Dict[int, str] = {
     20: "你升上來了。奈音的裙擺還沒掃到你，但伺服器已經默認你值得多看一眼—畢竟能跟他一起女裝排隊的份額有限。",
     40: "你現在的等級夠在群裡大聲說幹話。奈音若轉頭瞪你，那不是生氣，是男娘の視線自帶一點腿環反光。",
-    60: "再往上，連你的鍵盤都學會看奈音臉色。他若邊女裝邊罵人還帶笑，你別爭辯，那是本群限定版聖光—你負責在旁邊鼓掌就好。",
-    80: "到這一階，背鍋與帶風向你都有一半免責額。奈音的裙角若掃到誰的羞恥心，你負責把尷尬收成梗；男娘主理人只負責美，不負責幫人找台階。",
-    100: "封頂。你的恥力與奈音的衣櫃一樣沒有上蓋。從此等級是裝飾，真正的高危職位是：敢在他面不改色踩雷的時候，還能活著被已讀。",
+    60: "再往上，連你的鍵盤都學會看奈音臉色。他若邊女裝邊罵人，你別爭辯，那是本群的南娘群主又在傲嬌了。",
+    80: "到這一階，背鍋與帶風向你都有的份。奈音的裙角若掃到誰的羞恥心，你負責嚴肅觀摩；男娘群主只負責美，我們只負責看。",
+    100:"封頂。你這傻逼能滿等也是個奇蹟= =。",
 }
 
 def level_milestone_guild_id() -> typing.Optional[int]:
@@ -275,6 +275,14 @@ def calc_level_from_exp(exp):
         remaining -= need
         level += 1
     return level, remaining, (0 if level >= MAX_LEVEL else exp_for_next_level(level))
+
+def exp_required_for_level(target_level: int) -> int:
+    """回傳達到指定等級所需的總 EXP（例如 Lv.1 -> 0 EXP）。"""
+    lv = max(1, min(MAX_LEVEL, int(target_level)))
+    total = 0
+    for cur in range(1, lv):
+        total += exp_for_next_level(cur)
+    return total
 
 def get_level_stats(user_id):
     conn = get_db_connection()
@@ -1494,10 +1502,9 @@ async def level(interaction: discord.Interaction, member: discord.Member = None)
             f"📈 本級累積 **{cur_progress:,} / {next_need:,}** EXP，尚餘 **{need_more:,}** EXP 可升 Lv.{level_num + 1}\n"
             f"`{bar}`"
         )
-    ms_footer = "領幣與階段私訊：全伺服器；身分組僅在 `LEVEL_MILESTONE_GUILD_ID` 指定之伺服器內升等時加發。" if level_milestone_guild_id() else "領幣與階段私訊：全伺服器。未設 `LEVEL_MILESTONE_GUILD_ID` 則不會自動加任何身分組。"
     emb.add_field(
         name="階段里程碑 Lv.20／40／60／80／100",
-        value=("\n".join(ms_lines) or "未設定") + f"\n\n{ms_footer}",
+        value="\n".join(ms_lines) or "未設定",
         inline=False,
     )
     await interaction.response.send_message(embed=emb)
@@ -2560,6 +2567,32 @@ async def tournament_admin_reopen_match(interaction: discord.Interaction, round_
 
 def is_slash_host(interaction: discord.Interaction):
     return interaction.user.id in ALLOWED_HOST_IDS
+
+@bot.tree.command(name="setlevel", description="[管理員] 直接設定玩家等級")
+@app_commands.describe(member="玩家", level="要設定到幾等（1~100）")
+async def setlevel_slash(interaction: discord.Interaction, member: discord.Member, level: int):
+    if not is_slash_host(interaction):
+        return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
+    if level < 1 or level > MAX_LEVEL:
+        return await interaction.response.send_message(f"等級需介於 1~{MAX_LEVEL}。", ephemeral=True)
+
+    ensure_user_exists(member.id, 0)
+    lv_row = get_level_stats(member.id)
+    old_exp = int(lv_row[0] or 0) if lv_row else 0
+    old_level = int(lv_row[1] or 1) if lv_row else 1
+    target_exp = exp_required_for_level(level)
+
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("UPDATE users SET level=%s, exp=%s WHERE user_id=%s", (int(level), int(target_exp), str(member.id)))
+    conn.commit()
+    conn.close()
+
+    await interaction.response.send_message(
+        f"✅ 已將 {member.mention} 設定為 **Lv.{level}**\n"
+        f"原本：Lv.{old_level} / EXP `{old_exp:,}`\n"
+        f"現在：Lv.{level} / EXP `{target_exp:,}`"
+    )
 
 @bot.tree.command(name="give", description="[管理員] 發放東雲幣給玩家")
 @app_commands.describe(member="玩家", amount="發放數量", note="備註（選填）")
