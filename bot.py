@@ -378,13 +378,13 @@ async def process_level_ups(member: discord.Member, old_lv: int, new_lv: int):
     for m in crossed:
         coin_amt = LEVEL_MILESTONE_COINS.get(m, 0)
         got = try_claim_milestone(member.id, m, coin_amt)
-        if got < 0:
-            continue
-        fl = LEVEL_MILESTONE_FLAVOR.get(m)
-        if fl:
-            flavor_paras.append(f"**【Lv.{m}】** {fl}")
-        if got > 0:
-            reward_lines.append(f"🎁 Lv.{m}：+**{got:,}** 東雲幣")
+        # 里程碑內容（致詞 / 幣）僅在首次達成時顯示；但身分組可獨立嘗試補發。
+        if got >= 0:
+            fl = LEVEL_MILESTONE_FLAVOR.get(m)
+            if fl:
+                flavor_paras.append(f"**【Lv.{m}】** {fl}")
+            if got > 0:
+                reward_lines.append(f"🎁 Lv.{m}：+**{got:,}** 東雲幣")
         rid = level_auto_role_id(m)
         g_limit = level_milestone_guild_id()
         if (
@@ -402,6 +402,8 @@ async def process_level_ups(member: discord.Member, old_lv: int, new_lv: int):
                     reward_lines.append(f"⚠️ 無法加上身分組「{role.name}」：請確認 Bot 有**管理身分組**，且 Bot 的**位階**高於該身分組。")
                 except discord.HTTPException:
                     reward_lines.append("⚠️ 授予身分組時發生錯誤，稍後可請管理員手動補上。")
+            else:
+                reward_lines.append(f"⚠️ 找不到 Lv.{m} 對應身分組（ID: {rid}），請確認此 ID 屬於目前伺服器。")
     if not flavor_paras and not reward_lines:
         return
     if flavor_paras:
