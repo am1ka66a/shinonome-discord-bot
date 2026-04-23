@@ -355,10 +355,7 @@ async def process_level_ups(member: discord.Member, old_lv: int, new_lv: int):
     crossed = [m for m in LEVEL_MILE_TIERS if old_lv < m <= new_lv]
     if not crossed:
         return
-    intro = (
-        f"從 Lv.{old_lv} 升至 Lv.{new_lv}，**首次**通過本階檻。\n"
-        f"階段幣**全伺服器**發放；**身分組**僅在 `.env` 指定之 `LEVEL_MILESTONE_GUILD_ID` 內、因聊天升等而加發。"
-    )
+    intro = f"從 Lv.{old_lv} 升至 Lv.{new_lv}，**首次**通過本階檻。"
     embed = discord.Embed(title="🎉 等級階段解鎖", description=intro, color=0x57F287)
     reward_lines = []
     flavor_paras: typing.List[str] = []
