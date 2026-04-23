@@ -22,7 +22,7 @@
 1. 用瀏覽器打開 <https://discord.com/developers/applications> 並登入。
 2. 點 **New Application**，取個名字 → **Create**。
 3. 左欄點 **Bot** → **Add Bot**（若已經有就略過）。
-4. 在 **Token** 區塱按 **Reset Token** / **Copy**，把出現的長字串**先貼在記事本**（**不要**貼在公開網路或 GitHub 上）。
+4. 在 **Token** 區按 **Reset Token** / **Copy**，把出現的長字串**先貼在記事本**（**不要**貼在公開網路或 GitHub 上）。
 5. 同一頁建議關掉 **Public Bot**（若你只想自己伺服器用），並打開 **MESSAGE CONTENT INTENT**（機器人需要讀取訊息內容做活躍獎勵等）。
 6. 左欄點 **OAuth2** → **URL Generator**：
    - **SCOPES** 勾 `bot`（必要時可再加 `applications.commands` 通常已內建於現代邀請流程）。
@@ -109,15 +109,132 @@ python bot.py
 
 ---
 
-## 七、專案裡有什麼（概覽）
+## 七、專案裡有什麼
 
-- **前綴指令**：`!` 前綴的傳統指令（若有實作）。
-- **斜線指令 (Slash)**：例如 `daily`、`hourly`、`bj`（21 點）、`balance`、`stock` 底下多個子指令、比賽相關 `tournament_*`、管理用 `give` / `take` / `ban` 等（權限依 Discord 與程式設計而定）。
-- **管理員專用**：`publish_bracket`、`give`、`lock`、`adminhelp` 等，請只給可信任的人使用。
+本專案主程式是單一檔案 **`bot.py`**（未拆成多個 `.py` 模塊，但可從下表對照**程式在檔內的職責**）。技術上：`discord.py` + **MySQL**（`PyMySQL`）+ **`.env`**（`python-dotenv`），對外幾乎全是 **斜線指令 (Slash)**。完整指令列表在 Discord 輸入 `/` 瀏覽，或在原始碼搜尋 `@bot.tree.command` 與 `@stock_group.command`。
 
-完整列表請在 **Discord 打 `/` 在介面中瀏覽**，或搜尋 `bot.py` 內的 `@bot.tree.command`。
+### 1. 系統設定與權限
 
-技術重點：`discord.py`、**MySQL** 透過 `PyMySQL`，設定自 **`.env` / `load_dotenv()`**。
+| 內容 | 做什麼 |
+|------|--------|
+| `ALLOWED_HOST_IDS` | 指定誰是「**遊戲主辦**」（21 點內主辦按鈕、部分賽事／管理行為）。 |
+| `IS_EVENT_ACTIVE`、側注比例等常數 | 控制賭桌是否接客、**旁注上限**等全局規則。 |
+| `is_host` / `is_slash_host` | 在指令或按鈕內**檢查**是否為主辦，不符合就擋。 |
+
+### 2. 資料庫層
+
+| 內容 | 做什麼 |
+|------|--------|
+| `get_db_connection` | 從 `MYSQL_URL` / `DATABASE_URL` 或分開的 `MYSQLHOST`… 等讀設定，**連上 MySQL**。 |
+| `init_db` | 啟動時**建表、補欄位**（`users`、`activity_stats`、`blacklist`、`daily_claims`、`logs`、`stock_watchlist`、比賽相關表等），缺表則建、舊表則**漸進補欄**（`ALTER`）。 |
+| 各資料表 | 存玩家餘額/戰績、**聊天與語音活躍**、**黑名單**、**每日簽到**、**交易紀錄**、**自選股**、**比賽報名／賽程／比分**等。 |
+
+### 3. 經濟與帳本
+
+| 內容 | 做什麼 |
+|------|--------|
+| `ensure_user_exists`、`get_user_stats`、`try_deduct_balance` | 新玩家**預設餘額**、查戰績、下注時**扣款**（防透支）。 |
+| `update_game_result` | 21 點結算後**更新**餘額、胜場、累計盈虧。 |
+| `log_transaction` + `logs` 表 | 幾乎所有**金額變動**寫一筆，方便查帳。 |
+| `is_blacklisted` | 被黑名單者是否拒絕服務。 |
+| 對應指令 | `/daily`、`/hourly`、`/beg`、`/rescue`、`/transfer`、`/redpacket`、轉帳與**排行榜**等。 |
+
+### 4. 等級、經驗、每小時加給
+
+| 內容 | 做什麼 |
+|------|--------|
+| `exp_for_next_level`、`calc_level_from_exp`、`add_user_exp` | **升級曲線**、依總經驗**換算等級**、發放經驗。 |
+| `get_level_stats` | 查等級。 |
+| `refresh_hourly_bank`、`payout_hourly_bank` | **每小時可領的「累積槽」**依等級有上限、依時間**慢慢堆**，`/hourly` 一次領出。 |
+| 與 `on_message` 連動 | 符合冷卻時在頻道聊天會**小量加經驗**（`EXP_COOLDOWN_SECONDS`）。 |
+
+### 5. 活躍與被動獎勵
+
+| 內容 | 做什麼 |
+|------|--------|
+| `on_message` | 在伺服器文字頻道計算**訊息數**；夠多句可觸發**活躍獎勵**；並在冷卻外發放**經驗**。需 **Message Content Intent**。 |
+| `vc_reward_task` | 背景迴圈：在**語音**且非全靜音等條件下，間隔夠久可發**語音掛網獎勵**到餘額。 |
+
+### 6. 台股查詢模組
+
+| 內容 | 做什麼 |
+|------|--------|
+| `fetch_stock_day_all` | 呼叫**證交所 OpenAPI** 全上市股票日內盤匯整（有**短快取**）。 |
+| `fetch_mis_quotes`、MIS 相輔助函式 | 向 **TWSE MIS** 取**即時報價**（分輪詢、避免單次網址過長）。 |
+| `get_realtime_rank_data` | 綜合成交量與即時漲跌，產**排行用**候選＋報價。 |
+| `STOCK_API_INSECURE_SSL` | 在 `.env` 可關閉 SSL 驗證（**僅在特定環境需要時**使用，有安全權衡）。 |
+| 對應指令 | 斜線群組 **`/stock`**：`quote`、`list`、`movers`、`gainers`、`losers`、`topvolume`、`market`、**自選股** `watch_*` / `watchquote`、`txchart` 等。 |
+| `StockPagerView` | 股票清單等介面的**分頁按鈕** UI。 |
+
+### 7. 21 點與遊戲介面
+
+| 內容 | 做什麼 |
+|------|--------|
+| `get_deck`、`calculate_score` | 使用 **6 副牌**（可調）、算點數（含 A 軟硬）。 |
+| `check_sidebets` | **對子旁注**、**21+3 旁注**（同花、順、三條等與盤面賠率）。 |
+| `SetupView`、`BetModal` | 開局前**主注、旁注**輸入與確認。 |
+| `BlackjackGame` 等 View | 遊戲中**要牌、停牌、分牌、All-in** 等按鈕邏輯；結算寫入經濟。 |
+| `ConfirmAllInView`、`NewGameView` | 全下確認、再開一局等流程。 |
+| 對應指令 | `/bj` 進入 21 點；`IS_EVENT_ACTIVE` 關閉時會「打烊」。 |
+
+### 8. 紅包
+
+| 內容 | 做什麼 |
+|------|--------|
+| `build_random_splits` | 將總金額**隨機拆**成多份。 |
+| `RedPacketView` | 一則可搶紅包訊息上的**搶奪按鈕**與時效。 |
+| 對應指令 | `/redpacket`（從自己餘額扣、發多人搶包）。 |
+
+### 9. 比賽（錦標賽）模組
+
+| 內容 | 做什麼 |
+|------|--------|
+| 報名與欄位 | 玩家**遊戲內 ID**、**卡組名**、**卡組圖網址**、Discord 對應等。 |
+| `get_tournament_window` 等 | **報名起迄時間**的讀寫與顯示。 |
+| `publish_bracket`、`_advance_winner`、`_clear_downstream…` 等 | **單淘汰 BO3 賽程**建立、**晉級**、輪空自動推進、**重開比賽**回滾後續。 |
+| 比分流程 | 選手 `/tournament_submit_score` 提交、雙方 `/tournament_confirm_score` **同意才成立**；管理員可**直接裁定、指定晉級、重開場次**。 |
+| 其他 | `/tournament_list`、`/tournament_bracket` 查名單與戰況等。 |
+
+### 10. 查詢與社群
+
+| 內容 | 做什麼 |
+|------|--------|
+| `/balance`、`/level`、`/record` | 個人**餘額／戰績**、**等級**、**金流紀錄**（分頁）。 |
+| `/leaderboard`、`/lvleaderboard` | 餘額前段班、**等級榜**。 |
+| `/say` | 管理員在指定頻道**代機器人發話**（需 `manage_messages` 等權限設計）。 |
+
+### 11. 管理、黑名單、賭場開關
+
+| 內容 | 做什麼 |
+|------|--------|
+| `/give`、`/take` | 發幣、扣幣。 |
+| `/ban`、`/unban` | 黑名單。 |
+| `/resetall_zero`、`/resetall_default` | 全服餘額**歸零**或**重設成預設額**（高風險操作）。 |
+| `/lock` | 切換**賭場**是否接客。 |
+| `/adminhelp` | 看管理相關指令說明。 |
+| 比賽用 | `/tournament_remove`、`/clear_tournament_players`、各種 `tournament_admin_*` 等。 |
+
+**提醒**：有「管理」或**全體金錢**影響的指令，只應讓**信任的管理員**使用，並在 Discord 後台**權限**分級。
+
+### `bot.py` 行數區段對照（方便在原始碼裡跳轉）
+
+下表以目前 **`bot.py` 全檔約 2516 行**為基準。之後你若增刪程式，**行數會跟著變動**，實務上以檔內的 `# ---`、`# =====` 註解與 `def` / `class` 名稱為準；此表僅作**大致導航**用。
+
+| 行數 (約) | 區段內容 |
+|-----------|----------|
+| 1–17 | `import`、`.env` 載入 |
+| 19–35 | 系統常數（主辦 ID、賭場開關、等）、`is_host` |
+| 37–212 | 資料庫連線、`init_db`、使用者／帳本／黑名單、21 點結算用的 `update_game_result` 等 |
+| 214–296 | 等級與經驗、每小時可領「累積槽」`refresh_hourly_bank` / `payout_hourly_bank` |
+| 298–555 | 台股（證交所 OpenAPI、MIS 即時、漲跌排行取樣）與**比賽晉級／重開**等純函式（賽制邏輯在這一帶） |
+| 556–1119 | 21 點牌組與點數、旁注、以及 **UI**：`SetupView` / `BlackjackGame`、全下確認、**紅包** `RedPacketView`、**台股** `StockPagerView` 等 |
+| 1121–1196 | 建立 `Bot` 實例、`on_ready`（建表＋同步 Slash）、**背景語音獎勵** `vc_reward_task`、**訊息活躍** `on_message` |
+| 1197–1400 | 經濟向斜線：`/daily`～`/redpacket`（含轉帳、21 點入口 `/bj` 等，至紅包為止） |
+| 1401–1734 | 斜線群組 **`/stock`** 全部子指令與**自動完成** `stock_symbol_autocomplete` |
+| 1736–1793 | `/say`、`/record`、**餘額榜** `/leaderboard`、**等級榜** `/lvleaderboard` |
+| 1795–2392 | 比賽一條龍：報名、報名窗、名單、公布賽程、交比分、雙方確認、以及各種**賽事管理**斜線，至 `tournament_admin_reopen_match` 為止 |
+| 2394–2514 | `is_slash_host` 與**主辦向管理**：`give` / `take` / `ban` / `unban`、全服重置、清空比賽報名、`/lock`、`/adminhelp` 等 |
+| 2516 | 啟動：`bot.run(os.getenv("DISCORD_TOKEN"))` |
 
 ---
 
