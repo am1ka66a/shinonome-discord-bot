@@ -2588,10 +2588,18 @@ async def setlevel_slash(interaction: discord.Interaction, member: discord.Membe
     conn.commit()
     conn.close()
 
+    milestone_note = ""
+    if level > old_level:
+        crossed = [m for m in LEVEL_MILE_TIERS if old_level < m <= level]
+        if crossed:
+            await process_level_ups(member, old_level, level)
+            milestone_note = f"\n🎯 已同步觸發里程碑流程：Lv.{', '.join(map(str, crossed))}"
+
     await interaction.response.send_message(
         f"✅ 已將 {member.mention} 設定為 **Lv.{level}**\n"
         f"原本：Lv.{old_level} / EXP `{old_exp:,}`\n"
         f"現在：Lv.{level} / EXP `{target_exp:,}`"
+        f"{milestone_note}"
     )
 
 @bot.tree.command(name="give", description="[管理員] 發放東雲幣給玩家")
