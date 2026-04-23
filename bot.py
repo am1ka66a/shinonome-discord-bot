@@ -1930,21 +1930,24 @@ async def record_cmd(interaction: discord.Interaction, member: discord.Member = 
         return await interaction.response.send_message("無紀錄", ephemeral=True)
 
     page_size = 10
-    total_pages = max(1, (len(rows) + page_size - 1) // page_size)
-    page = max(1, min(page, total_pages))
-    seg = rows[(page - 1) * page_size: page * page_size]
-    lines = []
-    base = (page - 1) * page_size
-    for i, r in enumerate(seg):
+    page = max(1, int(page))
+    all_lines = []
+    for i, r in enumerate(rows):
         time_text = r[2].strftime('%m/%d %H:%M') if r[2] else "N/A"
-        lines.append(f"{base+i+1}. [{time_text}] {r[1]}: `{r[0]}`")
-    embed = discord.Embed(
+        all_lines.append(f"{i+1}. [{time_text}] {r[1]}: `{r[0]}`")
+    view = StockPagerView(
+        owner_id=interaction.user.id,
         title=f"📒 {target.display_name} 的最近紀錄",
-        description="\n".join(lines),
-        color=0x2b2d31
+        lines=all_lines,
+        page_size=page_size,
+        start_page=page,
+        footer_prefix=f"共 {len(rows)} 筆（最多顯示 50）"
     )
-    embed.set_footer(text=f"第 {page}/{total_pages} 頁 | 共 {len(rows)} 筆（最多顯示 50）")
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=view.build_embed(), view=view)
+    try:
+        view.message = await interaction.original_response()
+    except:
+        pass
 
 @bot.tree.command(name="leaderboard", description="前 10 名")
 async def leaderboard(interaction: discord.Interaction):
@@ -2203,18 +2206,21 @@ async def tournament_list(interaction: discord.Interaction, page: int = 1):
     if not rows:
         return await interaction.response.send_message("目前無人報名。", ephemeral=True)
     page_size = 20
-    total_pages = max(1, (len(rows) + page_size - 1) // page_size)
-    page = max(1, min(page, total_pages))
-    start = (page - 1) * page_size
-    end = start + page_size
-    seg = rows[start:end]
-    lines = []
-    base = start
-    for i, (pid, created_at) in enumerate(seg):
-        lines.append(f"{base+i+1}. `{pid}`")
-    embed = discord.Embed(title="📋 比賽報名名單", description="\n".join(lines), color=0x2b2d31)
-    embed.set_footer(text=f"第 {page}/{total_pages} 頁 | 共 {len(rows)} 人")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    page = max(1, int(page))
+    all_lines = [f"{i+1}. `{pid}`" for i, (pid, _) in enumerate(rows)]
+    view = StockPagerView(
+        owner_id=interaction.user.id,
+        title="📋 比賽報名名單",
+        lines=all_lines,
+        page_size=page_size,
+        start_page=page,
+        footer_prefix=f"共 {len(rows)} 人"
+    )
+    await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
+    try:
+        view.message = await interaction.original_response()
+    except:
+        pass
 
 @bot.tree.command(name="tournament_window_set", description="[管理員] 設定報名起始與截止時間")
 @app_commands.describe(
