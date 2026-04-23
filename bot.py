@@ -29,22 +29,31 @@ RED_PACKET_MIN_SECONDS = 10
 red_packet_seq = 0
 stock_cache = {"day_all": {"ts": 0.0, "data": []}}
 STOCK_API_INSECURE_SSL = str(os.getenv("STOCK_API_INSECURE_SSL", "0")).strip().lower() in ("1", "true", "yes", "on")
-MINECRAFT_DEATH_MESSAGES = [
-    "{target} 被殭屍打倒了",
-    "{target} 被骷髏射成了刺蝟",
-    "{target} 嘗試在岩漿裡游泳",
-    "{target} 被苦力怕炸上天",
-    "{target} 從高處墜落",
-    "{target} 重重摔在地上",
-    "{target} 被仙人掌刺死了",
-    "{target} 在和烈焰使者作戰時走進了火裡",
-    "{target} 溺水了",
-    "{target} 被魔法擊殺",
-    "{target} 被掉落的鐵砧砸扁了",
-    "{target} 注定要墜落",
-    "{target} 被鐵巨人痛扁了一頓",
-    "{target} 被活活燒死",
+MINECRAFT_DEATH_MESSAGES_PATH = os.path.join(
+    os.path.dirname(__file__),
+    "data",
+    "minecraft_death_messages_zh_tw.json",
+)
+DEFAULT_MINECRAFT_DEATH_MESSAGES = [
+    "{target} 死了",
+    "{target} 在嘗試與地形理論辯論時失敗了",
+    "{target} 以為自己能扛住這一下",
 ]
+
+def load_minecraft_death_messages() -> typing.List[str]:
+    try:
+        with open(MINECRAFT_DEATH_MESSAGES_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        msgs = data.get("messages") if isinstance(data, dict) else None
+        if not isinstance(msgs, list):
+            return DEFAULT_MINECRAFT_DEATH_MESSAGES[:]
+        cleaned = [str(x).strip() for x in msgs if isinstance(x, str) and x.strip()]
+        return cleaned if cleaned else DEFAULT_MINECRAFT_DEATH_MESSAGES[:]
+    except Exception as e:
+        print(f"⚠️ 載入 Minecraft 死法 JSON 失敗: {e}")
+        return DEFAULT_MINECRAFT_DEATH_MESSAGES[:]
+
+MINECRAFT_DEATH_MESSAGES = load_minecraft_death_messages()
 
 # 等級里程碑：僅在**第一次到達** Lv.20/40/60/80/100 時發私訊、可領幣；自動加身分組**僅**在 .env 指定的伺服器（LEVEL_MILESTONE_GUILD_ID）
 LEVEL_MILE_TIERS: typing.Tuple[int, ...] = (20, 40, 60, 80, 100)
