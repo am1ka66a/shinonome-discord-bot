@@ -29,6 +29,22 @@ RED_PACKET_MIN_SECONDS = 10
 red_packet_seq = 0
 stock_cache = {"day_all": {"ts": 0.0, "data": []}}
 STOCK_API_INSECURE_SSL = str(os.getenv("STOCK_API_INSECURE_SSL", "0")).strip().lower() in ("1", "true", "yes", "on")
+MINECRAFT_DEATH_MESSAGES = [
+    "{target} 被殭屍打倒了",
+    "{target} 被骷髏射成了刺蝟",
+    "{target} 嘗試在岩漿裡游泳",
+    "{target} 被苦力怕炸上天",
+    "{target} 從高處墜落",
+    "{target} 重重摔在地上",
+    "{target} 被仙人掌刺死了",
+    "{target} 在和烈焰使者作戰時走進了火裡",
+    "{target} 溺水了",
+    "{target} 被魔法擊殺",
+    "{target} 被掉落的鐵砧砸扁了",
+    "{target} 注定要墜落",
+    "{target} 被鐵巨人痛扁了一頓",
+    "{target} 被活活燒死",
+]
 
 # 等級里程碑：僅在**第一次到達** Lv.20/40/60/80/100 時發私訊、可領幣；自動加身分組**僅**在 .env 指定的伺服器（LEVEL_MILESTONE_GUILD_ID）
 LEVEL_MILE_TIERS: typing.Tuple[int, ...] = (20, 40, 60, 80, 100)
@@ -1570,6 +1586,12 @@ async def redpacket(interaction: discord.Interaction, total_amount: int, count: 
     except:
         pass
 
+@bot.tree.command(name="kill", description="在目前頻道送出 Minecraft 風格隨機死法")
+@app_commands.describe(target="目標玩家")
+async def kill(interaction: discord.Interaction, target: discord.Member):
+    template = random.choice(MINECRAFT_DEATH_MESSAGES)
+    await interaction.response.send_message(template.format(target=target.mention))
+
 async def stock_symbol_autocomplete(interaction: discord.Interaction, current: str):
     try:
         rows = await fetch_stock_day_all()
@@ -1956,14 +1978,28 @@ async def leaderboard(interaction: discord.Interaction):
 
 @bot.tree.command(name="lvleaderboard", description="等級排行榜前 10 名")
 async def lvleaderboard(interaction: discord.Interaction):
+    ensure_user_exists(interaction.user.id, 50000)
     conn = get_db_connection()
     c = conn.cursor()
     c.execute("SELECT user_id, level, exp FROM users ORDER BY level DESC, exp DESC LIMIT 10")
     data = c.fetchall()
+    c.execute("SELECT level, exp FROM users WHERE user_id=%s", (str(interaction.user.id),))
+    me = c.fetchone()
+    if me:
+        my_level, my_exp = me
+        c.execute(
+            "SELECT COUNT(*) FROM users WHERE level > %s OR (level = %s AND exp > %s)",
+            (my_level, my_level, my_exp)
+        )
+        rank_row = c.fetchone()
+        my_rank = (rank_row[0] if rank_row else 0) + 1
+    else:
+        my_level, my_exp, my_rank = 1, 0, "-"
     conn.close()
     if not data:
         return await interaction.response.send_message("目前沒有等級資料", ephemeral=True)
     msg = "\n".join([f"{i+1}. <@{uid}>: Lv.{lv} | EXP {exp}" for i, (uid, lv, exp) in enumerate(data)])
+    msg += f"\n\n📍 你的目前名次：**#{my_rank}**（Lv.{my_level} | EXP {my_exp}）"
     await interaction.response.send_message(embed=discord.Embed(title="🧠 Lv 排行榜", description=msg))
 
 @bot.tree.command(name="check_players", description="[管理員] 查看所有報名玩家與卡組")
