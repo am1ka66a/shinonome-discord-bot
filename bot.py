@@ -30,6 +30,45 @@ red_packet_seq = 0
 stock_cache = {"day_all": {"ts": 0.0, "data": []}}
 STOCK_API_INSECURE_SSL = str(os.getenv("STOCK_API_INSECURE_SSL", "0")).strip().lower() in ("1", "true", "yes", "on")
 
+# 等級里程碑：僅在**第一次到達** Lv.20/40/60/80/100 時發私訊、可領幣；自動加身分組**僅**在 .env 指定的伺服器（LEVEL_MILESTONE_GUILD_ID）
+LEVEL_MILE_TIERS: typing.Tuple[int, ...] = (20, 40, 60, 80, 100)
+LEVEL_MILESTONE_COINS: typing.Dict[int, int] = {
+    20: 500_000,
+    40: 1_000_000,
+    60: 2_000_000,
+    80: 8_000_000,
+    100: 20_000_000,
+}
+
+# 各階首次解鎖時的私訊短句；每則都帶「奈音」群梗，玩笑偏開，可再自行改
+LEVEL_MILESTONE_FLAVOR: typing.Dict[int, str] = {
+    20: "你升上來了。奈音的裙擺還沒掃到你，但伺服器已經默認你值得多看一眼—畢竟能跟他一起女裝排隊的份額有限。",
+    40: "你現在的等級夠在群裡大聲說幹話。奈音若轉頭瞪你，那不是生氣，是男娘の視線自帶一點腿環反光。",
+    60: "再往上，連你的鍵盤都學會看奈音臉色。他若邊女裝邊罵人還帶笑，你別爭辯，那是本群限定版聖光—你負責在旁邊鼓掌就好。",
+    80: "到這一階，背鍋與帶風向你都有一半免責額。奈音的裙角若掃到誰的羞恥心，你負責把尷尬收成梗；男娘主理人只負責美，不負責幫人找台階。",
+    100: "封頂。你的恥力與奈音的衣櫃一樣沒有上蓋。從此等級是裝飾，真正的高危職位是：敢在他面不改色踩雷的時候，還能活著被已讀。",
+}
+
+def level_milestone_guild_id() -> typing.Optional[int]:
+    """要自動上身分組的目標 Discord 伺服器 ID；未設則不會在任何伺服器加身分組。"""
+    raw = (os.getenv("LEVEL_MILESTONE_GUILD_ID", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+def level_auto_role_id(milestone: int) -> typing.Optional[int]:
+    """.env 設 LEVEL_ROLE_ID_20=數字 等；僅在 `LEVEL_MILESTONE_GUILD_ID` 相符的伺服器內、首次到達該等級時加身分組。"""
+    raw = (os.getenv(f"LEVEL_ROLE_ID_{milestone}", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
 def is_host():
     def predicate(ctx): return ctx.author.id in ALLOWED_HOST_IDS
     return commands.check(predicate)
@@ -143,6 +182,17 @@ def init_db():
                  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                  PRIMARY KEY (round_no, match_no)
                  )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS level_milestone_claims (
+                 user_id VARCHAR(255) NOT NULL,
+                 milestone INT NOT NULL,
+                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                 PRIMARY KEY (user_id, milestone)
+                 )''')
+    # 清除舊版里程碑（10/25/50），改為 20/40/60/80/100 後不再使用
+    try:
+        c.execute("DELETE FROM level_milestone_claims WHERE milestone IN (10, 25, 50)")
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
@@ -254,6 +304,97 @@ def add_user_exp(user_id, amount):
     conn.commit()
     conn.close()
     return old_level, new_level, new_exp
+
+def get_claimed_milestones(user_id) -> set:
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT milestone FROM level_milestone_claims WHERE user_id=%s", (str(user_id),))
+    rows = c.fetchall()
+    conn.close()
+    return {int(r[0]) for r in rows} if rows else set()
+
+def try_claim_milestone(user_id, milestone, coin_amount) -> int:
+    """
+    首次記錄該里程碑：寫入 level_milestone_claims，可選加幣。
+    已領過回傳 -1；本輪新領則回傳入帳金額（0 表示僅解鎖里程碑，無幣）。
+    """
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT 1 FROM level_milestone_claims WHERE user_id=%s AND milestone=%s", (str(user_id), milestone))
+    if c.fetchone():
+        conn.close()
+        return -1
+    c.execute("INSERT INTO level_milestone_claims (user_id, milestone) VALUES (%s, %s)", (str(user_id), milestone))
+    added = 0
+    if coin_amount and coin_amount > 0:
+        c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (coin_amount, str(user_id)))
+        log_transaction(user_id, coin_amount, f"等級里程碑 Lv.{milestone}")
+        added = coin_amount
+    conn.commit()
+    conn.close()
+    return added
+
+def build_exp_progress_bar(cur: int, need: int, width: int = 12) -> str:
+    if need <= 0:
+        return "▓" * width + " 100%"
+    ratio = min(1.0, max(0.0, cur / need))
+    filled = int(round(ratio * width))
+    return "▓" * filled + "░" * (width - filled) + f"  {ratio * 100:.0f}%"
+
+async def process_level_ups(member: discord.Member, old_lv: int, new_lv: int):
+    if new_lv <= old_lv or member.bot:
+        return
+    crossed = [m for m in LEVEL_MILE_TIERS if old_lv < m <= new_lv]
+    if not crossed:
+        return
+    intro = (
+        f"從 Lv.{old_lv} 升至 Lv.{new_lv}，**首次**通過本階檻。\n"
+        f"階段幣**全伺服器**發放；**身分組**僅在 `.env` 指定之 `LEVEL_MILESTONE_GUILD_ID` 內、因聊天升等而加發。"
+    )
+    embed = discord.Embed(title="🎉 等級階段解鎖", description=intro, color=0x57F287)
+    reward_lines = []
+    flavor_paras: typing.List[str] = []
+    for m in crossed:
+        coin_amt = LEVEL_MILESTONE_COINS.get(m, 0)
+        got = try_claim_milestone(member.id, m, coin_amt)
+        if got < 0:
+            continue
+        fl = LEVEL_MILESTONE_FLAVOR.get(m)
+        if fl:
+            flavor_paras.append(f"**【Lv.{m}】** {fl}")
+        if got > 0:
+            reward_lines.append(f"🎁 Lv.{m}：+**{got:,}** 東雲幣")
+        rid = level_auto_role_id(m)
+        g_limit = level_milestone_guild_id()
+        if (
+            rid
+            and member.guild
+            and g_limit is not None
+            and member.guild.id == g_limit
+        ):
+            role = member.guild.get_role(rid)
+            if role:
+                try:
+                    await member.add_roles(role, reason=f"首次達到 Lv.{m} 解鎖（{member.guild.name}）")
+                    reward_lines.append(f"🎭 已授予身分組 {role.name}")
+                except discord.Forbidden:
+                    reward_lines.append(f"⚠️ 無法加上身分組「{role.name}」：請確認 Bot 有**管理身分組**，且 Bot 的**位階**高於該身分組。")
+                except discord.HTTPException:
+                    reward_lines.append("⚠️ 授予身分組時發生錯誤，稍後可請管理員手動補上。")
+    if not flavor_paras and not reward_lines:
+        return
+    if flavor_paras:
+        embed.add_field(
+            name="階段致詞",
+            value="\n\n".join(flavor_paras)[:3800],
+            inline=False,
+        )
+    if reward_lines:
+        embed.add_field(name="本次獎勵", value="\n".join(reward_lines)[:1000], inline=False)
+    try:
+        await member.send(embed=embed)
+    except (discord.Forbidden, discord.HTTPException):
+        pass
 
 def refresh_hourly_bank(user_id):
     now = datetime.datetime.now()
@@ -1181,7 +1322,12 @@ async def on_message(message):
         row = c.fetchone()
         if row and (row[2] is None or (now - row[2]).total_seconds() >= EXP_COOLDOWN_SECONDS):
             exp_gain = random.randint(12, 20)
-            add_user_exp(user_id, exp_gain)
+            ensure_user_exists(message.author.id, 50000)
+            exp_result = add_user_exp(user_id, exp_gain)
+            if exp_result and exp_result[1] > exp_result[0]:
+                o, n = exp_result[0], exp_result[1]
+                if any(o < m <= n for m in LEVEL_MILE_TIERS):
+                    asyncio.create_task(process_level_ups(message.author, o, n))
             c.execute("UPDATE activity_stats SET last_exp_reward=%s WHERE user_id=%s", (now, user_id))
         if row and row[0] >= 10:
             if row[1] is None or (now - row[1]).total_seconds() >= 1800:
@@ -1325,15 +1471,36 @@ async def level(interaction: discord.Interaction, member: discord.Member = None)
     level_num = int(lv_row[1] or 1)
     calc_lv, cur_progress, next_need = calc_level_from_exp(exp)
     level_num = max(level_num, calc_lv)
+    claimed = get_claimed_milestones(target.id)
+    bar = build_exp_progress_bar(cur_progress, next_need) if level_num < MAX_LEVEL else "▓" * 12 + "  100%"
+    need_more = (next_need - cur_progress) if level_num < MAX_LEVEL and next_need > 0 else 0
+    ms_lines = []
+    for m, coins in sorted(LEVEL_MILESTONE_COINS.items()):
+        if m in claimed:
+            ms_lines.append(f"**Lv.{m}** — ✅ 已領 {coins:,} 幣")
+        elif level_num < m:
+            ms_lines.append(f"**Lv.{m}** — 💰 達到 Lv.{m} 領 {coins:,} 幣")
+        else:
+            ms_lines.append(f"**Lv.{m}** — 已達此級（獎勵僅在**升級當下首次跨過**時發放，不事後補發）")
+    emb = discord.Embed(title="🏅 等級與經驗", color=0x2b2d31)
+    av = target.display_avatar.url if getattr(target, "display_avatar", None) else None
+    emb.set_author(name=target.display_name, icon_url=av)
     if level_num >= MAX_LEVEL:
-        text = f"🏅 {target.mention} 目前 **Lv.{level_num}**（已滿級）\n✨ 總 EXP：`{exp}`"
+        emb.description = f"{target.mention} **Lv.{level_num}**（已滿級）\n✨ 總 EXP：`{exp:,}`"
     else:
-        text = (
-            f"🏅 {target.mention} 目前 **Lv.{level_num}**\n"
-            f"✨ 總 EXP：`{exp}`\n"
-            f"📈 升級進度：`{cur_progress}/{next_need}`"
+        emb.description = (
+            f"{target.mention} **Lv.{level_num}**\n"
+            f"✨ 總 EXP：`{exp:,}`\n"
+            f"📈 本級累積 **{cur_progress:,} / {next_need:,}** EXP，尚餘 **{need_more:,}** EXP 可升 Lv.{level_num + 1}\n"
+            f"`{bar}`"
         )
-    await interaction.response.send_message(text)
+    ms_footer = "領幣與階段私訊：全伺服器；身分組僅在 `LEVEL_MILESTONE_GUILD_ID` 指定之伺服器內升等時加發。" if level_milestone_guild_id() else "領幣與階段私訊：全伺服器。未設 `LEVEL_MILESTONE_GUILD_ID` 則不會自動加任何身分組。"
+    emb.add_field(
+        name="階段里程碑 Lv.20／40／60／80／100",
+        value=("\n".join(ms_lines) or "未設定") + f"\n\n{ms_footer}",
+        inline=False,
+    )
+    await interaction.response.send_message(embed=emb)
 
 @bot.tree.command(name="transfer", description="轉帳給其他玩家")
 @app_commands.describe(member="要轉帳給誰", amount="轉帳金額", note="備註（選填）")
