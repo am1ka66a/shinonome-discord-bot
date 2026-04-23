@@ -1601,7 +1601,8 @@ async def redpacket(interaction: discord.Interaction, total_amount: int, count: 
 @app_commands.describe(target="目標玩家")
 async def kill(interaction: discord.Interaction, target: discord.Member):
     template = random.choice(MINECRAFT_DEATH_MESSAGES)
-    await interaction.response.send_message(template.format(target=target.mention))
+    msg = template.format(target=target.mention).replace("擊殺者", interaction.user.mention)
+    await interaction.response.send_message(msg)
 
 async def stock_symbol_autocomplete(interaction: discord.Interaction, current: str):
     try:
