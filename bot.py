@@ -1652,7 +1652,7 @@ async def transfer(interaction: discord.Interaction, member: discord.Member, amo
         name="匯款方",
         value=(
             f"{interaction.user.mention}\n"
-            f"轉帳後餘額：`{sender_after:,}` 柚子幣"
+            f"轉帳後餘額：`{sender_after:,}` 東雲幣"
         ),
         inline=True
     )
@@ -1660,18 +1660,18 @@ async def transfer(interaction: discord.Interaction, member: discord.Member, amo
         name="收款方",
         value=(
             f"{member.mention}\n"
-            f"收款後餘額：`{receiver_after:,}` 柚子幣"
+            f"收款後餘額：`{receiver_after:,}` 東雲幣"
         ),
         inline=True
     )
     embed.add_field(
         name="轉帳金額",
-        value=f"`{amount:,}` 柚子幣",
+        value=f"`{amount:,}` 東雲幣",
         inline=False
     )
     embed.add_field(
         name="轉帳手續費",
-        value=f"`{fee_amount:,}` 柚子幣",
+        value=f"`{fee_amount:,}` 東雲幣",
         inline=False
     )
     embed.add_field(
