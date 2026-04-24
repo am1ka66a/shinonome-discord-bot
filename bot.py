@@ -1463,10 +1463,12 @@ async def daily(interaction: discord.Interaction):
     tomorrow_tw = today_tw + datetime.timedelta(days=1)
     next_claim_dt = datetime.datetime.combine(tomorrow_tw, datetime.time.min, tzinfo=tz)
     ts = int(next_claim_dt.timestamp())
-    await interaction.response.send_message(
-        f"🎉 簽到成功！獲得 **{daily_reward}** 東雲幣！目前餘額：`{new_bal}`\n"
-        f"下次領取時間：<t:{ts}:f> (<t:{ts}:R>)"
-    )
+    embed = discord.Embed(title="✅ 每日簽到成功", color=discord.Color.green())
+    embed.add_field(name="獲得", value=f"`{daily_reward:,}` 東雲幣", inline=False)
+    embed.add_field(name="目前餘額", value=f"`{new_bal:,}` 東雲幣", inline=False)
+    embed.add_field(name="下次可領取", value=f"<t:{ts}:f>（<t:{ts}:R>）", inline=False)
+    embed.set_footer(text=f"簽到者：{interaction.user.display_name}")
+    await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="hourly", description="每小時簽到（可依等級累積）")
 async def hourly(interaction: discord.Interaction):
@@ -1487,13 +1489,13 @@ async def hourly(interaction: discord.Interaction):
         )
     payout = payout_hourly_bank(interaction.user.id, bank, reward_per_slot)
     new_bal = get_user_stats(interaction.user.id)[0]
-    await interaction.response.send_message(
-        f"🕒 已領取每小時簽到！\n"
-        f"累積時段：`{bank}` 小時（上限 `{level_num}`）\n"
-        f"每小時獎勵：`{reward_per_slot}`\n"
-        f"本次共獲得：`{payout}` 東雲幣\n"
-        f"目前餘額：`{new_bal}`"
-    )
+    embed = discord.Embed(title="✅ 每小時簽到成功", color=discord.Color.green())
+    embed.add_field(name="累積時段", value=f"`{bank}` 小時（上限 `{level_num}`）", inline=False)
+    embed.add_field(name="每小時獎勵", value=f"`{reward_per_slot:,}` 東雲幣", inline=True)
+    embed.add_field(name="本次獲得", value=f"`{payout:,}` 東雲幣", inline=True)
+    embed.add_field(name="目前餘額", value=f"`{new_bal:,}` 東雲幣", inline=False)
+    embed.set_footer(text=f"領取者：{interaction.user.display_name}")
+    await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="beg", description="街頭乞討")
 async def beg(interaction: discord.Interaction):
@@ -1504,8 +1506,19 @@ async def beg(interaction: discord.Interaction):
     now = datetime.datetime.now()
     if row[1] and (now - row[1]).total_seconds() < 120: return await interaction.response.send_message("太快了", ephemeral=True)
     earn = random.randint(100, 600)
-    if random.random() < 0.3: await interaction.response.send_message("沒人鳥你 乞丐"); c.execute("UPDATE users SET last_beg=%s WHERE user_id=%s", (now, str(interaction.user.id)))
-    else: c.execute("UPDATE users SET balance=balance+%s, last_beg=%s WHERE user_id=%s", (earn, now, str(interaction.user.id))); log_transaction(interaction.user.id, earn, "乞討所得"); await interaction.response.send_message(f"你被施捨了！獲得 {earn} 元")
+    if random.random() < 0.3:
+        c.execute("UPDATE users SET last_beg=%s WHERE user_id=%s", (now, str(interaction.user.id)))
+        embed = discord.Embed(title="❌ 乞討失敗", color=discord.Color.orange())
+        embed.add_field(name="結果", value="沒人理你，這次什麼都沒拿到。", inline=False)
+        await interaction.response.send_message(embed=embed)
+    else:
+        c.execute("UPDATE users SET balance=balance+%s, last_beg=%s WHERE user_id=%s", (earn, now, str(interaction.user.id)))
+        log_transaction(interaction.user.id, earn, "乞討所得")
+        new_bal = int((row[0] or 0) + earn)
+        embed = discord.Embed(title="✅ 乞討成功", color=discord.Color.green())
+        embed.add_field(name="獲得", value=f"`{earn:,}` 東雲幣", inline=True)
+        embed.add_field(name="目前餘額", value=f"`{new_bal:,}` 東雲幣", inline=True)
+        await interaction.response.send_message(embed=embed)
     conn.commit(); conn.close()
 
 @bot.tree.command(name="rescue", description="破產救濟計畫，餘額為 0 元時可領 1,000 (每人限領 10 次)")
@@ -1524,7 +1537,12 @@ async def rescue(interaction: discord.Interaction):
         
     c.execute("UPDATE users SET balance=balance+1000, last_rescue=%s, rescue_count=rescue_count+1 WHERE user_id=%s", (now, str(interaction.user.id)))
     conn.commit(); conn.close(); log_transaction(interaction.user.id, 1000, "賭狗破產救濟")
-    await interaction.response.send_message(f"🚑 窮鬼救濟金已發放！獲得 **1,000** 東雲幣。這是你第 `{row[2]+1}/10` 次領取。")
+    claim_no = row[2] + 1
+    embed = discord.Embed(title="✅ 破產救濟發放", color=discord.Color.green())
+    embed.add_field(name="獲得", value="`1,000` 東雲幣", inline=True)
+    embed.add_field(name="累計次數", value=f"`{claim_no}/10`", inline=True)
+    embed.set_footer(text="請謹慎下注，避免再次破產")
+    await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="bj", description="開始 21 點")
 @app_commands.describe(bet="注額")
@@ -1544,13 +1562,15 @@ async def balance(interaction: discord.Interaction, member: discord.Member = Non
     stats = get_user_stats(target.id)
     bal, total, wins, t_prof = stats
     wr = (wins/total*100) if total > 0 else 0
-    msg = f"📊 **{target.mention} 的統計資料**\n"
-    msg += f"💰 目前餘額：`{bal}`\n"
-    msg += f"🎲 總遊玩局數：`{total}` 局\n"
-    msg += f"🏆 勝利場次：`{wins}` 場\n"
-    msg += f"📈 勝率：`{wr:.1f}%`\n"
-    msg += f"💸 歷史總盈虧：`{t_prof}`"
-    await interaction.response.send_message(msg)
+    embed = discord.Embed(title="📊 帳戶統計", color=0x2b2d31)
+    av = target.display_avatar.url if getattr(target, "display_avatar", None) else None
+    embed.set_author(name=target.display_name, icon_url=av)
+    embed.add_field(name="目前餘額", value=f"`{bal:,}` 東雲幣", inline=False)
+    embed.add_field(name="總遊玩局數", value=f"`{total:,}` 局", inline=True)
+    embed.add_field(name="勝利場次", value=f"`{wins:,}` 場", inline=True)
+    embed.add_field(name="勝率", value=f"`{wr:.1f}%`", inline=True)
+    embed.add_field(name="歷史總盈虧", value=f"`{t_prof:,}` 東雲幣", inline=False)
+    await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="level", description="查詢等級與經驗值")
 async def level(interaction: discord.Interaction, member: discord.Member = None):
@@ -1640,8 +1660,6 @@ async def transfer(interaction: discord.Interaction, member: discord.Member, amo
     log_transaction(interaction.user.id, -amount, out_reason)
     log_transaction(member.id, amount, in_reason)
 
-    fee_ratio = 0.0
-    fee_amount = int(amount * fee_ratio)
     now_text = datetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
 
     embed = discord.Embed(
@@ -1654,7 +1672,7 @@ async def transfer(interaction: discord.Interaction, member: discord.Member, amo
             f"{interaction.user.mention}\n"
             f"轉帳後餘額：`{sender_after:,}` 東雲幣"
         ),
-        inline=True
+        inline=False
     )
     embed.add_field(
         name="收款方",
@@ -1662,16 +1680,11 @@ async def transfer(interaction: discord.Interaction, member: discord.Member, amo
             f"{member.mention}\n"
             f"收款後餘額：`{receiver_after:,}` 東雲幣"
         ),
-        inline=True
+        inline=False
     )
     embed.add_field(
         name="轉帳金額",
         value=f"`{amount:,}` 東雲幣",
-        inline=False
-    )
-    embed.add_field(
-        name="轉帳手續費",
-        value=f"`{fee_amount:,}` 東雲幣",
         inline=False
     )
     embed.add_field(
@@ -2779,17 +2792,24 @@ async def give_slash(interaction: discord.Interaction, member: discord.Member, a
         return await interaction.response.send_message("數量必須大於 0", ephemeral=True)
     ensure_user_exists(member.id, 0)
     conn = get_db_connection(); c = conn.cursor()
+    c.execute("SELECT balance FROM users WHERE user_id=%s", (str(member.id),))
+    before_row = c.fetchone()
+    before_bal = int((before_row[0] if before_row else 0) or 0)
     c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (amount, str(member.id)))
+    after_bal = before_bal + amount
     conn.commit(); conn.close()
     note_text = (note or "").strip()
     if len(note_text) > 100:
         note_text = note_text[:100]
     reason = f"管理員發放（備註: {note_text}）" if note_text else "管理員發放"
     log_transaction(member.id, amount, reason)
-    if note_text:
-        await interaction.response.send_message(f"已發放 **{amount}** 東雲幣給 {member.mention}。\n📝 備註：{note_text}")
-    else:
-        await interaction.response.send_message(f"已發放 **{amount}** 東雲幣給 {member.mention}。")
+    embed = discord.Embed(title="✅ 發放成功", color=discord.Color.green())
+    embed.add_field(name="對象", value=member.mention, inline=False)
+    embed.add_field(name="發放金額", value=f"`{amount:,}` 東雲幣", inline=True)
+    embed.add_field(name="餘額變化", value=f"`{before_bal:,}` → `{after_bal:,}`", inline=True)
+    embed.add_field(name="備註", value=note_text if note_text else "（無）", inline=False)
+    embed.set_footer(text=f"操作人：{interaction.user.display_name}")
+    await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="take", description="[管理員] 扣除玩家東雲幣")
 @app_commands.describe(member="玩家", amount="扣除數量", note="備註（選填）")
@@ -2800,17 +2820,24 @@ async def take_slash(interaction: discord.Interaction, member: discord.Member, a
         return await interaction.response.send_message("數量必須大於 0", ephemeral=True)
     ensure_user_exists(member.id, 0)
     conn = get_db_connection(); c = conn.cursor()
+    c.execute("SELECT balance FROM users WHERE user_id=%s", (str(member.id),))
+    before_row = c.fetchone()
+    before_bal = int((before_row[0] if before_row else 0) or 0)
     c.execute("UPDATE users SET balance=GREATEST(0, balance-%s) WHERE user_id=%s", (amount, str(member.id)))
+    after_bal = max(0, before_bal - amount)
     conn.commit(); conn.close()
     note_text = (note or "").strip()
     if len(note_text) > 100:
         note_text = note_text[:100]
     reason = f"管理員扣除（備註: {note_text}）" if note_text else "管理員扣除"
     log_transaction(member.id, -amount, reason)
-    if note_text:
-        await interaction.response.send_message(f"已從 {member.mention} 扣除 **{amount}** 東雲幣。\n📝 備註：{note_text}")
-    else:
-        await interaction.response.send_message(f"已從 {member.mention} 扣除 **{amount}** 東雲幣。")
+    embed = discord.Embed(title="✅ 扣款成功", color=discord.Color.green())
+    embed.add_field(name="對象", value=member.mention, inline=False)
+    embed.add_field(name="扣除金額", value=f"`{amount:,}` 東雲幣", inline=True)
+    embed.add_field(name="餘額變化", value=f"`{before_bal:,}` → `{after_bal:,}`", inline=True)
+    embed.add_field(name="備註", value=note_text if note_text else "（無）", inline=False)
+    embed.set_footer(text=f"操作人：{interaction.user.display_name}")
+    await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="ban", description="[管理員] 將玩家加入黑名單")
 @app_commands.describe(member="玩家")
