@@ -1634,23 +1634,53 @@ async def transfer(interaction: discord.Interaction, member: discord.Member, amo
     if note_text:
         out_reason = f"轉帳給 {member.id}（備註: {note_text}）"
         in_reason = f"收到 {interaction.user.id} 的轉帳（備註: {note_text}）"
-        msg = (
-            f"✅ 已轉帳 **{amount}** 給 {member.mention}\n"
-            f"👤 你：`{sender_before}` → `{sender_after}`（`-{amount}`）\n"
-            f"👤 對方：`{receiver_before}` → `{receiver_after}`（`+{amount}`）\n"
-            f"📝 備註：{note_text}"
-        )
     else:
         out_reason = f"轉帳給 {member.id}"
         in_reason = f"收到 {interaction.user.id} 的轉帳"
-        msg = (
-            f"✅ 已轉帳 **{amount}** 給 {member.mention}\n"
-            f"👤 你：`{sender_before}` → `{sender_after}`（`-{amount}`）\n"
-            f"👤 對方：`{receiver_before}` → `{receiver_after}`（`+{amount}`）"
-        )
     log_transaction(interaction.user.id, -amount, out_reason)
     log_transaction(member.id, amount, in_reason)
-    await interaction.response.send_message(msg)
+
+    fee_ratio = 0.0
+    fee_amount = int(amount * fee_ratio)
+    now_text = datetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+
+    embed = discord.Embed(
+        title="✅ 轉帳成功",
+        color=discord.Color.green()
+    )
+    embed.add_field(
+        name="匯款方",
+        value=(
+            f"{interaction.user.mention}\n"
+            f"轉帳後餘額：`{sender_after:,}` 柚子幣"
+        ),
+        inline=True
+    )
+    embed.add_field(
+        name="收款方",
+        value=(
+            f"{member.mention}\n"
+            f"收款後餘額：`{receiver_after:,}` 柚子幣"
+        ),
+        inline=True
+    )
+    embed.add_field(
+        name="轉帳金額",
+        value=f"`{amount:,}` 柚子幣",
+        inline=False
+    )
+    embed.add_field(
+        name="轉帳手續費",
+        value=f"`{fee_amount:,}` 柚子幣",
+        inline=False
+    )
+    embed.add_field(
+        name="轉帳備註",
+        value=note_text if note_text else "（無）",
+        inline=False
+    )
+    embed.set_footer(text=f"交易時間：{now_text}")
+    await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="redpacket", description="發送紅包！")
 @app_commands.describe(total_amount="紅包總金額", count="份數", seconds="有效秒數(最少10秒)")
