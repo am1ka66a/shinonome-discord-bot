@@ -29,10 +29,17 @@ RED_PACKET_MIN_SECONDS = 10
 red_packet_seq = 0
 stock_cache = {"day_all": {"ts": 0.0, "data": []}}
 STOCK_API_INSECURE_SSL = str(os.getenv("STOCK_API_INSECURE_SSL", "0")).strip().lower() in ("1", "true", "yes", "on")
+MSG_DB_FLUSH_EVERY_SECONDS = 8
+MSG_DB_FLUSH_COUNT = 3
 MINECRAFT_DEATH_MESSAGES_PATH = os.path.join(
     os.path.dirname(__file__),
     "data",
     "minecraft_death_messages_zh_tw.json",
+)
+MINECRAFT_ITEMS_PATH = os.path.join(
+    os.path.dirname(__file__),
+    "data",
+    "minecraft_items_zh_tw.json",
 )
 DEFAULT_MINECRAFT_DEATH_MESSAGES = [
     "{target} 死了",
@@ -54,6 +61,30 @@ def load_minecraft_death_messages() -> typing.List[str]:
         return DEFAULT_MINECRAFT_DEATH_MESSAGES[:]
 
 MINECRAFT_DEATH_MESSAGES = load_minecraft_death_messages()
+DEFAULT_MINECRAFT_ITEMS = [
+    "鑽石劍", "下界合金劍", "弓", "弩", "三叉戟", "鐵斧", "鑽石斧", "終界水晶",
+    "TNT 炸藥", "火焰彈", "烈焰棒", "不死圖騰", "附魔金蘋果", "終界珍珠", "地獄石",
+    "黑曜石", "床", "熔岩桶", "水桶", "鐵砧", "盾牌", "雪球", "雞蛋", "釣魚竿",
+    "鵝卵石", "鑽石鎬", "下界之星", "煙火火箭", "歌萊果", "苦力怕頭顱"
+]
+
+def load_minecraft_items() -> typing.List[str]:
+    try:
+        with open(MINECRAFT_ITEMS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        items = data.get("items") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            return DEFAULT_MINECRAFT_ITEMS[:]
+        cleaned = [str(x).strip() for x in items if isinstance(x, str) and x.strip()]
+        return cleaned if cleaned else DEFAULT_MINECRAFT_ITEMS[:]
+    except Exception as e:
+        print(f"⚠️ 載入 Minecraft 物品 JSON 失敗: {e}")
+        return DEFAULT_MINECRAFT_ITEMS[:]
+
+MINECRAFT_ITEMS = load_minecraft_items()
+_pending_msg_counts: typing.Dict[str, int] = {}
+_last_msg_flush_ts: typing.Dict[str, float] = {}
+_last_exp_award_ts: typing.Dict[str, float] = {}
 
 # 等級里程碑：僅在**第一次到達** Lv.20/40/60/80/100 時發私訊、可領幣；自動加身分組**僅**在 .env 指定的伺服器（LEVEL_MILESTONE_GUILD_ID）
 LEVEL_MILE_TIERS: typing.Tuple[int, ...] = (20, 40, 60, 80, 100)
@@ -159,6 +190,10 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS blacklist (user_id VARCHAR(255) PRIMARY KEY)''')
     c.execute('''CREATE TABLE IF NOT EXISTS daily_claims (user_id VARCHAR(255) PRIMARY KEY, last_claim DATE)''')
     c.execute('''CREATE TABLE IF NOT EXISTS logs (id INT AUTO_INCREMENT PRIMARY KEY, user_id VARCHAR(255), amount BIGINT, reason VARCHAR(255), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+    try: c.execute("CREATE INDEX idx_logs_user_created ON logs (user_id, created_at)")
+    except: pass
+    try: c.execute("CREATE INDEX idx_users_level_exp ON users (level, exp)")
+    except: pass
     c.execute('''CREATE TABLE IF NOT EXISTS stock_watchlist (
                  user_id VARCHAR(255),
                  symbol VARCHAR(32),
@@ -1347,12 +1382,34 @@ async def on_message(message):
     try:
         if not message.guild:
             return
-        user_id, now = str(message.author.id), datetime.datetime.now()
-        conn = get_db_connection(); c = conn.cursor()
-        c.execute("INSERT INTO activity_stats (user_id, msg_count) VALUES (%s, 1) ON DUPLICATE KEY UPDATE msg_count=msg_count+1", (user_id,))
-        c.execute("SELECT msg_count, last_msg_reward, last_exp_reward FROM activity_stats WHERE user_id=%s", (user_id,))
+        user_id = str(message.author.id)
+        now = datetime.datetime.now()
+        now_ts = time.time()
+
+        _pending_msg_counts[user_id] = _pending_msg_counts.get(user_id, 0) + 1
+        pending = _pending_msg_counts[user_id]
+        last_flush = _last_msg_flush_ts.get(user_id, 0.0)
+        should_flush = pending >= MSG_DB_FLUSH_COUNT or (now_ts - last_flush) >= MSG_DB_FLUSH_EVERY_SECONDS
+
+        last_exp_ts = _last_exp_award_ts.get(user_id, 0.0)
+        exp_due = (now_ts - last_exp_ts) >= EXP_COOLDOWN_SECONDS
+
+        if not should_flush and not exp_due:
+            return
+
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO activity_stats (user_id, msg_count) VALUES (%s, %s) ON DUPLICATE KEY UPDATE msg_count=msg_count+%s",
+            (user_id, pending, pending)
+        )
+        _pending_msg_counts[user_id] = 0
+        _last_msg_flush_ts[user_id] = now_ts
+
+        c.execute("SELECT msg_count, last_msg_reward FROM activity_stats WHERE user_id=%s", (user_id,))
         row = c.fetchone()
-        if row and (row[2] is None or (now - row[2]).total_seconds() >= EXP_COOLDOWN_SECONDS):
+
+        if exp_due:
             exp_gain = random.randint(12, 20)
             ensure_user_exists(message.author.id, 50000)
             exp_result = add_user_exp(user_id, exp_gain)
@@ -1361,12 +1418,16 @@ async def on_message(message):
                 if any(o < m <= n for m in LEVEL_MILE_TIERS):
                     asyncio.create_task(process_level_ups(message.author, o, n))
             c.execute("UPDATE activity_stats SET last_exp_reward=%s WHERE user_id=%s", (now, user_id))
+            _last_exp_award_ts[user_id] = now_ts
+
         if row and row[0] >= 10:
             if row[1] is None or (now - row[1]).total_seconds() >= 1800:
                 c.execute("INSERT INTO users (user_id, balance) VALUES (%s, 500) ON DUPLICATE KEY UPDATE balance=balance+500", (user_id,))
                 c.execute("UPDATE activity_stats SET msg_count=0, last_msg_reward=%s WHERE user_id=%s", (now, user_id))
                 log_transaction(user_id, 500, "聊天活躍獎勵 (10句)")
-        conn.commit(); conn.close()
+
+        conn.commit()
+        conn.close()
     except Exception as e:
         print(f"❌ on_message 錯誤: {e}")
     finally:
@@ -1547,6 +1608,12 @@ async def transfer(interaction: discord.Interaction, member: discord.Member, amo
 
     conn = get_db_connection()
     c = conn.cursor()
+    c.execute("SELECT balance FROM users WHERE user_id=%s", (str(interaction.user.id),))
+    sender_before_row = c.fetchone()
+    c.execute("SELECT balance FROM users WHERE user_id=%s", (str(member.id),))
+    receiver_before_row = c.fetchone()
+    sender_before = int((sender_before_row[0] if sender_before_row else 0) or 0)
+    receiver_before = int((receiver_before_row[0] if receiver_before_row else 0) or 0)
     c.execute(
         "UPDATE users SET balance=balance-%s WHERE user_id=%s AND balance >= %s",
         (amount, str(interaction.user.id), amount)
@@ -1556,6 +1623,8 @@ async def transfer(interaction: discord.Interaction, member: discord.Member, amo
         return await interaction.response.send_message("餘額不足，無法轉帳", ephemeral=True)
 
     c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (amount, str(member.id)))
+    sender_after = sender_before - amount
+    receiver_after = receiver_before + amount
     conn.commit()
     conn.close()
 
@@ -1565,11 +1634,20 @@ async def transfer(interaction: discord.Interaction, member: discord.Member, amo
     if note_text:
         out_reason = f"轉帳給 {member.id}（備註: {note_text}）"
         in_reason = f"收到 {interaction.user.id} 的轉帳（備註: {note_text}）"
-        msg = f"✅ 已轉帳 **{amount}** 給 {member.mention}\n📝 備註：{note_text}"
+        msg = (
+            f"✅ 已轉帳 **{amount}** 給 {member.mention}\n"
+            f"👤 你：`{sender_before}` → `{sender_after}`（`-{amount}`）\n"
+            f"👤 對方：`{receiver_before}` → `{receiver_after}`（`+{amount}`）\n"
+            f"📝 備註：{note_text}"
+        )
     else:
         out_reason = f"轉帳給 {member.id}"
         in_reason = f"收到 {interaction.user.id} 的轉帳"
-        msg = f"✅ 已轉帳 **{amount}** 給 {member.mention}"
+        msg = (
+            f"✅ 已轉帳 **{amount}** 給 {member.mention}\n"
+            f"👤 你：`{sender_before}` → `{sender_after}`（`-{amount}`）\n"
+            f"👤 對方：`{receiver_before}` → `{receiver_after}`（`+{amount}`）"
+        )
     log_transaction(interaction.user.id, -amount, out_reason)
     log_transaction(member.id, amount, in_reason)
     await interaction.response.send_message(msg)
@@ -1601,7 +1679,16 @@ async def redpacket(interaction: discord.Interaction, total_amount: int, count: 
 @app_commands.describe(target="目標玩家")
 async def kill(interaction: discord.Interaction, target: discord.Member):
     template = random.choice(MINECRAFT_DEATH_MESSAGES)
-    msg = template.format(target=target.mention).replace("擊殺者", interaction.user.mention)
+    item = random.choice(MINECRAFT_ITEMS)
+    target_text = target.mention
+    msg = (
+        template.format(target=target_text)
+        .replace("<死者>", target_text)
+        .replace("死者", target_text)
+        .replace("擊殺者", interaction.user.mention)
+        .replace("击杀者", interaction.user.mention)
+        .replace("物品", item)
+    )
     await interaction.response.send_message(msg)
 
 async def stock_symbol_autocomplete(interaction: discord.Interaction, current: str):
