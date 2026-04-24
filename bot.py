@@ -1512,7 +1512,7 @@ async def beg(interaction: discord.Interaction):
     else:
         c.execute("UPDATE users SET balance=balance+%s, last_beg=%s WHERE user_id=%s", (earn, now, str(interaction.user.id)))
         log_transaction(interaction.user.id, earn, "乞討所得")
-        await interaction.response.send_message(f"?({earn})錢給你啦 乞丐!")
+        await interaction.response.send_message(f"你獲得了{earn}東雲幣!錢給你啦 乞丐!")
     conn.commit(); conn.close()
 
 @bot.tree.command(name="rescue", description="破產救濟計畫，餘額為 0 元時可領 1,000 (每人限領 10 次)")
