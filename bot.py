@@ -1491,8 +1491,8 @@ async def hourly(interaction: discord.Interaction):
     new_bal = get_user_stats(interaction.user.id)[0]
     embed = discord.Embed(title="✅ 每小時簽到成功", color=discord.Color.green())
     embed.add_field(name="累積時段", value=f"`{bank}` 小時（上限 `{level_num}`）", inline=False)
-    embed.add_field(name="每小時獎勵", value=f"`{reward_per_slot:,}` 東雲幣", inline=True)
-    embed.add_field(name="本次獲得", value=f"`{payout:,}` 東雲幣", inline=True)
+    embed.add_field(name="每小時獎勵", value=f"`{reward_per_slot:,}` 東雲幣", inline=False)
+    embed.add_field(name="本次獲得", value=f"`{payout:,}` 東雲幣", inline=False)
     embed.add_field(name="目前餘額", value=f"`{new_bal:,}` 東雲幣", inline=False)
     embed.set_footer(text=f"領取者：{interaction.user.display_name}")
     await interaction.response.send_message(embed=embed)
@@ -1508,17 +1508,11 @@ async def beg(interaction: discord.Interaction):
     earn = random.randint(100, 600)
     if random.random() < 0.3:
         c.execute("UPDATE users SET last_beg=%s WHERE user_id=%s", (now, str(interaction.user.id)))
-        embed = discord.Embed(title="❌ 乞討失敗", color=discord.Color.orange())
-        embed.add_field(name="結果", value="沒人理你，這次什麼都沒拿到。", inline=False)
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.send_message("沒人鳥你 乞丐")
     else:
         c.execute("UPDATE users SET balance=balance+%s, last_beg=%s WHERE user_id=%s", (earn, now, str(interaction.user.id)))
         log_transaction(interaction.user.id, earn, "乞討所得")
-        new_bal = int((row[0] or 0) + earn)
-        embed = discord.Embed(title="✅ 乞討成功", color=discord.Color.green())
-        embed.add_field(name="獲得", value=f"`{earn:,}` 東雲幣", inline=True)
-        embed.add_field(name="目前餘額", value=f"`{new_bal:,}` 東雲幣", inline=True)
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.send_message(f"?({earn})錢給你啦 乞丐!")
     conn.commit(); conn.close()
 
 @bot.tree.command(name="rescue", description="破產救濟計畫，餘額為 0 元時可領 1,000 (每人限領 10 次)")
@@ -1539,8 +1533,8 @@ async def rescue(interaction: discord.Interaction):
     conn.commit(); conn.close(); log_transaction(interaction.user.id, 1000, "賭狗破產救濟")
     claim_no = row[2] + 1
     embed = discord.Embed(title="✅ 破產救濟發放", color=discord.Color.green())
-    embed.add_field(name="獲得", value="`1,000` 東雲幣", inline=True)
-    embed.add_field(name="累計次數", value=f"`{claim_no}/10`", inline=True)
+    embed.add_field(name="獲得", value="`1,000` 東雲幣", inline=False)
+    embed.add_field(name="累計次數", value=f"`{claim_no}/10`", inline=False)
     embed.set_footer(text="請謹慎下注，避免再次破產")
     await interaction.response.send_message(embed=embed)
 
@@ -1566,9 +1560,9 @@ async def balance(interaction: discord.Interaction, member: discord.Member = Non
     av = target.display_avatar.url if getattr(target, "display_avatar", None) else None
     embed.set_author(name=target.display_name, icon_url=av)
     embed.add_field(name="目前餘額", value=f"`{bal:,}` 東雲幣", inline=False)
-    embed.add_field(name="總遊玩局數", value=f"`{total:,}` 局", inline=True)
-    embed.add_field(name="勝利場次", value=f"`{wins:,}` 場", inline=True)
-    embed.add_field(name="勝率", value=f"`{wr:.1f}%`", inline=True)
+    embed.add_field(name="總遊玩局數", value=f"`{total:,}` 局", inline=False)
+    embed.add_field(name="勝利場次", value=f"`{wins:,}` 場", inline=False)
+    embed.add_field(name="勝率", value=f"`{wr:.1f}%`", inline=False)
     embed.add_field(name="歷史總盈虧", value=f"`{t_prof:,}` 東雲幣", inline=False)
     await interaction.response.send_message(embed=embed)
 
@@ -2117,6 +2111,34 @@ async def record_cmd(interaction: discord.Interaction, member: discord.Member = 
 async def leaderboard(interaction: discord.Interaction):
     conn = get_db_connection(); c = conn.cursor(); c.execute("SELECT user_id, balance FROM users ORDER BY balance DESC LIMIT 10"); data = c.fetchall(); conn.close()
     msg = "\n".join([f"{i+1}. <@{uid}>: {bal}" for i, (uid, bal) in enumerate(data)]); await interaction.response.send_message(embed=discord.Embed(title="🏆 排行榜", description=msg))
+
+@bot.tree.command(name="casino_stats", description="查看賭場金流統計（回收率/總發幣量/流通量）")
+async def casino_stats(interaction: discord.Interaction):
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT COALESCE(SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END), 0) FROM logs")
+    issued_row = c.fetchone()
+    total_issued = int((issued_row[0] if issued_row else 0) or 0)
+
+    c.execute("SELECT COALESCE(SUM(CASE WHEN amount < 0 THEN -amount ELSE 0 END), 0) FROM logs")
+    recovered_row = c.fetchone()
+    total_recovered = int((recovered_row[0] if recovered_row else 0) or 0)
+
+    c.execute("SELECT COALESCE(SUM(balance), 0) FROM users")
+    circulation_row = c.fetchone()
+    circulation = int((circulation_row[0] if circulation_row else 0) or 0)
+    conn.close()
+
+    recovery_rate = (total_recovered / total_issued * 100) if total_issued > 0 else 0.0
+    net_issued = total_issued - total_recovered
+    embed = discord.Embed(title="🏦 賭場金流統計", color=0x2b2d31)
+    embed.add_field(name="金錢回收率", value=f"`{recovery_rate:.2f}%`", inline=False)
+    embed.add_field(name="總發幣量", value=f"`{total_issued:,}` 東雲幣", inline=False)
+    embed.add_field(name="總回收量", value=f"`{total_recovered:,}` 東雲幣", inline=False)
+    embed.add_field(name="淨發行量", value=f"`{net_issued:,}` 東雲幣", inline=False)
+    embed.add_field(name="目前流通量", value=f"`{circulation:,}` 東雲幣", inline=False)
+    embed.set_footer(text="計算基準：logs 與 users.balance")
+    await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="lvleaderboard", description="等級排行榜前 10 名")
 async def lvleaderboard(interaction: discord.Interaction):
