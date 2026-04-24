@@ -67,10 +67,10 @@ LEVEL_MILESTONE_COINS: typing.Dict[int, int] = {
 
 # 各階首次解鎖時的私訊短句；每則都帶「奈音」群梗，玩笑偏開，可再自行改
 LEVEL_MILESTONE_FLAVOR: typing.Dict[int, str] = {
-    20: "你升上來了。奈音的裙擺還沒掃到你，但伺服器已經默認你值得多看一眼—畢竟能跟他一起女裝排隊的份額有限。",
-    40: "你現在的等級夠在群裡大聲說幹話。奈音若轉頭瞪你，那不是生氣，是男娘の視線自帶一點腿環反光。",
-    60: "再往上，連你的鍵盤都學會看奈音臉色。他若邊女裝邊罵人，你別爭辯，那是本群的南娘群主又在傲嬌了。",
-    80: "到這一階，背鍋與帶風向你都有的份。奈音的裙角若掃到誰的羞恥心，你負責嚴肅觀摩；男娘群主只負責美，我們只負責看。",
+    20: "恭喜你升上20等。請繼續努力，當個好賭狗。",
+    40: "恭喜你從賭狗進化成了奈音的狗，到了這裡請當個好狗狗，多催更奈音的女裝。",
+    60: "你好閒，水群水到了60等，請繼續浪費時間在DC上面，多多賭博有助身心健康。",
+    80: "到了這一階，你時間真的很多，到了這個等級請買一張2330供奉給am1ka，撫慰他的辛勞。",
     100:"封頂。你這傻逼能滿等也是個奇蹟= =。",
 }
 
@@ -1447,23 +1447,23 @@ async def beg(interaction: discord.Interaction):
     else: c.execute("UPDATE users SET balance=balance+%s, last_beg=%s WHERE user_id=%s", (earn, now, str(interaction.user.id))); log_transaction(interaction.user.id, earn, "乞討所得"); await interaction.response.send_message(f"你被施捨了！獲得 {earn} 元")
     conn.commit(); conn.close()
 
-@bot.tree.command(name="rescue", description="[極致救濟] 餘額為 0 元時可領 1,000 (每人限領 10 次)")
+@bot.tree.command(name="rescue", description="破產救濟計畫，餘額為 0 元時可領 1,000 (每人限領 10 次)")
 async def rescue(interaction: discord.Interaction):
     ensure_user_exists(interaction.user.id, 50000)
     conn = get_db_connection(); c = conn.cursor()
     c.execute("SELECT balance, last_rescue, rescue_count FROM users WHERE user_id=%s", (str(interaction.user.id),))
     row = c.fetchone()
-    if row[0] > 0: return await interaction.response.send_message(f"💰 你還有一點尊嚴（餘額: {row[0]}），請自力更生！完全歸零時再來領。", ephemeral=True)
-    if row[2] >= 10: return await interaction.response.send_message("🚫 抱歉，你的救濟次數已達 10 次上限。這輩子不能再領了，去跟朋友借吧！", ephemeral=True)
+    if row[0] > 0: return await interaction.response.send_message(f"💰 還沒破產（餘額: {row[0]}），請這位賭狗先去賭到傾家蕩產！完全歸零時再來領。", ephemeral=True)
+    if row[2] >= 10: return await interaction.response.send_message("🚫 抱歉，你的救濟次數已達 10 次上限。這輩子不能再領了，賭鬼！", ephemeral=True)
     
     now = datetime.datetime.now()
     if row[1] and (now - row[1]).total_seconds() < 3600:
         rem = 3600 - (now - row[1]).total_seconds()
-        return await interaction.response.send_message(f"🕒 救助站正在休息中！請再等 `{int(rem//60)}` 分鐘。", ephemeral=True)
+        return await interaction.response.send_message(f"🕒 銀行還不想給你錢！請再等 `{int(rem//60)}` 分鐘。", ephemeral=True)
         
     c.execute("UPDATE users SET balance=balance+1000, last_rescue=%s, rescue_count=rescue_count+1 WHERE user_id=%s", (now, str(interaction.user.id)))
-    conn.commit(); conn.close(); log_transaction(interaction.user.id, 1000, "終極破產救濟")
-    await interaction.response.send_message(f"🚑 貧窮救濟金已發放！獲得 **1,000** 東雲幣。這是你第 `{row[2]+1}/10` 次領取。")
+    conn.commit(); conn.close(); log_transaction(interaction.user.id, 1000, "賭狗破產救濟")
+    await interaction.response.send_message(f"🚑 窮鬼救濟金已發放！獲得 **1,000** 東雲幣。這是你第 `{row[2]+1}/10` 次領取。")
 
 @bot.tree.command(name="bj", description="開始 21 點")
 @app_commands.describe(bet="注額")
@@ -1574,7 +1574,7 @@ async def transfer(interaction: discord.Interaction, member: discord.Member, amo
     log_transaction(member.id, amount, in_reason)
     await interaction.response.send_message(msg)
 
-@bot.tree.command(name="redpacket", description="發送可搶紅包（會扣自己的錢）")
+@bot.tree.command(name="redpacket", description="發送紅包！")
 @app_commands.describe(total_amount="紅包總金額", count="份數", seconds="有效秒數(最少10秒)")
 async def redpacket(interaction: discord.Interaction, total_amount: int, count: int, seconds: int = 60):
     ensure_user_exists(interaction.user.id, 50000)
