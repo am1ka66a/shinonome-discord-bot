@@ -1329,8 +1329,6 @@ class StockPagerView(discord.ui.View):
 # --- 4. 指令系統 ---
 intents = discord.Intents.default(); intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
-stock_group = app_commands.Group(name="stock", description="台股查詢")
-bot.tree.add_command(stock_group)
 
 @bot.event
 async def on_ready():
@@ -1745,323 +1743,6 @@ async def stock_symbol_autocomplete(interaction: discord.Interaction, current: s
                 break
     return choices
 
-@stock_group.command(name="quote", description="查詢台股個股資訊")
-@app_commands.describe(symbol="股票代號或名稱")
-@app_commands.autocomplete(symbol=stock_symbol_autocomplete)
-async def stock_quote(interaction: discord.Interaction, symbol: str):
-    await interaction.response.defer(thinking=True)
-    try:
-        rows = await fetch_stock_day_all()
-    except Exception as e:
-        return await interaction.followup.send(f"台股資料暫時無法取得：{e}", ephemeral=True)
-
-    raw_key = symbol.strip()
-    key = raw_key.upper()
-    picked = None
-    partial_matches = []
-    for row in rows:
-        code = str(row.get("Code", "")).upper()
-        name = str(row.get("Name", ""))
-        if code == key or name == symbol.strip():
-            picked = row
-            break
-    if picked is None:
-        for row in rows:
-            code = str(row.get("Code", "")).upper()
-            name = str(row.get("Name", ""))
-            if key in code or raw_key in name:
-                partial_matches.append(row)
-        if partial_matches:
-            # 模糊關鍵字命中多檔時，先回候選清單給使用者再精準查
-            if len(partial_matches) > 1:
-                candidates = [f"{row.get('Code')} {row.get('Name')}" for row in partial_matches[:20]]
-                return await interaction.followup.send(
-                    "🔎 找到多筆相近股票，請改輸入更完整代號或名稱：\n"
-                    + "\n".join([f"- `{c}`" for c in candidates]),
-                    ephemeral=True
-                )
-            picked = partial_matches[0]
-    if picked is None:
-        suggestions = []
-        for row in rows[:12]:
-            suggestions.append(f"{row.get('Code')} {row.get('Name')}")
-        return await interaction.followup.send(
-            "找不到該股票代號/名稱。\n你可以查詢例如：\n" + "\n".join([f"- `{s}`" for s in suggestions]),
-            ephemeral=True
-        )
-
-    code = str(picked.get("Code", "")).strip()
-    try:
-        quotes = await fetch_mis_quotes(build_mis_channels_for_code(code))
-    except Exception as e:
-        return await interaction.followup.send(f"即時資料暫時無法取得：{e}", ephemeral=True)
-    real = None
-    for q in quotes:
-        if q["code"] == code and q["price"] > 0:
-            real = q
-            break
-    if real is None and quotes:
-        real = quotes[0]
-    if not real or real["price"] <= 0:
-        return await interaction.followup.send("目前查無即時成交資訊", ephemeral=True)
-
-    open_price = to_float(picked.get("OpeningPrice", "0"))
-    high_price = to_float(picked.get("HighestPrice", "0"))
-    low_price = to_float(picked.get("LowestPrice", "0"))
-    ref_price = real["prev_close"]
-    color = 0x2ecc71 if real["change"] > 0 else (0xe74c3c if real["change"] < 0 else 0x95a5a6)
-    embed = discord.Embed(title=f"📈 {picked.get('Name')} ({picked.get('Code')})", color=color)
-    embed.add_field(name="即時價", value=f"`{real['price']:.2f}`")
-    embed.add_field(name="漲跌", value=f"`{real['change']:+.2f}` ({real['pct']:+.2f}%)")
-    embed.add_field(name="成交量", value=f"`{real['volume']:,}`")
-    embed.add_field(name="開盤", value=f"`{open_price:.2f}`")
-    embed.add_field(name="最高 / 最低", value=f"`{high_price:.2f}` / `{low_price:.2f}`")
-    embed.add_field(name="昨收(參考)", value=f"`{ref_price:.2f}`")
-    embed.set_footer(text=f"即時來源: TWSE MIS | 時間: {real['time'] or 'N/A'}")
-    await interaction.followup.send(embed=embed)
-
-@stock_group.command(name="list", description="列出可查詢股票（可翻頁）")
-@app_commands.describe(keyword="股票代號或名稱關鍵字（選填）", page="頁碼（從 1 開始）")
-async def stock_list(interaction: discord.Interaction, keyword: str = "", page: int = 1):
-    await interaction.response.defer(thinking=True)
-    try:
-        rows = await fetch_stock_day_all()
-    except Exception as e:
-        return await interaction.followup.send(f"台股資料暫時無法取得：{e}", ephemeral=True)
-
-    key = keyword.strip().upper()
-    filtered = []
-    for row in rows:
-        code = str(row.get("Code", "")).upper()
-        name = str(row.get("Name", ""))
-        if not key or key in code or keyword.strip() in name:
-            filtered.append(row)
-    if not filtered:
-        return await interaction.followup.send("沒有符合的股票。", ephemeral=True)
-
-    page_size = 20
-    total_pages = max(1, (len(filtered) + page_size - 1) // page_size)
-    page = max(1, min(page, total_pages))
-    start = (page - 1) * page_size
-    end = start + page_size
-    preview = filtered[start:end]
-    all_lines = [f"{i+1}. `{r.get('Code')} {r.get('Name')}`" for i, r in enumerate(filtered)]
-    view = StockPagerView(
-        owner_id=interaction.user.id,
-        title=f"📚 可查詢股票（關鍵字：{keyword or '全部'}）",
-        lines=all_lines,
-        page_size=page_size,
-        start_page=page,
-        footer_prefix=f"共 {len(filtered)} 檔"
-    )
-    msg = await interaction.followup.send(embed=view.build_embed(), view=view)
-    view.message = msg
-
-@stock_group.command(name="movers", description="台股漲跌排行（精簡）")
-@app_commands.describe(top_n="排行筆數(1-20)")
-async def stock_movers(interaction: discord.Interaction, top_n: int = 5):
-    await interaction.response.defer(thinking=True)
-    top_n = max(1, min(20, top_n))
-    try:
-        scored, _ = await get_realtime_rank_data()
-    except Exception as e:
-        return await interaction.followup.send(f"即時資料暫時無法取得：{e}", ephemeral=True)
-    if not scored:
-        return await interaction.followup.send("目前無法計算排行", ephemeral=True)
-
-    gainers = sorted(scored, key=lambda x: x[0], reverse=True)[:top_n]
-    losers = sorted(scored, key=lambda x: x[0])[:top_n]
-    up_text = "\n".join([f"{i+1}. {r['code']} {r['name']} `{p:+.2f}%`" for i, (p, r) in enumerate(gainers)])
-    down_text = "\n".join([f"{i+1}. {r['code']} {r['name']} `{p:+.2f}%`" for i, (p, r) in enumerate(losers)])
-    embed = discord.Embed(title="📊 台股漲跌排行", color=0x2b2d31)
-    embed.add_field(name="漲幅前段", value=up_text or "無資料", inline=False)
-    embed.add_field(name="跌幅前段", value=down_text or "無資料", inline=False)
-    embed.set_footer(text="即時來源: TWSE MIS（熱門成交值樣本）")
-    await interaction.followup.send(embed=embed)
-
-@stock_group.command(name="gainers", description="台股即時漲幅榜（可翻頁）")
-@app_commands.describe(limit="總共要看幾名(1-100)", page="頁碼（每頁10名）")
-async def stock_gainers(interaction: discord.Interaction, limit: int = 50, page: int = 1):
-    await interaction.response.defer(thinking=True)
-    limit = max(1, min(100, limit))
-    try:
-        scored, _ = await get_realtime_rank_data()
-    except Exception as e:
-        return await interaction.followup.send(f"即時資料暫時無法取得：{e}", ephemeral=True)
-    if not scored:
-        return await interaction.followup.send("目前無法計算排行", ephemeral=True)
-    ranked = sorted(scored, key=lambda x: x[0], reverse=True)[:limit]
-    page_size = 10
-    total_pages = max(1, (len(ranked) + page_size - 1) // page_size)
-    page = max(1, min(page, total_pages))
-    all_lines = [f"{i+1}. {r['code']} {r['name']} `{p:+.2f}%`" for i, (p, r) in enumerate(ranked)]
-    view = StockPagerView(
-        owner_id=interaction.user.id,
-        title="📈 台股即時漲幅榜",
-        lines=all_lines,
-        page_size=page_size,
-        start_page=page,
-        footer_prefix=f"共 {len(ranked)} 名 | 來源: TWSE MIS"
-    )
-    msg = await interaction.followup.send(embed=view.build_embed(), view=view)
-    view.message = msg
-
-@stock_group.command(name="losers", description="台股即時跌幅榜（可翻頁）")
-@app_commands.describe(limit="總共要看幾名(1-100)", page="頁碼（每頁10名）")
-async def stock_losers(interaction: discord.Interaction, limit: int = 50, page: int = 1):
-    await interaction.response.defer(thinking=True)
-    limit = max(1, min(100, limit))
-    try:
-        scored, _ = await get_realtime_rank_data()
-    except Exception as e:
-        return await interaction.followup.send(f"即時資料暫時無法取得：{e}", ephemeral=True)
-    if not scored:
-        return await interaction.followup.send("目前無法計算排行", ephemeral=True)
-    ranked = sorted(scored, key=lambda x: x[0])[:limit]
-    page_size = 10
-    total_pages = max(1, (len(ranked) + page_size - 1) // page_size)
-    page = max(1, min(page, total_pages))
-    all_lines = [f"{i+1}. {r['code']} {r['name']} `{p:+.2f}%`" for i, (p, r) in enumerate(ranked)]
-    view = StockPagerView(
-        owner_id=interaction.user.id,
-        title="📉 台股即時跌幅榜",
-        lines=all_lines,
-        page_size=page_size,
-        start_page=page,
-        footer_prefix=f"共 {len(ranked)} 名 | 來源: TWSE MIS"
-    )
-    msg = await interaction.followup.send(embed=view.build_embed(), view=view)
-    view.message = msg
-
-@stock_group.command(name="topvolume", description="台股成交量排行（可翻頁）")
-@app_commands.describe(limit="總共要看幾名(1-100)", page="頁碼（每頁10名）")
-async def stock_topvolume(interaction: discord.Interaction, limit: int = 50, page: int = 1):
-    await interaction.response.defer(thinking=True)
-    limit = max(1, min(100, limit))
-    try:
-        rows = await fetch_stock_day_all()
-    except Exception as e:
-        return await interaction.followup.send(f"台股資料暫時無法取得：{e}", ephemeral=True)
-    ranked = []
-    for row in rows:
-        vol = int(to_float(row.get("TradeVolume", "0")))
-        if vol > 0:
-            ranked.append((vol, str(row.get("Code", "")), str(row.get("Name", ""))))
-    ranked = sorted(ranked, key=lambda x: x[0], reverse=True)[:limit]
-    if not ranked:
-        return await interaction.followup.send("目前無法取得成交量排行", ephemeral=True)
-    page_size = 10
-    total_pages = max(1, (len(ranked) + page_size - 1) // page_size)
-    page = max(1, min(page, total_pages))
-    all_lines = [f"{i+1}. {c} {n} `{v:,}`" for i, (v, c, n) in enumerate(ranked)]
-    view = StockPagerView(
-        owner_id=interaction.user.id,
-        title="📊 台股成交量排行",
-        lines=all_lines,
-        page_size=page_size,
-        start_page=page,
-        footer_prefix=f"共 {len(ranked)} 名 | 來源: TWSE openapi"
-    )
-    msg = await interaction.followup.send(embed=view.build_embed(), view=view)
-    view.message = msg
-
-@stock_group.command(name="market", description="台股市場摘要")
-async def stock_market(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True)
-    try:
-        scored, rows = await get_realtime_rank_data()
-    except Exception as e:
-        return await interaction.followup.send(f"市場摘要暫時無法取得：{e}", ephemeral=True)
-    if not scored:
-        return await interaction.followup.send("目前無法計算市場摘要", ephemeral=True)
-    up = len([1 for p, _ in scored if p > 0])
-    down = len([1 for p, _ in scored if p < 0])
-    flat = len(scored) - up - down
-    total_value = 0
-    for row in rows:
-        total_value += int(to_float(row.get("TradeValue", "0")))
-    embed = discord.Embed(title="🧭 台股市場摘要", color=0x2b2d31)
-    embed.add_field(name="上漲 / 下跌 / 平盤", value=f"`{up}` / `{down}` / `{flat}`", inline=False)
-    embed.add_field(name="成交值(全市場日資料)", value=f"`{total_value:,}`", inline=False)
-    embed.set_footer(text="即時漲跌樣本: TWSE MIS | 成交值: TWSE openapi")
-    await interaction.followup.send(embed=embed)
-
-@stock_group.command(name="watch_add", description="加入自選股")
-@app_commands.describe(symbol="股票代號")
-async def stock_watch_add(interaction: discord.Interaction, symbol: str):
-    code = symbol.strip().upper()
-    if not code:
-        return await interaction.response.send_message("請輸入股票代號", ephemeral=True)
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("INSERT IGNORE INTO stock_watchlist (user_id, symbol) VALUES (%s, %s)", (str(interaction.user.id), code))
-    conn.commit()
-    conn.close()
-    await interaction.response.send_message(f"✅ 已加入自選股：`{code}`", ephemeral=True)
-
-@stock_group.command(name="watch_remove", description="移除自選股")
-@app_commands.describe(symbol="股票代號")
-async def stock_watch_remove(interaction: discord.Interaction, symbol: str):
-    code = symbol.strip().upper()
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("DELETE FROM stock_watchlist WHERE user_id=%s AND symbol=%s", (str(interaction.user.id), code))
-    conn.commit()
-    conn.close()
-    await interaction.response.send_message(f"🗑️ 已移除自選股：`{code}`", ephemeral=True)
-
-@stock_group.command(name="watch_list", description="查看自選股清單")
-async def stock_watch_list(interaction: discord.Interaction):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT symbol FROM stock_watchlist WHERE user_id=%s ORDER BY created_at DESC", (str(interaction.user.id),))
-    rows = c.fetchall()
-    conn.close()
-    if not rows:
-        return await interaction.response.send_message("你還沒有自選股，先用 `/stock watch_add` 新增。", ephemeral=True)
-    items = [r[0] for r in rows]
-    await interaction.response.send_message("⭐ 你的自選股：\n" + "\n".join([f"- `{x}`" for x in items]), ephemeral=True)
-
-@stock_group.command(name="watchquote", description="自選股即時報價")
-async def stock_watchquote(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True)
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT symbol FROM stock_watchlist WHERE user_id=%s ORDER BY created_at DESC LIMIT 20", (str(interaction.user.id),))
-    rows = c.fetchall()
-    conn.close()
-    if not rows:
-        return await interaction.followup.send("你還沒有自選股，先用 `/stock watch_add` 新增。", ephemeral=True)
-    symbols = [r[0] for r in rows]
-    channels = []
-    for code in symbols:
-        channels.extend(build_mis_channels_for_code(code))
-    try:
-        quotes = await fetch_mis_quotes(channels)
-    except Exception as e:
-        return await interaction.followup.send(f"即時資料暫時無法取得：{e}", ephemeral=True)
-    best = {}
-    for q in quotes:
-        code = q["code"]
-        if code in symbols and (code not in best or q["price"] > best[code]["price"]):
-            best[code] = q
-    lines = []
-    for code in symbols:
-        q = best.get(code)
-        if not q:
-            lines.append(f"{code} `N/A`")
-        else:
-            lines.append(f"{code} `{q['price']:.2f}` ({q['pct']:+.2f}%)")
-    embed = discord.Embed(title="⭐ 自選股即時報價", description="\n".join(lines), color=0x2b2d31)
-    embed.set_footer(text="來源: TWSE MIS")
-    await interaction.followup.send(embed=embed)
-
-@stock_group.command(name="txchart", description="台指期圖表連結")
-async def stock_txchart(interaction: discord.Interaction):
-    embed = discord.Embed(title="📉 台指期圖表", color=0x2b2d31)
-    embed.description = "可直接開這個連結看台指期連續合約圖：\nhttps://www.tradingview.com/chart/?symbol=TAIFEX%3ATX1%21"
-    await interaction.response.send_message(embed=embed)
-
 @bot.tree.command(name="say", description="[管理員] 指定機器人對特定頻道發送內容")
 @app_commands.describe(text="你要機器人說什麼？", channel="指定發送到哪個頻道？(選填)")
 @app_commands.default_permissions(manage_messages=True)
@@ -2109,7 +1790,11 @@ async def record_cmd(interaction: discord.Interaction, member: discord.Member = 
 
 @bot.tree.command(name="leaderboard", description="前 10 名")
 async def leaderboard(interaction: discord.Interaction):
-    conn = get_db_connection(); c = conn.cursor(); c.execute("SELECT user_id, balance FROM users ORDER BY balance DESC LIMIT 10"); data = c.fetchall(); conn.close()
+    conn = get_db_connection(); c = conn.cursor()
+    admin_ids = [str(x) for x in ALLOWED_HOST_IDS]
+    ph = ",".join(["%s"] * len(admin_ids))
+    c.execute(f"SELECT user_id, balance FROM users WHERE user_id NOT IN ({ph}) ORDER BY balance DESC LIMIT 10", tuple(admin_ids))
+    data = c.fetchall(); conn.close()
     msg = "\n".join([f"{i+1}. <@{uid}>: {bal}" for i, (uid, bal) in enumerate(data)]); await interaction.response.send_message(embed=discord.Embed(title="🏆 排行榜", description=msg))
 
 @bot.tree.command(name="casino_stats", description="查看賭場金流統計（回收率/總發幣量/流通量）")
@@ -2145,18 +1830,23 @@ async def lvleaderboard(interaction: discord.Interaction):
     ensure_user_exists(interaction.user.id, 50000)
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT user_id, level, exp FROM users ORDER BY level DESC, exp DESC LIMIT 10")
+    admin_ids = [str(x) for x in ALLOWED_HOST_IDS]
+    ph = ",".join(["%s"] * len(admin_ids))
+    c.execute(f"SELECT user_id, level, exp FROM users WHERE user_id NOT IN ({ph}) ORDER BY level DESC, exp DESC LIMIT 10", tuple(admin_ids))
     data = c.fetchall()
     c.execute("SELECT level, exp FROM users WHERE user_id=%s", (str(interaction.user.id),))
     me = c.fetchone()
     if me:
         my_level, my_exp = me
-        c.execute(
-            "SELECT COUNT(*) FROM users WHERE level > %s OR (level = %s AND exp > %s)",
-            (my_level, my_level, my_exp)
-        )
-        rank_row = c.fetchone()
-        my_rank = (rank_row[0] if rank_row else 0) + 1
+        if str(interaction.user.id) in admin_ids:
+            my_rank = "不列入"
+        else:
+            c.execute(
+                f"SELECT COUNT(*) FROM users WHERE user_id NOT IN ({ph}) AND (level > %s OR (level = %s AND exp > %s))",
+                tuple(admin_ids) + (my_level, my_level, my_exp)
+            )
+            rank_row = c.fetchone()
+            my_rank = (rank_row[0] if rank_row else 0) + 1
     else:
         my_level, my_exp, my_rank = 1, 0, "-"
     conn.close()
