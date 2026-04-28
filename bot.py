@@ -1790,12 +1790,28 @@ async def record_cmd(interaction: discord.Interaction, member: discord.Member = 
 
 @bot.tree.command(name="leaderboard", description="前 10 名")
 async def leaderboard(interaction: discord.Interaction):
+    ensure_user_exists(interaction.user.id, 50000)
     conn = get_db_connection(); c = conn.cursor()
     admin_ids = [str(x) for x in ALLOWED_HOST_IDS]
     ph = ",".join(["%s"] * len(admin_ids))
     c.execute(f"SELECT user_id, balance FROM users WHERE user_id NOT IN ({ph}) ORDER BY balance DESC LIMIT 10", tuple(admin_ids))
-    data = c.fetchall(); conn.close()
-    msg = "\n".join([f"{i+1}. <@{uid}>: {bal}" for i, (uid, bal) in enumerate(data)]); await interaction.response.send_message(embed=discord.Embed(title="🏆 排行榜", description=msg))
+    data = c.fetchall()
+    c.execute("SELECT balance FROM users WHERE user_id=%s", (str(interaction.user.id),))
+    my_row = c.fetchone()
+    my_bal = int((my_row[0] if my_row else 0) or 0)
+    if str(interaction.user.id) in admin_ids:
+        my_rank = "不列入"
+    else:
+        c.execute(
+            f"SELECT COUNT(*) FROM users WHERE user_id NOT IN ({ph}) AND balance > %s",
+            tuple(admin_ids) + (my_bal,)
+        )
+        rank_row = c.fetchone()
+        my_rank = (rank_row[0] if rank_row else 0) + 1
+    conn.close()
+    msg = "\n".join([f"{i+1}. <@{uid}>: {bal}" for i, (uid, bal) in enumerate(data)])
+    msg += f"\n\n📍 你的目前名次：**#{my_rank}**（餘額 `{my_bal:,}`）"
+    await interaction.response.send_message(embed=discord.Embed(title="🏆 排行榜", description=msg))
 
 @bot.tree.command(name="casino_stats", description="查看賭場金流統計（回收率/總發幣量/流通量）")
 async def casino_stats(interaction: discord.Interaction):
