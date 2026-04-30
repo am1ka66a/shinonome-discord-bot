@@ -26,6 +26,7 @@ MAX_LEVEL = 100
 EXP_COOLDOWN_SECONDS = 45
 STOCK_CACHE_SECONDS = 20
 RED_PACKET_MIN_SECONDS = 10
+ROB_COOLDOWN_SECONDS = 1800
 red_packet_seq = 0
 stock_cache = {"day_all": {"ts": 0.0, "data": []}}
 STOCK_API_INSECURE_SSL = str(os.getenv("STOCK_API_INSECURE_SSL", "0")).strip().lower() in ("1", "true", "yes", "on")
@@ -161,7 +162,7 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS users 
                  (user_id VARCHAR(255) PRIMARY KEY, balance BIGINT, rescue_count INT DEFAULT 0,
                   total_games INT DEFAULT 0, wins INT DEFAULT 0, total_profit BIGINT DEFAULT 0,
-                  last_work TIMESTAMP NULL, last_beg TIMESTAMP NULL, last_rescue TIMESTAMP NULL,
+                  last_work TIMESTAMP NULL, last_beg TIMESTAMP NULL, last_rescue TIMESTAMP NULL, last_rob TIMESTAMP NULL,
                   exp BIGINT DEFAULT 0, level INT DEFAULT 1,
                   last_hourly_claim TIMESTAMP NULL, hourly_bank INT DEFAULT 0)''')
     # 確保現有表也有新欄位 (Migration)
@@ -170,6 +171,8 @@ def init_db():
     try: c.execute("ALTER TABLE users ADD COLUMN last_beg TIMESTAMP NULL")
     except: pass
     try: c.execute("ALTER TABLE users ADD COLUMN last_rescue TIMESTAMP NULL")
+    except: pass
+    try: c.execute("ALTER TABLE users ADD COLUMN last_rob TIMESTAMP NULL")
     except: pass
     try: c.execute("ALTER TABLE users ADD COLUMN exp BIGINT DEFAULT 0")
     except: pass
@@ -289,6 +292,23 @@ def ensure_user_exists(user_id, startup_balance=50000):
     )
     conn.commit()
     conn.close()
+
+def get_inflation_multiplier():
+    """依全服流通量計算通膨倍率，回傳 (multiplier, circulation, avg_balance)。"""
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT COALESCE(SUM(balance), 0), COUNT(*) FROM users")
+    row = c.fetchone()
+    conn.close()
+    circulation = int((row[0] if row else 0) or 0)
+    user_count = int((row[1] if row else 0) or 0)
+    avg_balance = circulation / user_count if user_count > 0 else 50000.0
+    # 以全服流通量作為主軸（不是單人平均）
+    base_circulation = 5_000_000.0
+    multiplier = circulation / base_circulation
+    # 低風險範圍：避免獎勵暴衝或過低
+    multiplier = max(0.5, min(5.0, multiplier))
+    return multiplier, circulation, avg_balance
 
 def try_deduct_balance(user_id, amount, reason):
     if amount <= 0:
@@ -1503,7 +1523,9 @@ async def beg(interaction: discord.Interaction):
     row = c.fetchone()
     now = datetime.datetime.now()
     if row[1] and (now - row[1]).total_seconds() < 120: return await interaction.response.send_message("太快了", ephemeral=True)
-    earn = random.randint(100, 600)
+    inflation_mult, _, _ = get_inflation_multiplier()
+    base_earn = random.randint(100, 600)
+    earn = max(50, int(base_earn * inflation_mult))
     if random.random() < 0.3:
         c.execute("UPDATE users SET last_beg=%s WHERE user_id=%s", (now, str(interaction.user.id)))
         await interaction.response.send_message("沒人鳥你 乞丐")
@@ -1512,6 +1534,85 @@ async def beg(interaction: discord.Interaction):
         log_transaction(interaction.user.id, earn, "乞討所得")
         await interaction.response.send_message(f"你獲得了{earn}東雲幣!錢給你啦 乞丐!")
     conn.commit(); conn.close()
+
+@bot.tree.command(name="rob", description="搶劫其他玩家（高風險高報酬）")
+@app_commands.describe(member="要搶劫的對象")
+async def rob(interaction: discord.Interaction, member: discord.Member):
+    if member.bot:
+        return await interaction.response.send_message("不能搶劫機器人。", ephemeral=True)
+    if member.id == interaction.user.id:
+        return await interaction.response.send_message("你不能搶劫自己。", ephemeral=True)
+
+    ensure_user_exists(interaction.user.id, 50000)
+    ensure_user_exists(member.id, 0)
+
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT balance, last_rob FROM users WHERE user_id=%s", (str(interaction.user.id),))
+    robber_row = c.fetchone()
+    c.execute("SELECT balance FROM users WHERE user_id=%s", (str(member.id),))
+    target_row = c.fetchone()
+
+    robber_balance = int((robber_row[0] if robber_row else 0) or 0)
+    last_rob = robber_row[1] if robber_row else None
+    target_balance = int((target_row[0] if target_row else 0) or 0)
+    now = datetime.datetime.now()
+
+    if last_rob and (now - last_rob).total_seconds() < ROB_COOLDOWN_SECONDS:
+        remain = ROB_COOLDOWN_SECONDS - int((now - last_rob).total_seconds())
+        mins = max(1, remain // 60)
+        conn.close()
+        return await interaction.response.send_message(f"⏳ 你剛搶過，請再等 `{mins}` 分鐘。", ephemeral=True)
+
+    if target_balance < 500:
+        conn.close()
+        return await interaction.response.send_message("對方太窮了，沒有東西可以搶。", ephemeral=True)
+
+    success_rate = 0.45
+    success = random.random() < success_rate
+    c.execute("UPDATE users SET last_rob=%s WHERE user_id=%s", (now, str(interaction.user.id)))
+
+    if success:
+        steal_amount = int(max(100, min(target_balance * random.uniform(0.08, 0.2), 50000)))
+        c.execute(
+            "UPDATE users SET balance=balance-%s WHERE user_id=%s AND balance >= %s",
+            (steal_amount, str(member.id), steal_amount)
+        )
+        if c.rowcount == 0:
+            conn.commit()
+            conn.close()
+            return await interaction.response.send_message("對方及時把錢藏好了，這次搶劫失敗。")
+        c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (steal_amount, str(interaction.user.id)))
+        conn.commit()
+        conn.close()
+        log_transaction(interaction.user.id, steal_amount, f"搶劫成功（目標:{member.id}）")
+        log_transaction(member.id, -steal_amount, f"被搶劫（搶匪:{interaction.user.id}）")
+        return await interaction.response.send_message(
+            f"🦹 搶劫成功！你從 {member.mention} 身上搶走了 **{steal_amount:,}** 東雲幣。"
+        )
+
+    fail_penalty = int(max(100, min(robber_balance * random.uniform(0.05, 0.12), 30000)))
+    if fail_penalty > 0:
+        c.execute(
+            "UPDATE users SET balance=balance-%s WHERE user_id=%s AND balance >= %s",
+            (fail_penalty, str(interaction.user.id), fail_penalty)
+        )
+        deducted = c.rowcount > 0
+        if deducted:
+            c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (fail_penalty, str(member.id)))
+    else:
+        deducted = False
+    conn.commit()
+    conn.close()
+    if deducted:
+        log_transaction(interaction.user.id, -fail_penalty, f"搶劫失敗反噬（目標:{member.id}）")
+        log_transaction(member.id, fail_penalty, f"反制搶劫獲賠（搶匪:{interaction.user.id}）")
+        return await interaction.response.send_message(
+            f"🚨 搶劫失敗！你被反殺，賠了 **{fail_penalty:,}** 東雲幣給 {member.mention}。"
+        )
+    return await interaction.response.send_message(
+        f"🚨 搶劫失敗！你身上已經沒什麼可賠，{member.mention} 放你一馬。"
+    )
 
 @bot.tree.command(name="rescue", description="破產救濟計畫，餘額為 0 元時可領 1,000 (每人限領 10 次)")
 async def rescue(interaction: discord.Interaction):
@@ -1527,11 +1628,13 @@ async def rescue(interaction: discord.Interaction):
         rem = 3600 - (now - row[1]).total_seconds()
         return await interaction.response.send_message(f"🕒 銀行還不想給你錢！請再等 `{int(rem//60)}` 分鐘。", ephemeral=True)
         
-    c.execute("UPDATE users SET balance=balance+1000, last_rescue=%s, rescue_count=rescue_count+1 WHERE user_id=%s", (now, str(interaction.user.id)))
-    conn.commit(); conn.close(); log_transaction(interaction.user.id, 1000, "賭狗破產救濟")
+    inflation_mult, _, _ = get_inflation_multiplier()
+    rescue_reward = max(500, min(50000, int(1000 * inflation_mult)))
+    c.execute("UPDATE users SET balance=balance+%s, last_rescue=%s, rescue_count=rescue_count+1 WHERE user_id=%s", (rescue_reward, now, str(interaction.user.id)))
+    conn.commit(); conn.close(); log_transaction(interaction.user.id, rescue_reward, "賭狗破產救濟")
     claim_no = row[2] + 1
     embed = discord.Embed(title="✅ 破產救濟發放", color=discord.Color.green())
-    embed.add_field(name="獲得", value="`1,000` 東雲幣", inline=False)
+    embed.add_field(name="獲得", value=f"`{rescue_reward:,}` 東雲幣", inline=False)
     embed.add_field(name="累計次數", value=f"`{claim_no}/10`", inline=False)
     embed.set_footer(text="請謹慎下注，避免再次破產")
     await interaction.response.send_message(embed=embed)
