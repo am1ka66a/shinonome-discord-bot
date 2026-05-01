@@ -27,6 +27,7 @@ EXP_COOLDOWN_SECONDS = 45
 STOCK_CACHE_SECONDS = 20
 RED_PACKET_MIN_SECONDS = 10
 ROB_COOLDOWN_SECONDS = 60
+ROB_VICTIM_PROTECT_SECONDS = 1800
 red_packet_seq = 0
 stock_cache = {"day_all": {"ts": 0.0, "data": []}}
 STOCK_API_INSECURE_SSL = str(os.getenv("STOCK_API_INSECURE_SSL", "0")).strip().lower() in ("1", "true", "yes", "on")
@@ -162,7 +163,7 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS users 
                  (user_id VARCHAR(255) PRIMARY KEY, balance BIGINT, rescue_count INT DEFAULT 0,
                   total_games INT DEFAULT 0, wins INT DEFAULT 0, total_profit BIGINT DEFAULT 0,
-                  last_work TIMESTAMP NULL, last_beg TIMESTAMP NULL, last_rescue TIMESTAMP NULL, last_rob TIMESTAMP NULL,
+                  last_work TIMESTAMP NULL, last_beg TIMESTAMP NULL, last_rescue TIMESTAMP NULL, last_rob TIMESTAMP NULL, last_robbed TIMESTAMP NULL,
                   exp BIGINT DEFAULT 0, level INT DEFAULT 1,
                   last_hourly_claim TIMESTAMP NULL, hourly_bank INT DEFAULT 0)''')
     # 確保現有表也有新欄位 (Migration)
@@ -173,6 +174,8 @@ def init_db():
     try: c.execute("ALTER TABLE users ADD COLUMN last_rescue TIMESTAMP NULL")
     except: pass
     try: c.execute("ALTER TABLE users ADD COLUMN last_rob TIMESTAMP NULL")
+    except: pass
+    try: c.execute("ALTER TABLE users ADD COLUMN last_robbed TIMESTAMP NULL")
     except: pass
     try: c.execute("ALTER TABLE users ADD COLUMN exp BIGINT DEFAULT 0")
     except: pass
@@ -1550,7 +1553,7 @@ async def rob(interaction: discord.Interaction, member: discord.Member):
     c = conn.cursor()
     c.execute("SELECT balance, last_rob, level FROM users WHERE user_id=%s", (str(interaction.user.id),))
     robber_row = c.fetchone()
-    c.execute("SELECT balance, level FROM users WHERE user_id=%s", (str(member.id),))
+    c.execute("SELECT balance, level, last_robbed FROM users WHERE user_id=%s", (str(member.id),))
     target_row = c.fetchone()
 
     robber_balance = int((robber_row[0] if robber_row else 0) or 0)
@@ -1558,6 +1561,7 @@ async def rob(interaction: discord.Interaction, member: discord.Member):
     robber_level = int((robber_row[2] if robber_row else 1) or 1)
     target_balance = int((target_row[0] if target_row else 0) or 0)
     target_level = int((target_row[1] if target_row else 1) or 1)
+    target_last_robbed = target_row[2] if target_row else None
     now = datetime.datetime.now()
 
     if last_rob and (now - last_rob).total_seconds() < ROB_COOLDOWN_SECONDS:
@@ -1572,6 +1576,11 @@ async def rob(interaction: discord.Interaction, member: discord.Member):
     if robber_balance < 50000:
         conn.close()
         return await interaction.response.send_message("你的餘額低於 50,000，無法發起搶劫。", ephemeral=True)
+    if target_last_robbed and (now - target_last_robbed).total_seconds() < ROB_VICTIM_PROTECT_SECONDS:
+        remain = ROB_VICTIM_PROTECT_SECONDS - int((now - target_last_robbed).total_seconds())
+        mins = max(1, remain // 60)
+        conn.close()
+        return await interaction.response.send_message(f"對方目前有保護，請 `{mins}` 分鐘後再試。", ephemeral=True)
 
     # 基礎成功率 30%，每差 1 等調整 1%
     level_gap = robber_level - target_level
@@ -1583,7 +1592,7 @@ async def rob(interaction: discord.Interaction, member: discord.Member):
     victim_name = member.display_name
 
     if success:
-        steal_amount = int(max(1, target_balance * random.uniform(0.10, 0.30)))
+        steal_amount = int(max(1, target_balance * random.uniform(0.10, 0.25)))
         c.execute(
             "UPDATE users SET balance=balance-%s WHERE user_id=%s AND balance >= %s",
             (steal_amount, str(member.id), steal_amount)
@@ -1593,6 +1602,7 @@ async def rob(interaction: discord.Interaction, member: discord.Member):
             conn.close()
             return await interaction.response.send_message("對方及時把錢藏好了，這次搶劫失敗。")
         c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (steal_amount, str(interaction.user.id)))
+        c.execute("UPDATE users SET last_robbed=%s WHERE user_id=%s", (now, str(member.id)))
         conn.commit()
         conn.close()
         log_transaction(interaction.user.id, steal_amount, f"搶劫成功（目標:{member.id}）")
