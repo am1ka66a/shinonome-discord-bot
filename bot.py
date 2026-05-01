@@ -1595,7 +1595,8 @@ async def rob(interaction: discord.Interaction, member: discord.Member):
         log_transaction(interaction.user.id, steal_amount, f"搶劫成功（目標:{member.id}）")
         log_transaction(member.id, -steal_amount, f"被搶劫（搶匪:{interaction.user.id}）")
         return await interaction.response.send_message(
-            f"嘿嘿嘿 你的錢錢現在是我的了!{steal_amount:,}這些是我的錢!"
+            f"嘿嘿嘿 你的錢錢現在是我的了!{steal_amount:,}這些是我的錢!\n"
+            f"搶劫者：{interaction.user.display_name}｜被搶者：{member.display_name}"
         )
 
     fail_penalty = int(max(100, min(robber_balance * random.uniform(0.05, 0.12), 30000)))
@@ -1615,10 +1616,12 @@ async def rob(interaction: discord.Interaction, member: discord.Member):
         log_transaction(interaction.user.id, -fail_penalty, f"搶劫失敗反噬（目標:{member.id}）")
         log_transaction(member.id, fail_penalty, f"反制搶劫獲賠（搶匪:{interaction.user.id}）")
         return await interaction.response.send_message(
-            f"菜狗 {fail_penalty:,}被搶走了!"
+            f"菜狗 {fail_penalty:,}被搶走了!\n"
+            f"搶劫者：{interaction.user.display_name}｜被搶者：{member.display_name}"
         )
     return await interaction.response.send_message(
-        f"菜狗 {fail_penalty:,}被搶走了!"
+        f"菜狗 {fail_penalty:,}被搶走了!\n"
+        f"搶劫者：{interaction.user.display_name}｜被搶者：{member.display_name}"
     )
 
 @bot.tree.command(name="rescue", description="破產救濟計畫，餘額為 0 元時可領 1,000 (每人限領 10 次)")
