@@ -1521,10 +1521,6 @@ async def beg(interaction: discord.Interaction):
     conn = get_db_connection(); c = conn.cursor()
     c.execute("SELECT balance, last_beg FROM users WHERE user_id=%s", (str(interaction.user.id),))
     row = c.fetchone()
-    balance_now = int((row[0] if row else 0) or 0)
-    if balance_now < 50000:
-        conn.close()
-        return await interaction.response.send_message("你的餘額低於 50,000，不能使用乞討。", ephemeral=True)
     now = datetime.datetime.now()
     if row[1] and (now - row[1]).total_seconds() < 120: return await interaction.response.send_message("太快了", ephemeral=True)
     inflation_mult, _, _ = get_inflation_multiplier()
@@ -1578,6 +1574,8 @@ async def rob(interaction: discord.Interaction, member: discord.Member):
     success_rate = 0.45
     success = random.random() < success_rate
     c.execute("UPDATE users SET last_rob=%s WHERE user_id=%s", (now, str(interaction.user.id)))
+    robber_name = interaction.user.display_name
+    victim_name = member.display_name
 
     if success:
         steal_amount = int(max(100, min(target_balance * random.uniform(0.08, 0.2), 50000)))
@@ -1595,8 +1593,7 @@ async def rob(interaction: discord.Interaction, member: discord.Member):
         log_transaction(interaction.user.id, steal_amount, f"搶劫成功（目標:{member.id}）")
         log_transaction(member.id, -steal_amount, f"被搶劫（搶匪:{interaction.user.id}）")
         return await interaction.response.send_message(
-            f"嘿嘿嘿 你的錢錢現在是我的了!{steal_amount:,}這些是我的錢!\n"
-            f"搶劫者：{interaction.user.display_name}｜被搶者：{member.display_name}"
+            f"{robber_name}搶了{victim_name}{steal_amount:,}東雲幣!!"
         )
 
     fail_penalty = int(max(100, min(robber_balance * random.uniform(0.05, 0.12), 30000)))
@@ -1616,12 +1613,10 @@ async def rob(interaction: discord.Interaction, member: discord.Member):
         log_transaction(interaction.user.id, -fail_penalty, f"搶劫失敗反噬（目標:{member.id}）")
         log_transaction(member.id, fail_penalty, f"反制搶劫獲賠（搶匪:{interaction.user.id}）")
         return await interaction.response.send_message(
-            f"菜狗 {fail_penalty:,}被搶走了!\n"
-            f"搶劫者：{interaction.user.display_name}｜被搶者：{member.display_name}"
+            f"{robber_name}這隻雜魚! 被{victim_name}搶了{fail_penalty:,}東雲幣!"
         )
     return await interaction.response.send_message(
-        f"菜狗 {fail_penalty:,}被搶走了!\n"
-        f"搶劫者：{interaction.user.display_name}｜被搶者：{member.display_name}"
+        f"{robber_name}這隻雜魚! 被{victim_name}搶了{fail_penalty:,}東雲幣!"
     )
 
 @bot.tree.command(name="rescue", description="破產救濟計畫，餘額為 0 元時可領 1,000 (每人限領 10 次)")
