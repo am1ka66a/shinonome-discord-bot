@@ -1592,7 +1592,7 @@ async def rob(interaction: discord.Interaction, member: discord.Member):
     victim_name = member.display_name
 
     if success:
-        steal_amount = int(max(1, target_balance * random.uniform(0.10, 0.25)))
+        steal_amount = int(max(1, min(target_balance * random.uniform(0.10, 0.25), 1_000_000)))
         c.execute(
             "UPDATE users SET balance=balance-%s WHERE user_id=%s AND balance >= %s",
             (steal_amount, str(member.id), steal_amount)
@@ -1611,7 +1611,7 @@ async def rob(interaction: discord.Interaction, member: discord.Member):
             f"{robber_name}搶了{victim_name}{steal_amount:,}東雲幣!!"
         )
 
-    fail_penalty = int(max(1, robber_balance * random.uniform(0.15, 0.45)))
+    fail_penalty = int(max(1, min(robber_balance * random.uniform(0.15, 0.45), 1_000_000)))
     if fail_penalty > 0:
         c.execute(
             "UPDATE users SET balance=balance-%s WHERE user_id=%s AND balance >= %s",
