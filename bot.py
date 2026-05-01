@@ -1628,10 +1628,10 @@ async def rob(interaction: discord.Interaction, member: discord.Member):
         log_transaction(interaction.user.id, -fail_penalty, f"搶劫失敗反噬（目標:{member.id}）")
         log_transaction(member.id, fail_penalty, f"反制搶劫獲賠（搶匪:{interaction.user.id}）")
         return await interaction.response.send_message(
-            f"{robber_name}這隻雜魚! 被{victim_name}搶了{fail_penalty:,}東雲幣!"
+            f"{robber_name}失手了! 反而被{victim_name}搶了{fail_penalty:,}東雲幣!"
         )
     return await interaction.response.send_message(
-        f"{robber_name}這隻雜魚! 被{victim_name}搶了{fail_penalty:,}東雲幣!"
+        f"{robber_name}失手了! 反而被{victim_name}搶了{fail_penalty:,}東雲幣!"
     )
 
 @bot.tree.command(name="rescue", description="破產救濟計畫，餘額為 0 元時可領 1,000 (每人限領 10 次)")
