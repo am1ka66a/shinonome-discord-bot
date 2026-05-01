@@ -1548,14 +1548,16 @@ async def rob(interaction: discord.Interaction, member: discord.Member):
 
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT balance, last_rob FROM users WHERE user_id=%s", (str(interaction.user.id),))
+    c.execute("SELECT balance, last_rob, level FROM users WHERE user_id=%s", (str(interaction.user.id),))
     robber_row = c.fetchone()
-    c.execute("SELECT balance FROM users WHERE user_id=%s", (str(member.id),))
+    c.execute("SELECT balance, level FROM users WHERE user_id=%s", (str(member.id),))
     target_row = c.fetchone()
 
     robber_balance = int((robber_row[0] if robber_row else 0) or 0)
     last_rob = robber_row[1] if robber_row else None
+    robber_level = int((robber_row[2] if robber_row else 1) or 1)
     target_balance = int((target_row[0] if target_row else 0) or 0)
+    target_level = int((target_row[1] if target_row else 1) or 1)
     now = datetime.datetime.now()
 
     if last_rob and (now - last_rob).total_seconds() < ROB_COOLDOWN_SECONDS:
@@ -1564,21 +1566,24 @@ async def rob(interaction: discord.Interaction, member: discord.Member):
         conn.close()
         return await interaction.response.send_message(f"⏳ 你剛搶過，請再等 `{mins}` 分鐘。", ephemeral=True)
 
-    if target_balance < 500:
+    if target_balance < 50000:
         conn.close()
         return await interaction.response.send_message("對方太窮了，沒有東西可以搶。", ephemeral=True)
     if robber_balance < 50000:
         conn.close()
         return await interaction.response.send_message("你的餘額低於 50,000，無法發起搶劫。", ephemeral=True)
 
-    success_rate = 0.45
+    # 基礎成功率 30%，每差 1 等調整 1%
+    level_gap = robber_level - target_level
+    success_rate = 0.30 + (level_gap * 0.01)
+    success_rate = max(0.05, min(0.95, success_rate))
     success = random.random() < success_rate
     c.execute("UPDATE users SET last_rob=%s WHERE user_id=%s", (now, str(interaction.user.id)))
     robber_name = interaction.user.display_name
     victim_name = member.display_name
 
     if success:
-        steal_amount = int(max(100, min(target_balance * random.uniform(0.08, 0.2), 50000)))
+        steal_amount = int(max(1, target_balance * random.uniform(0.10, 0.30)))
         c.execute(
             "UPDATE users SET balance=balance-%s WHERE user_id=%s AND balance >= %s",
             (steal_amount, str(member.id), steal_amount)
@@ -1596,7 +1601,7 @@ async def rob(interaction: discord.Interaction, member: discord.Member):
             f"{robber_name}搶了{victim_name}{steal_amount:,}東雲幣!!"
         )
 
-    fail_penalty = int(max(100, min(robber_balance * random.uniform(0.05, 0.12), 30000)))
+    fail_penalty = int(max(1, robber_balance * random.uniform(0.15, 0.45)))
     if fail_penalty > 0:
         c.execute(
             "UPDATE users SET balance=balance-%s WHERE user_id=%s AND balance >= %s",
