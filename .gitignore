@@ -18,3 +18,7 @@ ENV/
 
 # Local package artifacts
 *.whl
+
+# Runtime log file (see BOT_LOG_FILE in bot)
+logs/
+*.log

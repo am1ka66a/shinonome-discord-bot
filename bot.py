@@ -5,6 +5,7 @@ import random
 import pymysql
 import aiohttp
 import os
+import logging
 import asyncio
 import datetime
 import time
@@ -15,6 +16,42 @@ from urllib.parse import urlparse
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+def setup_bot_logging() -> logging.Logger:
+    """主程序日誌：主控台必出；若設定 BOT_LOG_FILE 或 LOG_FILE 則同步寫入檔案。"""
+    name = "shinonome_bot"
+    log = logging.getLogger(name)
+    if log.handlers:
+        return log
+    level_raw = (os.getenv("LOG_LEVEL") or "INFO").strip().upper()
+    level = getattr(logging, level_raw, logging.INFO)
+    log.setLevel(level)
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    ch = logging.StreamHandler()
+    ch.setLevel(level)
+    ch.setFormatter(fmt)
+    log.addHandler(ch)
+    log.propagate = False
+    log_path = (os.getenv("BOT_LOG_FILE") or os.getenv("LOG_FILE") or "").strip()
+    if log_path:
+        try:
+            log_dir = os.path.dirname(log_path)
+            if log_dir and not os.path.isdir(log_dir):
+                os.makedirs(log_dir, exist_ok=True)
+            fh = logging.FileHandler(log_path, encoding="utf-8")
+            fh.setLevel(level)
+            fh.setFormatter(fmt)
+            log.addHandler(fh)
+        except OSError as e:
+            log.warning("無法建立日誌檔 %s: %s", log_path, e)
+    return log
+
+
+logger = setup_bot_logging()
 
 # ==========================================
 # ⚙️ 系統設定與全局變數
@@ -1357,23 +1394,23 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 async def on_ready():
     try:
         init_db()
-        print("✅ 資料庫初始化完成")
+        logger.info("資料庫初始化完成")
     except Exception as e:
-        print(f"❌ init_db 失敗: {e}")
+        logger.exception("init_db 失敗: %s", e)
     try:
         synced = await bot.tree.sync()
-        print(f"✅ Slash 指令同步完成: {len(synced)}")
+        logger.info("Slash 指令同步完成: %s 個", len(synced))
     except Exception as e:
-        print(f"❌ Slash 同步失敗: {e}")
+        logger.exception("Slash 同步失敗: %s", e)
     # 在每個伺服器做 guild sync，讓新指令幾乎即時可用
     for guild in bot.guilds:
         try:
             gsynced = await bot.tree.sync(guild=guild)
-            print(f"✅ Guild 同步完成 {guild.id}: {len(gsynced)}")
+            logger.info("Guild 同步完成 %s: %s 個指令", guild.id, len(gsynced))
         except Exception as e:
-            print(f"❌ Guild 同步失敗 {guild.id}: {e}")
+            logger.exception("Guild 同步失敗 %s: %s", guild.id, e)
     bot.loop.create_task(vc_reward_task())
-    print(f"{bot.user} 啟動！")
+    logger.info("機器人已啟動: %s（伺服器數 %s）", bot.user, len(bot.guilds))
 
 async def vc_reward_task():
     await bot.wait_until_ready()
@@ -2599,6 +2636,65 @@ async def tournament_admin_reopen_match(interaction: discord.Interaction, round_
 
 def is_slash_host(interaction: discord.Interaction):
     return interaction.user.id in ALLOWED_HOST_IDS
+
+
+def _chunk_text_lines(lines: typing.List[str], max_len: int = 1900) -> typing.List[str]:
+    chunks: typing.List[str] = []
+    buf: typing.List[str] = []
+    size = 0
+    for line in lines:
+        add = len(line) + (1 if buf else 0)
+        if buf and size + add > max_len:
+            chunks.append("\n".join(buf))
+            buf = [line]
+            size = len(line)
+        else:
+            if buf:
+                size += 1
+            buf.append(line)
+            size += len(line)
+    if buf:
+        chunks.append("\n".join(buf))
+    return chunks
+
+
+@bot.tree.command(name="dev_list_guilds", description="[開發者] 列出機器人所在的所有伺服器（名稱、成員數、ID）")
+async def dev_list_guilds(interaction: discord.Interaction):
+    if interaction.user.id not in ALLOWED_HOST_IDS:
+        return await interaction.response.send_message("❌ 僅限開發者使用。", ephemeral=True)
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    lines: typing.List[str] = []
+    for g in sorted(bot.guilds, key=lambda x: (x.name or "").lower()):
+        name = g.name or "(無名稱)"
+        name_safe = discord.utils.escape_markdown(name)
+        try:
+            mc = g.member_count
+        except Exception:
+            mc = None
+        if mc is None:
+            mc = len(g.members)
+        lines.append(
+            f"• **{name_safe}** — 成員 `{mc:,}` ｜ ID `{g.id}`"
+        )
+    if not lines:
+        return await interaction.followup.send("目前沒有任何伺服器。", ephemeral=True)
+    header = f"**服務中伺服器**（共 `{len(bot.guilds)}` 個）\n"
+    parts = _chunk_text_lines(lines)
+    first_combined = header + parts[0]
+    if len(first_combined) <= 2000:
+        await interaction.followup.send(first_combined, ephemeral=True)
+        for p in parts[1:]:
+            await interaction.followup.send(p, ephemeral=True)
+    else:
+        await interaction.followup.send(header.rstrip(), ephemeral=True)
+        for p in parts:
+            await interaction.followup.send(p, ephemeral=True)
+    logger.info(
+        "dev_list_guilds: user=%s listed %s guilds",
+        interaction.user.id,
+        len(bot.guilds),
+    )
+
 
 @bot.tree.command(name="setlevel", description="[管理員] 直接設定玩家等級")
 @app_commands.describe(member="玩家", level="要設定到幾等（1~100）")
