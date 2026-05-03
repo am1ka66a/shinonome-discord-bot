@@ -5,6 +5,7 @@ import random
 import pymysql
 import aiohttp
 import os
+import io
 import logging
 import asyncio
 import datetime
@@ -124,6 +125,10 @@ MINECRAFT_ITEMS = load_minecraft_items()
 _pending_msg_counts: typing.Dict[str, int] = {}
 _last_msg_flush_ts: typing.Dict[str, float] = {}
 _last_exp_award_ts: typing.Dict[str, float] = {}
+
+# 私訊 ↔ 管理頻道雙向轉接（使用者 DM -> 頻道；管理員「回覆」轉發訊息 -> 私訊使用者）
+DM_RELAY_CHANNEL_ID = int(os.getenv("DM_RELAY_CHANNEL_ID", "1500383156186906764"))
+_relay_bot_msg_to_dm_user: typing.Dict[int, int] = {}
 
 # 等級里程碑：僅在**第一次到達** Lv.20/40/60/80/100 時發私訊、可領幣；自動加身分組**僅**在 .env 指定的伺服器（LEVEL_MILESTONE_GUILD_ID）
 LEVEL_MILE_TIERS: typing.Tuple[int, ...] = (20, 40, 60, 80, 100)
@@ -1387,8 +1392,170 @@ class StockPagerView(discord.ui.View):
             pass
 
 # --- 4. 指令系統 ---
-intents = discord.Intents.default(); intents.message_content = True
-bot = commands.Bot(command_prefix='!', intents=intents)
+intents = discord.Intents.default()
+intents.message_content = True
+if hasattr(intents, "dm_messages"):
+    intents.dm_messages = True
+
+
+@app_commands.command(
+    name="dev_list_guilds",
+    description="[開發者] 列出機器人所在的所有伺服器（名稱、成員數、ID）",
+)
+async def dev_list_guilds_command(interaction: discord.Interaction):
+    if interaction.user.id not in ALLOWED_HOST_IDS:
+        return await interaction.response.send_message("❌ 僅限開發者使用。", ephemeral=True)
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    lines: typing.List[str] = []
+    for g in sorted(interaction.client.guilds, key=lambda x: (x.name or "").lower()):
+        name = g.name or "(無名稱)"
+        name_safe = discord.utils.escape_markdown(name)
+        try:
+            mc = g.member_count
+        except Exception:
+            mc = None
+        if mc is None:
+            mc = len(g.members)
+        lines.append(
+            f"• **{name_safe}** — 成員 `{mc:,}` ｜ ID `{g.id}`"
+        )
+    if not lines:
+        return await interaction.followup.send("目前沒有任何伺服器。", ephemeral=True)
+    header = f"**服務中伺服器**（共 `{len(interaction.client.guilds)}` 個）\n"
+    parts = _chunk_text_lines(lines)
+    first_combined = header + parts[0]
+    if len(first_combined) <= 2000:
+        await interaction.followup.send(first_combined, ephemeral=True)
+        for p in parts[1:]:
+            await interaction.followup.send(p, ephemeral=True)
+    else:
+        await interaction.followup.send(header.rstrip(), ephemeral=True)
+        for p in parts:
+            await interaction.followup.send(p, ephemeral=True)
+    logger.info(
+        "dev_list_guilds: user=%s listed %s guilds",
+        interaction.user.id,
+        len(interaction.client.guilds),
+    )
+
+
+class ShinonomeBot(commands.Bot):
+    async def setup_hook(self) -> None:
+        env_override = (os.getenv("DEV_RELAY_GUILD_ID") or "").strip()
+        gid: typing.Optional[int] = int(env_override) if env_override else None
+        if gid is None:
+            try:
+                ch = await self.fetch_channel(DM_RELAY_CHANNEL_ID)
+                if ch and getattr(ch, "guild", None):
+                    gid = ch.guild.id
+            except Exception as e:
+                logger.warning("無法自動取得轉接頻道所在伺服器（dev_list_guilds 可能以全域註冊）: %s", e)
+        try:
+            if gid:
+                self.tree.add_command(dev_list_guilds_command, guild=discord.Object(id=gid))
+                logger.info("dev_list_guilds 僅註冊於伺服器 %s（其他伺服器不會出現此指令）", gid)
+            else:
+                self.tree.add_command(dev_list_guilds_command)
+                logger.warning(
+                    "dev_list_guilds 以全域註冊。若要隱藏，請設 DEV_RELAY_GUILD_ID 或確認 bot 能讀取 DM_RELAY_CHANNEL_ID"
+                )
+        except Exception as e:
+            logger.exception("註冊 dev_list_guilds 失敗，改為全域: %s", e)
+            self.tree.add_command(dev_list_guilds_command)
+
+
+bot = ShinonomeBot(command_prefix="!", intents=intents)
+
+
+async def _resolve_relay_dm_user_id(channel: discord.abc.GuildChannel, message: discord.Message) -> typing.Optional[int]:
+    ref_id = message.reference.message_id if message.reference and message.reference.message_id else None
+    seen: typing.Set[int] = set()
+    while ref_id and ref_id not in seen:
+        seen.add(ref_id)
+        u = _relay_bot_msg_to_dm_user.get(ref_id)
+        if u is not None:
+            return u
+        try:
+            ref_msg = await channel.fetch_message(ref_id)
+        except Exception:
+            return None
+        if ref_msg.reference and ref_msg.reference.message_id:
+            ref_id = ref_msg.reference.message_id
+        else:
+            return None
+    return None
+
+
+async def relay_dm_to_staff_channel(message: discord.Message) -> None:
+    """使用者私訊機器人 -> 轉發到管理頻道並記錄對應訊息 ID。"""
+    ch = bot.get_channel(DM_RELAY_CHANNEL_ID)
+    if ch is None:
+        try:
+            ch = await bot.fetch_channel(DM_RELAY_CHANNEL_ID)
+        except Exception as e:
+            logger.warning("找不到私訊轉接頻道 %s: %s", DM_RELAY_CHANNEL_ID, e)
+            return
+    if not isinstance(ch, discord.TextChannel):
+        logger.warning("DM_RELAY_CHANNEL_ID 不是文字頻道")
+        return
+    author = message.author
+    text = (message.content or "").strip()
+    emb = discord.Embed(title="📩 私訊轉發", color=0x5865F2, timestamp=datetime.datetime.now(datetime.timezone.utc))
+    emb.set_author(name=str(author), icon_url=author.display_avatar.url)
+    emb.add_field(name="發送者", value=f"<@{author.id}> ｜ ID `{author.id}`", inline=False)
+    emb.description = text[:4096] if text else "（無文字內容）"
+    att_urls = [a.url for a in message.attachments[:10]]
+    if att_urls:
+        emb.add_field(name="附件連結", value="\n".join(att_urls)[:1024], inline=False)
+    sticker_names = [str(s.name) for s in message.stickers][:5]
+    if sticker_names:
+        emb.add_field(name="貼圖", value=", ".join(sticker_names)[:1024], inline=False)
+    sent = await ch.send(embed=emb)
+    _relay_bot_msg_to_dm_user[sent.id] = author.id
+
+
+async def relay_staff_reply_to_dm_user(message: discord.Message) -> bool:
+    """管理員在轉接頻道「回覆」轉發訊息 -> 私訊原使用者。成功回傳 True。"""
+    if message.channel.id != DM_RELAY_CHANNEL_ID:
+        return False
+    uid = await _resolve_relay_dm_user_id(message.channel, message)
+    if uid is None:
+        return False
+    text = (message.content or "").strip()
+    if not text and not message.attachments:
+        try:
+            await message.add_reaction("❔")
+        except Exception:
+            pass
+        return True
+    try:
+        user = await bot.fetch_user(uid)
+        if text:
+            for chunk_start in range(0, len(text), 2000):
+                await user.send(text[chunk_start : chunk_start + 2000])
+        for att in message.attachments:
+            try:
+                data = await att.read()
+                await user.send(file=discord.File(io.BytesIO(data), filename=att.filename or "file"))
+            except Exception:
+                await user.send(att.url)
+    except discord.Forbidden:
+        try:
+            await message.reply("❌ 無法私訊該使用者（可能已關閉與機器人的私訊）。", mention_author=False)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.exception("轉發管理員回覆到私訊失敗: %s", e)
+        try:
+            await message.reply(f"❌ 發送私訊失敗：{e}", mention_author=False)
+        except Exception:
+            pass
+    else:
+        try:
+            await message.add_reaction("✅")
+        except Exception:
+            pass
+    return True
 
 @bot.event
 async def on_ready():
@@ -1438,6 +1605,14 @@ async def on_message(message):
     if message.author.bot:
         return
     try:
+        # 私訊 -> 管理伺服器指定頻道
+        if message.guild is None:
+            await relay_dm_to_staff_channel(message)
+            return
+        # 管理頻道：回覆轉發訊息 -> 私訊使用者（略過 Webhook）
+        if message.channel.id == DM_RELAY_CHANNEL_ID:
+            if not message.webhook_id and await relay_staff_reply_to_dm_user(message):
+                return
         if not message.guild:
             return
         user_id = str(message.author.id)
@@ -1487,7 +1662,7 @@ async def on_message(message):
         conn.commit()
         conn.close()
     except Exception as e:
-        print(f"❌ on_message 錯誤: {e}")
+        logger.exception("on_message 錯誤: %s", e)
     finally:
         await bot.process_commands(message)
 
@@ -2656,44 +2831,6 @@ def _chunk_text_lines(lines: typing.List[str], max_len: int = 1900) -> typing.Li
     if buf:
         chunks.append("\n".join(buf))
     return chunks
-
-
-@bot.tree.command(name="dev_list_guilds", description="[開發者] 列出機器人所在的所有伺服器（名稱、成員數、ID）")
-async def dev_list_guilds(interaction: discord.Interaction):
-    if interaction.user.id not in ALLOWED_HOST_IDS:
-        return await interaction.response.send_message("❌ 僅限開發者使用。", ephemeral=True)
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    lines: typing.List[str] = []
-    for g in sorted(bot.guilds, key=lambda x: (x.name or "").lower()):
-        name = g.name or "(無名稱)"
-        name_safe = discord.utils.escape_markdown(name)
-        try:
-            mc = g.member_count
-        except Exception:
-            mc = None
-        if mc is None:
-            mc = len(g.members)
-        lines.append(
-            f"• **{name_safe}** — 成員 `{mc:,}` ｜ ID `{g.id}`"
-        )
-    if not lines:
-        return await interaction.followup.send("目前沒有任何伺服器。", ephemeral=True)
-    header = f"**服務中伺服器**（共 `{len(bot.guilds)}` 個）\n"
-    parts = _chunk_text_lines(lines)
-    first_combined = header + parts[0]
-    if len(first_combined) <= 2000:
-        await interaction.followup.send(first_combined, ephemeral=True)
-        for p in parts[1:]:
-            await interaction.followup.send(p, ephemeral=True)
-    else:
-        await interaction.followup.send(header.rstrip(), ephemeral=True)
-        for p in parts:
-            await interaction.followup.send(p, ephemeral=True)
-    logger.info(
-        "dev_list_guilds: user=%s listed %s guilds",
-        interaction.user.id,
-        len(bot.guilds),
-    )
 
 
 @bot.tree.command(name="setlevel", description="[管理員] 直接設定玩家等級")
