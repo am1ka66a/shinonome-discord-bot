@@ -128,6 +128,8 @@ _last_exp_award_ts: typing.Dict[str, float] = {}
 
 # 私訊 ↔ 管理頻道雙向轉接（使用者 DM -> 頻道；管理員「回覆」轉發訊息 -> 私訊使用者）
 DM_RELAY_CHANNEL_ID = int(os.getenv("DM_RELAY_CHANNEL_ID", "1500383156186906764"))
+# 轉發到頻道時 @ 通知對象（預設此 Discord ID，可用 DM_RELAY_NOTIFY_USER_ID 覆寫）
+DM_RELAY_NOTIFY_USER_ID = int(os.getenv("DM_RELAY_NOTIFY_USER_ID", "531308526262550528"))
 _relay_bot_msg_to_dm_user: typing.Dict[int, int] = {}
 
 _discord_log_handler_installed = False
@@ -1578,17 +1580,12 @@ async def relay_dm_to_staff_channel(message: discord.Message) -> None:
     sticker_names = [str(s.name) for s in message.stickers][:5]
     if sticker_names:
         emb.add_field(name="貼圖", value=", ".join(sticker_names)[:1024], inline=False)
-    if ALLOWED_HOST_IDS:
-        dev_mentions = " ".join(f"<@{uid}>" for uid in ALLOWED_HOST_IDS)
-        sent = await ch.send(
-            content=dev_mentions,
-            embed=emb,
-            allowed_mentions=discord.AllowedMentions(
-                users=[discord.Object(id=int(uid)) for uid in ALLOWED_HOST_IDS]
-            ),
-        )
-    else:
-        sent = await ch.send(embed=emb)
+    notify_id = DM_RELAY_NOTIFY_USER_ID
+    sent = await ch.send(
+        content=f"<@{notify_id}>",
+        embed=emb,
+        allowed_mentions=discord.AllowedMentions(users=[discord.Object(id=notify_id)]),
+    )
     _relay_bot_msg_to_dm_user[sent.id] = author.id
 
 
