@@ -130,6 +130,74 @@ _last_exp_award_ts: typing.Dict[str, float] = {}
 DM_RELAY_CHANNEL_ID = int(os.getenv("DM_RELAY_CHANNEL_ID", "1500383156186906764"))
 _relay_bot_msg_to_dm_user: typing.Dict[int, int] = {}
 
+_discord_log_handler_installed = False
+
+
+class DiscordLogHandler(logging.Handler):
+    """將 logging 轉成非同步發送到 Discord 文字頻道（避免阻塞 logging）。"""
+
+    def __init__(self, client: commands.Bot, channel_id: int):
+        super().__init__()
+        self.client = client
+        self.channel_id = channel_id
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            if len(msg) > 1900:
+                msg = msg[:1900] + "…"
+            loop = self.client.loop
+            if loop is None or not loop.is_running():
+                return
+            fut = asyncio.run_coroutine_threadsafe(self._send(msg), loop)
+
+            def _discard_future_result(f: asyncio.Future) -> None:
+                try:
+                    f.result()
+                except Exception:
+                    pass
+
+            fut.add_done_callback(_discard_future_result)
+        except Exception:
+            self.handleError(record)
+
+    async def _send(self, text: str) -> None:
+        try:
+            ch = self.client.get_channel(self.channel_id)
+            if ch is None:
+                ch = await self.client.fetch_channel(self.channel_id)
+            if not isinstance(ch, discord.abc.Messageable):
+                return
+            chunk = text[:1990]
+            await ch.send(f"```\n{chunk}\n```")
+        except Exception:
+            pass
+
+
+def register_discord_log_handler(client: commands.Bot) -> None:
+    """啟動後掛上 Discord 頻道日誌；預設與私訊轉接同一頻道，可用 LOG_DISCORD_CHANNEL_ID 覆寫。"""
+    global _discord_log_handler_installed
+    if _discord_log_handler_installed:
+        return
+    raw = (os.getenv("LOG_DISCORD_CHANNEL_ID") or "").strip()
+    ch_id = int(raw) if raw else DM_RELAY_CHANNEL_ID
+    if not ch_id:
+        return
+    try:
+        h = DiscordLogHandler(client, ch_id)
+        h.setLevel(logger.level)
+        h.setFormatter(
+            logging.Formatter(
+                "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+        )
+        logger.addHandler(h)
+        _discord_log_handler_installed = True
+        logger.info("已啟用 Discord 頻道日誌（頻道 ID %s）", ch_id)
+    except Exception as e:
+        logger.warning("無法註冊 Discord 日誌 handler: %s", e)
+
 # 等級里程碑：僅在**第一次到達** Lv.20/40/60/80/100 時發私訊、可領幣；自動加身分組**僅**在 .env 指定的伺服器（LEVEL_MILESTONE_GUILD_ID）
 LEVEL_MILE_TIERS: typing.Tuple[int, ...] = (20, 40, 60, 80, 100)
 LEVEL_MILESTONE_COINS: typing.Dict[int, int] = {
@@ -1510,7 +1578,17 @@ async def relay_dm_to_staff_channel(message: discord.Message) -> None:
     sticker_names = [str(s.name) for s in message.stickers][:5]
     if sticker_names:
         emb.add_field(name="貼圖", value=", ".join(sticker_names)[:1024], inline=False)
-    sent = await ch.send(embed=emb)
+    if ALLOWED_HOST_IDS:
+        dev_mentions = " ".join(f"<@{uid}>" for uid in ALLOWED_HOST_IDS)
+        sent = await ch.send(
+            content=dev_mentions,
+            embed=emb,
+            allowed_mentions=discord.AllowedMentions(
+                users=[discord.Object(id=int(uid)) for uid in ALLOWED_HOST_IDS]
+            ),
+        )
+    else:
+        sent = await ch.send(embed=emb)
     _relay_bot_msg_to_dm_user[sent.id] = author.id
 
 
@@ -1559,6 +1637,7 @@ async def relay_staff_reply_to_dm_user(message: discord.Message) -> bool:
 
 @bot.event
 async def on_ready():
+    register_discord_log_handler(bot)
     try:
         init_db()
         logger.info("資料庫初始化完成")
