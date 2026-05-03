@@ -13,6 +13,7 @@ import time
 import typing
 import json
 import math
+import re
 from urllib.parse import urlparse
 from dotenv import load_dotenv
 
@@ -242,6 +243,74 @@ def level_auto_role_id(milestone: int) -> typing.Optional[int]:
 def is_host():
     def predicate(ctx): return ctx.author.id in ALLOWED_HOST_IDS
     return commands.check(predicate)
+
+
+def parse_discord_user_id(raw: typing.Optional[str]) -> typing.Optional[int]:
+    """解析純數字 ID 或 <@...> 提及。"""
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    m = re.fullmatch(r"<@!?(\d{17,20})>", s)
+    if m:
+        return int(m.group(1))
+    m = re.fullmatch(r"(\d{17,20})", s)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+async def resolve_slash_target(
+    interaction: discord.Interaction,
+    member: typing.Optional[discord.Member],
+    user_id: typing.Optional[str],
+    *,
+    required: bool = True,
+    in_guild_only: bool = False,
+) -> typing.Tuple[typing.Optional[typing.Union[discord.Member, discord.User]], typing.Optional[str]]:
+    """
+    優先使用選取的 member；否則解析 user_id。
+    in_guild_only=True 時必須為本伺服器成員（搶劫／轉帳等）；False 時若不在伺服器則改以 fetch_user（後台／黑名單等）。
+    """
+    if member is not None:
+        return member, None
+    uid = parse_discord_user_id(user_id)
+    if uid is None:
+        if not required:
+            return None, None
+        return None, "請選擇成員，或在「使用者 ID」填寫 17～19 位數字（亦可貼 `<@...>` 提及）。"
+    guild = interaction.guild
+    client = interaction.client
+    if guild is not None:
+        cached = guild.get_member(uid)
+        if cached is not None:
+            return cached, None
+        try:
+            m = await guild.fetch_member(uid)
+            return m, None
+        except discord.NotFound:
+            if in_guild_only:
+                return None, "找不到此成員（請確認對方仍在這個伺服器）。"
+            try:
+                u = await client.fetch_user(uid)
+                return u, None
+            except discord.NotFound:
+                return None, "找不到此 Discord 使用者。"
+            except discord.HTTPException as e:
+                return None, f"無法查詢使用者：{e}"
+        except discord.HTTPException as e:
+            return None, f"無法查詢成員：{e}"
+    if in_guild_only:
+        return None, "請在伺服器頻道使用此指令。"
+    try:
+        u = await client.fetch_user(uid)
+        return u, None
+    except discord.NotFound:
+        return None, "找不到此 Discord 使用者。"
+    except discord.HTTPException as e:
+        return None, f"無法查詢使用者：{e}"
+
 
 # ==========================================
 # 🗄️ 1. 資料庫系統 (MySQL)
@@ -544,8 +613,8 @@ def build_exp_progress_bar(cur: int, need: int, width: int = 12) -> str:
     filled = int(round(ratio * width))
     return "▓" * filled + "░" * (width - filled) + f"  {ratio * 100:.0f}%"
 
-async def process_level_ups(member: discord.Member, old_lv: int, new_lv: int):
-    if new_lv <= old_lv or member.bot:
+async def process_level_ups(member: typing.Union[discord.Member, discord.User], old_lv: int, new_lv: int):
+    if new_lv <= old_lv or getattr(member, "bot", False):
         return
     crossed = [m for m in LEVEL_MILE_TIERS if old_lv < m <= new_lv]
     if not crossed:
@@ -568,6 +637,7 @@ async def process_level_ups(member: discord.Member, old_lv: int, new_lv: int):
         g_limit = level_milestone_guild_id()
         if (
             rid
+            and isinstance(member, discord.Member)
             and member.guild
             and g_limit is not None
             and member.guild.id == g_limit
@@ -1827,8 +1897,20 @@ async def beg(interaction: discord.Interaction):
     conn.commit(); conn.close()
 
 @bot.tree.command(name="rob", description="搶劫其他玩家（高風險高報酬）")
-@app_commands.describe(member="要搶劫的對象")
-async def rob(interaction: discord.Interaction, member: discord.Member):
+@app_commands.describe(member="要搶劫的對象（選人）", user_id="或填使用者 ID／貼提及")
+async def rob(
+    interaction: discord.Interaction,
+    member: typing.Optional[discord.Member] = None,
+    user_id: typing.Optional[str] = None,
+):
+    m_user, err = await resolve_slash_target(
+        interaction, member, user_id, required=True, in_guild_only=True
+    )
+    if err:
+        return await interaction.response.send_message(err, ephemeral=True)
+    if not isinstance(m_user, discord.Member):
+        return await interaction.response.send_message("搶劫目標必須是此伺服器成員。", ephemeral=True)
+    member = m_user
     if member.bot:
         return await interaction.response.send_message("不能搶劫機器人。", ephemeral=True)
     if member.id == interaction.user.id:
@@ -1956,8 +2038,18 @@ async def bj(interaction: discord.Interaction, bet: int = 1000):
     sv = SetupView(interaction.user, bet); await interaction.response.send_message(embed=sv.build_embed(), view=sv)
 
 @bot.tree.command(name="balance", description="查詢個人的戰績與餘額")
-async def balance(interaction: discord.Interaction, member: discord.Member = None):
-    target = member or interaction.user
+@app_commands.describe(member="要查詢的成員（選填）", user_id="或填對方使用者 ID（選填）")
+async def balance(
+    interaction: discord.Interaction,
+    member: typing.Optional[discord.Member] = None,
+    user_id: typing.Optional[str] = None,
+):
+    resolved, err = await resolve_slash_target(
+        interaction, member, user_id, required=False, in_guild_only=False
+    )
+    if err:
+        return await interaction.response.send_message(err, ephemeral=True)
+    target: typing.Union[discord.Member, discord.User] = resolved or interaction.user
     if target.id == interaction.user.id:
         ensure_user_exists(target.id, 50000)
     else:
@@ -1976,8 +2068,18 @@ async def balance(interaction: discord.Interaction, member: discord.Member = Non
     await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="level", description="查詢等級與經驗值")
-async def level(interaction: discord.Interaction, member: discord.Member = None):
-    target = member or interaction.user
+@app_commands.describe(member="要查詢的成員（選填）", user_id="或填對方使用者 ID（選填）")
+async def level(
+    interaction: discord.Interaction,
+    member: typing.Optional[discord.Member] = None,
+    user_id: typing.Optional[str] = None,
+):
+    resolved, err = await resolve_slash_target(
+        interaction, member, user_id, required=False, in_guild_only=False
+    )
+    if err:
+        return await interaction.response.send_message(err, ephemeral=True)
+    target: typing.Union[discord.Member, discord.User] = resolved or interaction.user
     if target.id == interaction.user.id:
         ensure_user_exists(target.id, 50000)
     else:
@@ -2018,8 +2120,27 @@ async def level(interaction: discord.Interaction, member: discord.Member = None)
     await interaction.response.send_message(embed=emb)
 
 @bot.tree.command(name="transfer", description="轉帳給其他玩家")
-@app_commands.describe(member="要轉帳給誰", amount="轉帳金額", note="備註（選填）")
-async def transfer(interaction: discord.Interaction, member: discord.Member, amount: int, note: str = ""):
+@app_commands.describe(
+    member="收款人（選人，選填若已填 user_id）",
+    user_id="或填收款人使用者 ID",
+    amount="轉帳金額",
+    note="備註（選填）",
+)
+async def transfer(
+    interaction: discord.Interaction,
+    amount: int,
+    member: typing.Optional[discord.Member] = None,
+    user_id: typing.Optional[str] = None,
+    note: str = "",
+):
+    m_user, err = await resolve_slash_target(
+        interaction, member, user_id, required=True, in_guild_only=True
+    )
+    if err:
+        return await interaction.response.send_message(err, ephemeral=True)
+    if not isinstance(m_user, discord.Member):
+        return await interaction.response.send_message("轉帳對象必須是此伺服器成員。", ephemeral=True)
+    member = m_user
     if amount <= 0:
         return await interaction.response.send_message("金額必須大於 0", ephemeral=True)
     if member.bot:
@@ -2122,8 +2243,20 @@ async def redpacket(interaction: discord.Interaction, total_amount: int, count: 
         pass
 
 @bot.tree.command(name="kill", description="在目前頻道送出 Minecraft 風格隨機死法")
-@app_commands.describe(target="目標玩家")
-async def kill(interaction: discord.Interaction, target: discord.Member):
+@app_commands.describe(target="目標（選人）", user_id="或填使用者 ID／貼提及")
+async def kill(
+    interaction: discord.Interaction,
+    target: typing.Optional[discord.Member] = None,
+    user_id: typing.Optional[str] = None,
+):
+    m_user, err = await resolve_slash_target(
+        interaction, target, user_id, required=True, in_guild_only=True
+    )
+    if err:
+        return await interaction.response.send_message(err, ephemeral=True)
+    if not isinstance(m_user, discord.Member):
+        return await interaction.response.send_message("目標必須是此伺服器成員。", ephemeral=True)
+    target = m_user
     template = random.choice(MINECRAFT_DEATH_MESSAGES)
     item = random.choice(MINECRAFT_ITEMS)
     target_text = target.mention
@@ -2165,9 +2298,19 @@ async def say_slash(interaction: discord.Interaction, text: str, channel: discor
     await interaction.response.send_message(f"✅ 訊息已發送到 {target_channel.mention}！", ephemeral=True)
 
 @bot.tree.command(name="record", description="最近紀錄（最多 50 筆，10 筆一頁）")
-@app_commands.describe(member="要查詢的玩家（選填）", page="頁碼（每頁 10 筆）")
-async def record_cmd(interaction: discord.Interaction, member: discord.Member = None, page: int = 1):
-    target = member or interaction.user
+@app_commands.describe(member="要查詢的玩家（選填）", user_id="或填對方使用者 ID（選填）", page="頁碼（每頁 10 筆）")
+async def record_cmd(
+    interaction: discord.Interaction,
+    member: typing.Optional[discord.Member] = None,
+    user_id: typing.Optional[str] = None,
+    page: int = 1,
+):
+    resolved, err = await resolve_slash_target(
+        interaction, member, user_id, required=False, in_guild_only=False
+    )
+    if err:
+        return await interaction.response.send_message(err, ephemeral=True)
+    target: typing.Union[discord.Member, discord.User] = resolved or interaction.user
     conn = get_db_connection()
     c = conn.cursor()
     c.execute(
@@ -3033,12 +3176,27 @@ def _chunk_text_lines(lines: typing.List[str], max_len: int = 1900) -> typing.Li
 
 
 @bot.tree.command(name="setlevel", description="[管理員] 直接設定玩家等級")
-@app_commands.describe(member="玩家", level="要設定到幾等（1~100）")
-async def setlevel_slash(interaction: discord.Interaction, member: discord.Member, level: int):
+@app_commands.describe(
+    level="要設定到幾等（1~100）",
+    member="玩家（選人）",
+    user_id="或填使用者 ID／貼提及",
+)
+async def setlevel_slash(
+    interaction: discord.Interaction,
+    level: int,
+    member: typing.Optional[discord.Member] = None,
+    user_id: typing.Optional[str] = None,
+):
     if not is_slash_host(interaction):
         return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
     if level < 1 or level > MAX_LEVEL:
         return await interaction.response.send_message(f"等級需介於 1~{MAX_LEVEL}。", ephemeral=True)
+    m_user, err = await resolve_slash_target(
+        interaction, member, user_id, required=True, in_guild_only=False
+    )
+    if err:
+        return await interaction.response.send_message(err, ephemeral=True)
+    member = m_user
 
     ensure_user_exists(member.id, 0)
     lv_row = get_level_stats(member.id)
@@ -3067,12 +3225,29 @@ async def setlevel_slash(interaction: discord.Interaction, member: discord.Membe
     )
 
 @bot.tree.command(name="give", description="[管理員] 發放東雲幣給玩家")
-@app_commands.describe(member="玩家", amount="發放數量", note="備註（選填）")
-async def give_slash(interaction: discord.Interaction, member: discord.Member, amount: int, note: str = ""):
+@app_commands.describe(
+    amount="發放數量",
+    member="玩家（選人）",
+    user_id="或填使用者 ID／貼提及",
+    note="備註（選填）",
+)
+async def give_slash(
+    interaction: discord.Interaction,
+    amount: int,
+    member: typing.Optional[discord.Member] = None,
+    user_id: typing.Optional[str] = None,
+    note: str = "",
+):
     if not is_slash_host(interaction):
         return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
     if amount <= 0:
         return await interaction.response.send_message("數量必須大於 0", ephemeral=True)
+    m_user, err = await resolve_slash_target(
+        interaction, member, user_id, required=True, in_guild_only=False
+    )
+    if err:
+        return await interaction.response.send_message(err, ephemeral=True)
+    member = m_user
     ensure_user_exists(member.id, 0)
     conn = get_db_connection(); c = conn.cursor()
     c.execute("SELECT balance FROM users WHERE user_id=%s", (str(member.id),))
@@ -3095,12 +3270,29 @@ async def give_slash(interaction: discord.Interaction, member: discord.Member, a
     await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="take", description="[管理員] 扣除玩家東雲幣")
-@app_commands.describe(member="玩家", amount="扣除數量", note="備註（選填）")
-async def take_slash(interaction: discord.Interaction, member: discord.Member, amount: int, note: str = ""):
+@app_commands.describe(
+    amount="扣除數量",
+    member="玩家（選人）",
+    user_id="或填使用者 ID／貼提及",
+    note="備註（選填）",
+)
+async def take_slash(
+    interaction: discord.Interaction,
+    amount: int,
+    member: typing.Optional[discord.Member] = None,
+    user_id: typing.Optional[str] = None,
+    note: str = "",
+):
     if not is_slash_host(interaction):
         return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
     if amount <= 0:
         return await interaction.response.send_message("數量必須大於 0", ephemeral=True)
+    m_user, err = await resolve_slash_target(
+        interaction, member, user_id, required=True, in_guild_only=False
+    )
+    if err:
+        return await interaction.response.send_message(err, ephemeral=True)
+    member = m_user
     ensure_user_exists(member.id, 0)
     conn = get_db_connection(); c = conn.cursor()
     c.execute("SELECT balance FROM users WHERE user_id=%s", (str(member.id),))
@@ -3123,20 +3315,40 @@ async def take_slash(interaction: discord.Interaction, member: discord.Member, a
     await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="ban", description="[管理員] 將玩家加入黑名單")
-@app_commands.describe(member="玩家")
-async def ban_slash(interaction: discord.Interaction, member: discord.Member):
+@app_commands.describe(member="玩家（選人）", user_id="或填使用者 ID／貼提及")
+async def ban_slash(
+    interaction: discord.Interaction,
+    member: typing.Optional[discord.Member] = None,
+    user_id: typing.Optional[str] = None,
+):
     if not is_slash_host(interaction):
         return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
+    m_user, err = await resolve_slash_target(
+        interaction, member, user_id, required=True, in_guild_only=False
+    )
+    if err:
+        return await interaction.response.send_message(err, ephemeral=True)
+    member = m_user
     conn = get_db_connection(); c = conn.cursor()
     c.execute("INSERT IGNORE INTO blacklist (user_id) VALUES (%s)", (str(member.id),))
     conn.commit(); conn.close()
     await interaction.response.send_message(f"{member.mention} 已加入黑名單。")
 
 @bot.tree.command(name="unban", description="[管理員] 將玩家移出黑名單")
-@app_commands.describe(member="玩家")
-async def unban_slash(interaction: discord.Interaction, member: discord.Member):
+@app_commands.describe(member="玩家（選人，未必在伺服器）", user_id="或填使用者 ID／貼提及")
+async def unban_slash(
+    interaction: discord.Interaction,
+    member: typing.Optional[discord.Member] = None,
+    user_id: typing.Optional[str] = None,
+):
     if not is_slash_host(interaction):
         return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
+    m_user, err = await resolve_slash_target(
+        interaction, member, user_id, required=True, in_guild_only=False
+    )
+    if err:
+        return await interaction.response.send_message(err, ephemeral=True)
+    member = m_user
     conn = get_db_connection(); c = conn.cursor()
     c.execute("DELETE FROM blacklist WHERE user_id=%s", (str(member.id),))
     conn.commit(); conn.close()
