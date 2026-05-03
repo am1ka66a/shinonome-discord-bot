@@ -2123,30 +2123,99 @@ async def record_cmd(interaction: discord.Interaction, member: discord.Member = 
     except:
         pass
 
+
+async def _is_user_in_guild(guild: discord.Guild, user_id: int) -> bool:
+    """以快取或 API 確認使用者是否仍在該伺服器。"""
+    if guild.get_member(user_id):
+        return True
+    try:
+        await guild.fetch_member(user_id)
+        return True
+    except discord.NotFound:
+        return False
+    except Exception:
+        return False
+
+
+LEADERBOARD_POOL = 400
+LEADERBOARD_RANK_SCAN = 800
+
+
 @bot.tree.command(name="leaderboard", description="前 10 名")
 async def leaderboard(interaction: discord.Interaction):
     ensure_user_exists(interaction.user.id, 50000)
-    conn = get_db_connection(); c = conn.cursor()
+    guild = interaction.guild
+    conn = get_db_connection()
+    c = conn.cursor()
     admin_ids = [str(x) for x in ALLOWED_HOST_IDS]
     ph = ",".join(["%s"] * len(admin_ids))
-    c.execute(f"SELECT user_id, balance FROM users WHERE user_id NOT IN ({ph}) ORDER BY balance DESC LIMIT 10", tuple(admin_ids))
-    data = c.fetchall()
+
     c.execute("SELECT balance FROM users WHERE user_id=%s", (str(interaction.user.id),))
     my_row = c.fetchone()
     my_bal = int((my_row[0] if my_row else 0) or 0)
-    if str(interaction.user.id) in admin_ids:
-        my_rank = "不列入"
+
+    if guild:
+        await interaction.response.defer()
+        c.execute(
+            f"SELECT user_id, balance FROM users WHERE user_id NOT IN ({ph}) ORDER BY balance DESC LIMIT %s",
+            tuple(admin_ids) + (LEADERBOARD_POOL,),
+        )
+        pool = c.fetchall()
+        data: typing.List[typing.Tuple] = []
+        for row in pool:
+            if len(data) >= 10:
+                break
+            uid = int(row[0])
+            if await _is_user_in_guild(guild, uid):
+                data.append(row)
+
+        richer: typing.List[typing.Tuple] = []
+        if str(interaction.user.id) in admin_ids:
+            my_rank: typing.Union[str, int] = "不列入"
+        else:
+            c.execute(
+                f"SELECT user_id FROM users WHERE user_id NOT IN ({ph}) AND balance > %s ORDER BY balance DESC LIMIT %s",
+                tuple(admin_ids) + (my_bal, LEADERBOARD_RANK_SCAN),
+            )
+            richer = c.fetchall()
+            ahead = 0
+            for (uid_str,) in richer:
+                if await _is_user_in_guild(guild, int(uid_str)):
+                    ahead += 1
+            my_rank = ahead + 1
+
+        conn.close()
+        title = "🏆 排行榜（本伺服器）"
+        note = "\n\n※ 僅列出**目前仍在本伺服器**的成員（已退群者不含在內）。"
+        if str(interaction.user.id) not in admin_ids and len(richer) >= LEADERBOARD_RANK_SCAN:
+            note += f"\n※ 你的名次僅掃描「餘額較高」累計前 {LEADERBOARD_RANK_SCAN} 人中的本群成員；極端情況下為參考值。"
     else:
         c.execute(
-            f"SELECT COUNT(*) FROM users WHERE user_id NOT IN ({ph}) AND balance > %s",
-            tuple(admin_ids) + (my_bal,)
+            f"SELECT user_id, balance FROM users WHERE user_id NOT IN ({ph}) ORDER BY balance DESC LIMIT 10",
+            tuple(admin_ids),
         )
-        rank_row = c.fetchone()
-        my_rank = (rank_row[0] if rank_row else 0) + 1
-    conn.close()
-    msg = "\n".join([f"{i+1}. <@{uid}>: {bal}" for i, (uid, bal) in enumerate(data)])
-    msg += f"\n\n📍 你的目前名次：**#{my_rank}**（餘額 `{my_bal:,}`）"
-    await interaction.response.send_message(embed=discord.Embed(title="🏆 排行榜", description=msg))
+        data = c.fetchall()
+        if str(interaction.user.id) in admin_ids:
+            my_rank = "不列入"
+        else:
+            c.execute(
+                f"SELECT COUNT(*) FROM users WHERE user_id NOT IN ({ph}) AND balance > %s",
+                tuple(admin_ids) + (my_bal,),
+            )
+            rank_row = c.fetchone()
+            my_rank = (rank_row[0] if rank_row else 0) + 1
+        conn.close()
+        title = "🏆 排行榜（全站）"
+        note = "\n\n※ 在伺服器頻道使用時，榜單會改為**僅本伺服器成員**。"
+
+    lines = [f"{i+1}. <@{uid}>: {bal}" for i, (uid, bal) in enumerate(data)]
+    msg = "\n".join(lines) if lines else "（尚無符合條件的成員）"
+    msg += f"\n\n📍 你的目前名次：**#{my_rank}**（餘額 `{my_bal:,}`）{note}"
+    emb = discord.Embed(title=title, description=msg)
+    if guild:
+        await interaction.followup.send(embed=emb)
+    else:
+        await interaction.response.send_message(embed=emb)
 
 @bot.tree.command(name="casino_stats", description="查看賭場金流統計（回收率/總發幣量/流通量）")
 async def casino_stats(interaction: discord.Interaction):
@@ -2179,33 +2248,87 @@ async def casino_stats(interaction: discord.Interaction):
 @bot.tree.command(name="lvleaderboard", description="等級排行榜前 10 名")
 async def lvleaderboard(interaction: discord.Interaction):
     ensure_user_exists(interaction.user.id, 50000)
+    guild = interaction.guild
     conn = get_db_connection()
     c = conn.cursor()
     admin_ids = [str(x) for x in ALLOWED_HOST_IDS]
     ph = ",".join(["%s"] * len(admin_ids))
-    c.execute(f"SELECT user_id, level, exp FROM users WHERE user_id NOT IN ({ph}) ORDER BY level DESC, exp DESC LIMIT 10", tuple(admin_ids))
-    data = c.fetchall()
+
     c.execute("SELECT level, exp FROM users WHERE user_id=%s", (str(interaction.user.id),))
     me = c.fetchone()
     if me:
-        my_level, my_exp = me
+        my_level, my_exp = int(me[0] or 1), int(me[1] or 0)
+    else:
+        my_level, my_exp = 1, 0
+
+    if guild:
+        await interaction.response.defer()
+        c.execute(
+            f"SELECT user_id, level, exp FROM users WHERE user_id NOT IN ({ph}) ORDER BY level DESC, exp DESC LIMIT %s",
+            tuple(admin_ids) + (LEADERBOARD_POOL,),
+        )
+        pool = c.fetchall()
+        data: typing.List[typing.Tuple] = []
+        for row in pool:
+            if len(data) >= 10:
+                break
+            uid = int(row[0])
+            if await _is_user_in_guild(guild, uid):
+                data.append(row)
+
+        richer_lv: typing.List[typing.Tuple] = []
+        if str(interaction.user.id) in admin_ids:
+            my_rank: typing.Union[str, int] = "不列入"
+        else:
+            c.execute(
+                f"""SELECT user_id FROM users WHERE user_id NOT IN ({ph})
+                AND (level > %s OR (level = %s AND exp > %s))
+                ORDER BY level DESC, exp DESC LIMIT %s""",
+                tuple(admin_ids) + (my_level, my_level, my_exp, LEADERBOARD_RANK_SCAN),
+            )
+            richer_lv = c.fetchall()
+            ahead = 0
+            for (uid_str,) in richer_lv:
+                if await _is_user_in_guild(guild, int(uid_str)):
+                    ahead += 1
+            my_rank = ahead + 1
+
+        conn.close()
+        title = "🧠 Lv 排行榜（本伺服器）"
+        note = "\n\n※ 僅列出**目前仍在本伺服器**的成員。"
+        if str(interaction.user.id) not in admin_ids and len(richer_lv) >= LEADERBOARD_RANK_SCAN:
+            note += f"\n※ 你的名次僅掃描等級／EXP 較高者累計前 {LEADERBOARD_RANK_SCAN} 人中的本群成員；極端情況下為參考值。"
+    else:
+        c.execute(
+            f"SELECT user_id, level, exp FROM users WHERE user_id NOT IN ({ph}) ORDER BY level DESC, exp DESC LIMIT 10",
+            tuple(admin_ids),
+        )
+        data = c.fetchall()
         if str(interaction.user.id) in admin_ids:
             my_rank = "不列入"
         else:
             c.execute(
                 f"SELECT COUNT(*) FROM users WHERE user_id NOT IN ({ph}) AND (level > %s OR (level = %s AND exp > %s))",
-                tuple(admin_ids) + (my_level, my_level, my_exp)
+                tuple(admin_ids) + (my_level, my_level, my_exp),
             )
             rank_row = c.fetchone()
             my_rank = (rank_row[0] if rank_row else 0) + 1
-    else:
-        my_level, my_exp, my_rank = 1, 0, "-"
-    conn.close()
+        conn.close()
+        title = "🧠 Lv 排行榜（全站）"
+        note = "\n\n※ 在伺服器頻道使用時，榜單會改為**僅本伺服器成員**。"
+
     if not data:
-        return await interaction.response.send_message("目前沒有等級資料", ephemeral=True)
+        return await interaction.response.send_message("目前沒有符合條件的等級資料。", ephemeral=True) if not guild else await interaction.followup.send(
+            "目前沒有符合條件的等級資料。", ephemeral=True
+        )
+
     msg = "\n".join([f"{i+1}. <@{uid}>: Lv.{lv} | EXP {exp}" for i, (uid, lv, exp) in enumerate(data)])
-    msg += f"\n\n📍 你的目前名次：**#{my_rank}**（Lv.{my_level} | EXP {my_exp}）"
-    await interaction.response.send_message(embed=discord.Embed(title="🧠 Lv 排行榜", description=msg))
+    msg += f"\n\n📍 你的目前名次：**#{my_rank}**（Lv.{my_level} | EXP {my_exp}）{note}"
+    emb = discord.Embed(title=title, description=msg)
+    if guild:
+        await interaction.followup.send(embed=emb)
+    else:
+        await interaction.response.send_message(embed=emb)
 
 @bot.tree.command(name="check_players", description="[管理員] 查看所有報名玩家與卡組")
 async def check_players(interaction: discord.Interaction):
