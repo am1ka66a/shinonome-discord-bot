@@ -84,6 +84,9 @@ MAX_LEVEL = 100
 # Discord 單則訊息字元上限（與 API 一致）
 DISCORD_MESSAGE_CAP = 2000
 EXP_COOLDOWN_SECONDS = 45
+# 每完成一局 21 點結算時加發的隨機 EXP（見 roll_gamble_exp_from_bet）
+GAMBLE_EXP_MIN = 12
+GAMBLE_EXP_MAX = 38
 RED_PACKET_MIN_SECONDS = 10
 ROB_COOLDOWN_SECONDS = 60
 ROB_VICTIM_PROTECT_SECONDS = 1800
@@ -557,6 +560,13 @@ def try_deduct_balance(user_id, amount, reason):
     if ok:
         log_transaction(user_id, -amount, reason)
     return ok
+
+def roll_gamble_exp_from_bet(main_bet: int) -> int:
+    """完成一局 21 點時發放的隨機 EXP；主注越高可略增上限（仍為隨機區間）。"""
+    base = random.randint(GAMBLE_EXP_MIN, GAMBLE_EXP_MAX)
+    bonus = min(max(int(main_bet), 0) // 2500, 25)
+    return base + bonus
+
 
 def update_game_result(user_id, balance_delta, profit_delta, is_win, is_push=False):
     conn = get_db_connection()
@@ -1163,7 +1173,16 @@ class BlackjackGame(discord.ui.View):
         total_p = prof + getattr(self, 'side_p', 0)
         settlement_credit = self.total_deducted + total_p
         update_game_result(self.user.id, settlement_credit, total_p, win, is_push)
-        
+
+        exp_gain = roll_gamble_exp_from_bet(self.bet)
+        ensure_user_exists(self.user.id, 50000)
+        exp_result = add_user_exp(self.user.id, exp_gain)
+        if exp_result and exp_result[1] > exp_result[0]:
+            old_lv, new_lv = exp_result[0], exp_result[1]
+            if any(old_lv < m <= new_lv for m in LEVEL_MILE_TIERS):
+                asyncio.create_task(process_level_ups(self.user, old_lv, new_lv))
+        res = f"{res}\n✨ 經驗值 `+{exp_gain}`"
+
         for c in self.children: c.disabled = True
         stats = get_user_stats(self.user.id)
         nv  = NewGameView(self.user, self.bet, self.p_bet, self.s_bet, stats[0] if stats else 0)
