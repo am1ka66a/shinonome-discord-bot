@@ -1,7 +1,7 @@
 # ==============================================================================
 # 【一】匯入套件與環境變數
-# 載入 discord.py、aiohttp、pymysql 等依賴，並以 python-dotenv 讀取 .env
-# （DISCORD_TOKEN、MYSQL_URL、轉接頻道與等級／股市相關設定）。
+# 載入 discord.py、pymysql 等依賴，並以 python-dotenv 讀取 .env
+# （DISCORD_TOKEN、MYSQL_URL、轉接頻道與等級相關設定）。
 # ==============================================================================
 
 import asyncio
@@ -17,7 +17,6 @@ import time
 import typing
 from urllib.parse import urlparse
 
-import aiohttp
 import discord
 import pymysql
 from discord import app_commands
@@ -70,7 +69,7 @@ logger = setup_bot_logging()
 
 # ==============================================================================
 # 【三】全域常數、執行期狀態、轉接用對照與靜態資料
-# 含：管理員 ID、賭場／等級／搶紅包／台股快取、訊息與 EXP 冷卻、
+# 含：管理員 ID、賭場／等級／搶紅包、訊息與 EXP 冷卻、
 # 私訊轉接頻道與「轉發訊息 ID -> 原訊中繼」表格、Minecraft 死法／物品詞庫（JSON）。
 # ==============================================================================
 ALLOWED_HOST_IDS = [
@@ -85,13 +84,10 @@ MAX_LEVEL = 100
 # Discord 單則訊息字元上限（與 API 一致）
 DISCORD_MESSAGE_CAP = 2000
 EXP_COOLDOWN_SECONDS = 45
-STOCK_CACHE_SECONDS = 20
 RED_PACKET_MIN_SECONDS = 10
 ROB_COOLDOWN_SECONDS = 60
 ROB_VICTIM_PROTECT_SECONDS = 1800
 red_packet_seq = 0
-stock_cache = {"day_all": {"ts": 0.0, "data": []}}
-STOCK_API_INSECURE_SSL = str(os.getenv("STOCK_API_INSECURE_SSL", "0")).strip().lower() in ("1", "true", "yes", "on")
 MSG_DB_FLUSH_EVERY_SECONDS = 8
 MSG_DB_FLUSH_COUNT = 3
 MINECRAFT_DEATH_MESSAGES_PATH = os.path.join(
@@ -368,7 +364,7 @@ async def resolve_slash_target(
 # ==============================================================================
 # 【七】MySQL 與核心業務邏輯
 # 連線與資料表初始化；使用者餘額／交易／黑名單／通膨；二十一點與統計；等級與 EXP、
-# 里程碑領獎、時薪銀行；台股 API 與快取；錦標賽資料結構與晉級；排行榜取樣輔助等。
+# 里程碑領獎、時薪銀行；錦標賽資料結構與晉級；排行榜取樣輔助等。
 # （二十一點「牌面」介面邏輯在【八】【九】）
 # ==============================================================================
 
@@ -439,12 +435,6 @@ def init_db():
     except: pass
     try: c.execute("CREATE INDEX idx_users_level_exp ON users (level, exp)")
     except: pass
-    c.execute('''CREATE TABLE IF NOT EXISTS stock_watchlist (
-                 user_id VARCHAR(255),
-                 symbol VARCHAR(32),
-                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                 PRIMARY KEY (user_id, symbol)
-                 )''')
     c.execute('''CREATE TABLE IF NOT EXISTS tournament_players (
                  player_game_id VARCHAR(255) PRIMARY KEY,
                  player_discord_id VARCHAR(255) NULL,
@@ -766,86 +756,6 @@ def payout_hourly_bank(user_id, bank, reward_per_slot):
     log_transaction(user_id, payout, "每小時簽到")
     return payout
 
-def to_float(value, default=0.0):
-    try:
-        return float(str(value).replace(",", ""))
-    except:
-        return default
-
-async def fetch_stock_day_all():
-    now = time.time()
-    cache_obj = stock_cache["day_all"]
-    if now - cache_obj["ts"] < STOCK_CACHE_SECONDS and cache_obj["data"]:
-        return cache_obj["data"]
-    url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-    connector = aiohttp.TCPConnector(ssl=False if STOCK_API_INSECURE_SSL else None)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        async with session.get(url, timeout=15) as resp:
-            if resp.status != 200:
-                raise RuntimeError(f"TWSE API 錯誤: {resp.status}")
-            data = await resp.json()
-    cache_obj["ts"] = now
-    cache_obj["data"] = data
-    return data
-
-def _parse_mis_price(item):
-    z = str(item.get("z", "")).strip()
-    if z and z != "-":
-        return to_float(z, 0.0)
-    # z 為 "-" 時，用最佳買價欄位補
-    b = str(item.get("b", "")).split("_")[0].strip()
-    return to_float(b, 0.0)
-
-def _to_mis_quote(item):
-    code = str(item.get("c", "")).strip()
-    name = str(item.get("n", "")).strip() or code
-    price = _parse_mis_price(item)
-    prev_close = to_float(item.get("y", "0"), 0.0)
-    volume = int(to_float(item.get("v", "0"), 0.0))
-    change = price - prev_close if prev_close > 0 and price > 0 else 0.0
-    pct = (change / prev_close * 100) if prev_close > 0 and price > 0 else 0.0
-    return {
-        "code": code,
-        "name": name,
-        "price": price,
-        "prev_close": prev_close,
-        "change": change,
-        "pct": pct,
-        "volume": volume,
-        "time": str(item.get("t", "")).strip(),
-        "channel": str(item.get("ch", "")).strip(),
-    }
-
-async def fetch_mis_quotes(channels):
-    if not channels:
-        return []
-    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://mis.twse.com.tw/stock/index.jsp"}
-    connector = aiohttp.TCPConnector(ssl=False if STOCK_API_INSECURE_SSL else None)
-    all_quotes = []
-    # MIS 在 ex_ch 過長時常回 HTML；分批可避免 URL 過長與超時
-    chunk_size = 20
-    async with aiohttp.ClientSession(headers=headers, connector=connector) as session:
-        for i in range(0, len(channels), chunk_size):
-            chunk = channels[i:i + chunk_size]
-            ex_ch = "|".join(chunk)
-            ts = int(time.time() * 1000)
-            url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={ex_ch}&json=1&delay=0&_={ts}"
-            async with session.get(url, timeout=15) as resp:
-                if resp.status != 200:
-                    raise RuntimeError(f"MIS API 錯誤: {resp.status}")
-                text_body = await resp.text()
-                try:
-                    payload = json.loads(text_body)
-                except Exception:
-                    raise RuntimeError("MIS 回傳非 JSON（可能是請求過大或被擋）")
-                items = payload.get("msgArray") or []
-                all_quotes.extend([_to_mis_quote(item) for item in items if item])
-    return all_quotes
-
-def build_mis_channels_for_code(code):
-    c = str(code).strip().upper()
-    return [f"tse_{c}.tw", f"otc_{c}.tw"]
-
 def get_tournament_window():
     conn = get_db_connection()
     c = conn.cursor()
@@ -992,38 +902,6 @@ def _refresh_champion_if_single_left(conn):
         champion = next(iter(alive))
         c.execute("UPDATE tournament_meta SET status='finished', champion_player_id=%s WHERE id=1", (champion,))
 
-async def get_realtime_rank_data(sample_size=220):
-    rows = await fetch_stock_day_all()
-    candidates = []
-    for row in rows:
-        trade_value = to_float(row.get("TradeValue", "0"))
-        if trade_value > 0:
-            candidates.append((trade_value, str(row.get("Code", "")).strip(), str(row.get("Name", "")).strip()))
-    candidates = sorted(candidates, key=lambda x: x[0], reverse=True)[:sample_size]
-    channels = []
-    code_name_map = {}
-    for _, code, name in candidates:
-        if not code:
-            continue
-        code_name_map[code] = name
-        channels.extend(build_mis_channels_for_code(code))
-    quotes = await fetch_mis_quotes(channels)
-    best_by_code = {}
-    for q in quotes:
-        code = q["code"]
-        if not code:
-            continue
-        prev = best_by_code.get(code)
-        if prev is None or q["price"] > prev["price"]:
-            best_by_code[code] = q
-    scored = []
-    for code, q in best_by_code.items():
-        if q["price"] <= 0 or q["prev_close"] <= 0:
-            continue
-        q["name"] = code_name_map.get(code, q["name"] or code)
-        scored.append((q["pct"], q))
-    return scored, rows
-
 # ==============================================================================
 # 【八】二十一點：牌組、算分、旁注與牌局訊息更新
 # 多副牌洗牌、手牌點數（含 A）、對子／21+3 旁注結算、以及嵌入式訊息編輯流程。
@@ -1108,7 +986,7 @@ def check_sidebets(player_hand, dealer_up, p_bet, s_bet):
 
 # ==============================================================================
 # 【九】Discord 互動介面（UI）
-# 自訂下注 Modal、二十一點主 View 與相關按鈕、全下確認、新局、紅包搶領、台股清單翻頁等。
+# 自訂下注 Modal、二十一點主 View 與相關按鈕、全下確認、新局、紅包搶領、多行文字 Embed 翻頁等。
 # ==============================================================================
 
 
@@ -1539,7 +1417,7 @@ class RedPacketView(discord.ui.View):
         except:
             pass
 
-class StockPagerView(discord.ui.View):
+class LinePagerView(discord.ui.View):
     def __init__(self, owner_id, title, lines, page_size=10, start_page=1, color=0x2b2d31, footer_prefix=""):
         super().__init__(timeout=180)
         self.owner_id = owner_id
@@ -2036,8 +1914,8 @@ async def on_message(message):
         await bot.process_commands(message)
 
 # ==============================================================================
-# 【十三】Slash 指令：經濟、小遊戲、轉帳、股市、排行榜、管理公告等
-# 含每日／每小時簽到、乞討搶劫救濟、21 點、餘額與等級查詢、轉帳、紅包、台股、
+# 【十三】Slash 指令：經濟、小遊戲、轉帳、排行榜、管理公告等
+# 含每日／每小時簽到、乞討搶劫救濟、21 點、餘額與等級查詢、轉帳、紅包、
 # /say、戰報、賭場統計、排行榜（不含錦標賽專區與「僅主機」後台）。
 # ==============================================================================
 
@@ -2525,23 +2403,6 @@ async def kill(
     )
     await interaction.response.send_message(msg)
 
-async def stock_symbol_autocomplete(interaction: discord.Interaction, current: str):
-    try:
-        rows = await fetch_stock_day_all()
-    except:
-        return []
-    key = (current or "").strip().upper()
-    choices = []
-    for row in rows:
-        code = str(row.get("Code", "")).upper()
-        name = str(row.get("Name", ""))
-        if not key or key in code or (current or "").strip() in name:
-            label = f"{code} {name}".strip()
-            choices.append(app_commands.Choice(name=label[:100], value=code[:100]))
-            if len(choices) >= 25:
-                break
-    return choices
-
 @bot.tree.command(name="say", description="[管理員] 指定機器人對特定頻道發送內容")
 @app_commands.describe(text="你要機器人說什麼？", channel="指定發送到哪個頻道？(選填)")
 @app_commands.default_permissions(manage_messages=True)
@@ -2583,7 +2444,7 @@ async def record_cmd(
     for i, r in enumerate(rows):
         time_text = r[2].strftime('%m/%d %H:%M') if r[2] else "N/A"
         all_lines.append(f"{i+1}. [{time_text}] {r[1]}: `{r[0]}`")
-    view = StockPagerView(
+    view = LinePagerView(
         owner_id=interaction.user.id,
         title=f"📒 {target.display_name} 的最近紀錄",
         lines=all_lines,
@@ -3051,7 +2912,7 @@ async def tournament_list(interaction: discord.Interaction, page: int = 1):
     page_size = 20
     page = max(1, int(page))
     all_lines = [f"{i+1}. `{pid}`" for i, (pid, _) in enumerate(rows)]
-    view = StockPagerView(
+    view = LinePagerView(
         owner_id=interaction.user.id,
         title="📋 比賽報名名單",
         lines=all_lines,
