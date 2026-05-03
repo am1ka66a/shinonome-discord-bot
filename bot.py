@@ -1,20 +1,21 @@
-import discord
-from discord import app_commands
-from discord.ext import commands
-import random
-import pymysql
-import aiohttp
-import os
-import io
-import logging
 import asyncio
 import datetime
+import io
+import json
+import logging
+import math
+import os
+import random
+import re
 import time
 import typing
-import json
-import math
-import re
 from urllib.parse import urlparse
+
+import aiohttp
+import discord
+import pymysql
+from discord import app_commands
+from discord.ext import commands
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -58,10 +59,17 @@ logger = setup_bot_logging()
 # ==========================================
 # ⚙️ 系統設定與全局變數
 # ==========================================
-ALLOWED_HOST_IDS = [531308526262550528, 600177596088582185, 1027248561177509919,1309551323682701444]  # ⚠️ 填入你的 Discord ID
+ALLOWED_HOST_IDS = [
+    531308526262550528,
+    600177596088582185,
+    1027248561177509919,
+    1309551323682701444,
+]  # ⚠️ 填入你的 Discord ID
 SIDE_BET_RATIO = 0.5                     # 側注上限 (主注的 50%)
 IS_EVENT_ACTIVE = True                   # 賭場狀態
 MAX_LEVEL = 100
+# Discord 單則訊息字元上限（與 API 一致）
+DISCORD_MESSAGE_CAP = 2000
 EXP_COOLDOWN_SECONDS = 45
 STOCK_CACHE_SECONDS = 20
 RED_PACKET_MIN_SECONDS = 10
@@ -131,9 +139,10 @@ _last_exp_award_ts: typing.Dict[str, float] = {}
 DM_RELAY_CHANNEL_ID = int(os.getenv("DM_RELAY_CHANNEL_ID", "1500383156186906764"))
 # 轉發到頻道時 @ 通知對象（預設此 Discord ID，可用 DM_RELAY_NOTIFY_USER_ID 覆寫）
 DM_RELAY_NOTIFY_USER_ID = int(os.getenv("DM_RELAY_NOTIFY_USER_ID", "531308526262550528"))
-# 轉發訊息 ID -> (原 user_id, 是否私訊回覆, guild_id, channel_id, message_id)
-# 私訊轉發：(..., True, 0,0,0)；群組 @：(..., False, 原訊所在 guild/channel/message)
-_relay_forward_meta: typing.Dict[int, typing.Tuple[int, bool, int, int, int]] = {}
+# 轉發訊息 ID -> (原 user_id, 是否走 DM 回覆, guild_id, channel_id, message_id)
+# 私訊轉發：(..., True, 0, 0, 0)；群組 @：(..., False, 原訊 guild/channel/message)
+RelayForwardMeta = typing.Tuple[int, bool, int, int, int]
+_relay_forward_meta: typing.Dict[int, RelayForwardMeta] = {}
 
 _discord_log_handler_installed = False
 
@@ -219,7 +228,7 @@ LEVEL_MILESTONE_FLAVOR: typing.Dict[int, str] = {
     40: "恭喜你從賭狗進化成了奈音的狗，到了這裡請當個好狗狗，多催更奈音的女裝。",
     60: "你好閒，水群水到了60等，請繼續浪費時間在DC上面，多多賭博有助身心健康。",
     80: "到了這一階，你時間真的很多，到了這個等級請買一張2330供奉給am1ka，撫慰他的辛勞。",
-    100:"封頂。你這傻逼能滿等也是個奇蹟= =。",
+    100: "封頂。你這傻逼能滿等也是個奇蹟= =。",
 }
 
 def level_milestone_guild_id() -> typing.Optional[int]:
@@ -243,8 +252,19 @@ def level_auto_role_id(milestone: int) -> typing.Optional[int]:
         return None
 
 def is_host():
-    def predicate(ctx): return ctx.author.id in ALLOWED_HOST_IDS
+    def predicate(ctx):
+        return ctx.author.id in ALLOWED_HOST_IDS
+
     return commands.check(predicate)
+
+
+def _split_discord_message_chunks(
+    text: str, limit: int = DISCORD_MESSAGE_CAP
+) -> typing.List[str]:
+    """依字元長度切分，供多則訊息送出（一般文字／DM）。"""
+    if not text:
+        return []
+    return [text[i : i + limit] for i in range(0, len(text), limit)]
 
 
 def parse_discord_user_id(raw: typing.Optional[str]) -> typing.Optional[int]:
@@ -1530,7 +1550,7 @@ class StockPagerView(discord.ui.View):
         try:
             if self.message:
                 await self.message.edit(view=self)
-        except:
+        except Exception:
             pass
 
 # --- 4. 指令系統 ---
@@ -1566,7 +1586,7 @@ async def dev_list_guilds_command(interaction: discord.Interaction):
     header = f"**服務中伺服器**（共 `{len(interaction.client.guilds)}` 個）\n"
     parts = _chunk_text_lines(lines)
     first_combined = header + parts[0]
-    if len(first_combined) <= 2000:
+    if len(first_combined) <= DISCORD_MESSAGE_CAP:
         await interaction.followup.send(first_combined, ephemeral=True)
         for p in parts[1:]:
             await interaction.followup.send(p, ephemeral=True)
@@ -1609,9 +1629,12 @@ class ShinonomeBot(commands.Bot):
 bot = ShinonomeBot(command_prefix="!", intents=intents)
 
 
+# ---------- 私訊／群組 ↔ 轉接頻道 relay ----------
+
+
 async def _resolve_relay_from_staff_reply(
     channel: discord.abc.GuildChannel, message: discord.Message
-) -> typing.Optional[typing.Tuple[int, bool, int, int, int]]:
+) -> typing.Optional[RelayForwardMeta]:
     """沿回覆鏈找到機器人轉發訊息，回傳完整 relay meta。"""
     ref_id = message.reference.message_id if message.reference and message.reference.message_id else None
     seen: typing.Set[int] = set()
@@ -1632,7 +1655,8 @@ async def _resolve_relay_from_staff_reply(
 
 
 async def relay_user_message_to_staff_channel(message: discord.Message, *, is_dm: bool) -> None:
-    """私訊或群組 @ 機器人 -> 轉發到管理頻道。僅私訊轉發允許管理員回覆後自動私訊對方。"""
+    """私訊或群組 @ 機器人 -> 轉發到管理頻道。
+    管理員回覆：私訊轉發 -> DM；群組 @ 轉發 -> 在原頻道以機器人代發（不 DM）。"""
     ch = bot.get_channel(DM_RELAY_CHANNEL_ID)
     if ch is None:
         try:
@@ -1719,12 +1743,7 @@ async def _post_staff_reply_to_guild_channel(
     if not text and not files_first:
         raise RuntimeError("沒有可發送的文字或附件")
 
-    parts: typing.List[str] = []
-    if text:
-        for i in range(0, len(text), 2000):
-            parts.append(text[i : i + 2000])
-    else:
-        parts = [""]
+    parts: typing.List[str] = _split_discord_message_chunks(text) if text else [""]
 
     am = discord.AllowedMentions(users=[discord.Object(id=target_user_id)])
     first_chunk = True
@@ -1734,10 +1753,10 @@ async def _post_staff_reply_to_guild_channel(
         if part:
             if first_chunk and ref_msg is None:
                 prefix = f"<@{target_user_id}> "
-                room = max(0, 2000 - len(prefix))
+                room = max(0, DISCORD_MESSAGE_CAP - len(prefix))
                 body = prefix + part[:room]
             else:
-                body = part[:2000]
+                body = part[:DISCORD_MESSAGE_CAP]
             kwargs: typing.Dict[str, typing.Any] = {"content": body, "allowed_mentions": am}
             if use_ref is not None:
                 kwargs["reference"] = use_ref
@@ -1804,9 +1823,8 @@ async def relay_staff_reply_to_dm_user(message: discord.Message) -> bool:
 
     try:
         user = await bot.fetch_user(uid)
-        if text:
-            for chunk_start in range(0, len(text), 2000):
-                await user.send(text[chunk_start : chunk_start + 2000])
+        for chunk in _split_discord_message_chunks(text):
+            await user.send(chunk)
         for att in message.attachments:
             try:
                 data = await att.read()
@@ -1858,22 +1876,33 @@ async def vc_reward_task():
     await bot.wait_until_ready()
     while not bot.is_closed():
         await asyncio.sleep(600)
-        now, conn = datetime.datetime.now(), get_db_connection(); c = conn.cursor()
-        awarded_users = set()
+        now = datetime.datetime.now()
+        conn = get_db_connection()
+        c = conn.cursor()
+        awarded_users: typing.Set[str] = set()
         for guild in bot.guilds:
             for vc in guild.voice_channels:
                 for member in vc.members:
-                    if member.bot or member.voice.self_deaf or member.voice.deaf: continue
+                    if member.bot or member.voice.self_deaf or member.voice.deaf:
+                        continue
                     user_id = str(member.id)
-                    if user_id in awarded_users: continue
+                    if user_id in awarded_users:
+                        continue
                     c.execute("SELECT last_vc_reward FROM activity_stats WHERE user_id=%s", (user_id,))
                     row = c.fetchone()
                     if not row or row[0] is None or (now - row[0]).total_seconds() >= 1800:
-                        c.execute("INSERT INTO users (user_id, balance) VALUES (%s, 500) ON DUPLICATE KEY UPDATE balance=balance+500", (user_id,))
-                        c.execute("INSERT INTO activity_stats (user_id, last_vc_reward) VALUES (%s, %s) ON DUPLICATE KEY UPDATE last_vc_reward=%s", (user_id, now, now))
+                        c.execute(
+                            "INSERT INTO users (user_id, balance) VALUES (%s, 500) ON DUPLICATE KEY UPDATE balance=balance+500",
+                            (user_id,),
+                        )
+                        c.execute(
+                            "INSERT INTO activity_stats (user_id, last_vc_reward) VALUES (%s, %s) ON DUPLICATE KEY UPDATE last_vc_reward=%s",
+                            (user_id, now, now),
+                        )
                         log_transaction(user_id, 500, "語音通話獎勵 (10min)")
                         awarded_users.add(user_id)
-        conn.commit(); conn.close()
+        conn.commit()
+        conn.close()
 
 @bot.event
 async def on_message(message):
@@ -1884,11 +1913,11 @@ async def on_message(message):
         if message.guild is None:
             await relay_dm_to_staff_channel(message)
             return
-        # 管理頻道：回覆轉發訊息 -> 私訊使用者（略過 Webhook）
+        # 管理頻道：回覆轉發訊息 -> DM 或原頻道代發（略過 Webhook）
         if message.channel.id == DM_RELAY_CHANNEL_ID:
             if not message.webhook_id and await relay_staff_reply_to_dm_user(message):
                 return
-        # 任一伺服器頻道 @ 機器人（不在轉接頻道本身，避免洗版）-> 與私訊相同轉發並可回覆私訊
+        # 任一伺服器頻道 @ 機器人（略過轉接頻道）-> 轉發後可依類型回覆
         if (
             message.guild
             and message.channel.id != DM_RELAY_CHANNEL_ID
@@ -1959,7 +1988,8 @@ async def daily(interaction: discord.Interaction):
     now_tw = datetime.datetime.now(tz)
     today_tw = now_tw.date()
     
-    conn = get_db_connection(); c = conn.cursor()
+    conn = get_db_connection()
+    c = conn.cursor()
     c.execute("SELECT last_claim FROM daily_claims WHERE user_id=%s", (str(interaction.user.id),))
     row = c.fetchone()
     
@@ -1970,9 +2000,14 @@ async def daily(interaction: discord.Interaction):
         conn.close()
         return await interaction.response.send_message(f"⚠️ 你今天已經簽到過囉！下次簽到時間：<t:{ts}:F> (<t:{ts}:R>)", ephemeral=True)
         
-    c.execute("INSERT INTO daily_claims (user_id, last_claim) VALUES (%s, %s) ON DUPLICATE KEY UPDATE last_claim=%s", (str(interaction.user.id), today_tw, today_tw))
+    c.execute(
+        "INSERT INTO daily_claims (user_id, last_claim) VALUES (%s, %s) ON DUPLICATE KEY UPDATE last_claim=%s",
+        (str(interaction.user.id), today_tw, today_tw),
+    )
     c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (daily_reward, str(interaction.user.id)))
-    conn.commit(); conn.close(); log_transaction(interaction.user.id, daily_reward, "每日簽到")
+    conn.commit()
+    conn.close()
+    log_transaction(interaction.user.id, daily_reward, "每日簽到")
     new_bal = get_user_stats(interaction.user.id)[0]
     
     # 計算下一次領取時間
@@ -2016,11 +2051,14 @@ async def hourly(interaction: discord.Interaction):
 @bot.tree.command(name="beg", description="街頭乞討")
 async def beg(interaction: discord.Interaction):
     ensure_user_exists(interaction.user.id, 50000)
-    conn = get_db_connection(); c = conn.cursor()
+    conn = get_db_connection()
+    c = conn.cursor()
     c.execute("SELECT balance, last_beg FROM users WHERE user_id=%s", (str(interaction.user.id),))
     row = c.fetchone()
     now = datetime.datetime.now()
-    if row[1] and (now - row[1]).total_seconds() < 120: return await interaction.response.send_message("太快了", ephemeral=True)
+    if row[1] and (now - row[1]).total_seconds() < 120:
+        conn.close()
+        return await interaction.response.send_message("太快了", ephemeral=True)
     inflation_mult, _, _ = get_inflation_multiplier()
     base_earn = random.randint(100, 600)
     earn = max(50, int(base_earn * inflation_mult))
@@ -2031,7 +2069,8 @@ async def beg(interaction: discord.Interaction):
         c.execute("UPDATE users SET balance=balance+%s, last_beg=%s WHERE user_id=%s", (earn, now, str(interaction.user.id)))
         log_transaction(interaction.user.id, earn, "乞討所得")
         await interaction.response.send_message(f"你獲得了{earn}東雲幣!錢給你啦 乞丐!")
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
 
 @bot.tree.command(name="rob", description="搶劫其他玩家（高風險高報酬）")
 @app_commands.describe(member="要搶劫的對象（選人）", user_id="或填使用者 ID／貼提及")
@@ -2144,21 +2183,38 @@ async def rob(
 @bot.tree.command(name="rescue", description="破產救濟計畫，餘額為 0 元時可領 1,000 (每人限領 10 次)")
 async def rescue(interaction: discord.Interaction):
     ensure_user_exists(interaction.user.id, 50000)
-    conn = get_db_connection(); c = conn.cursor()
+    conn = get_db_connection()
+    c = conn.cursor()
     c.execute("SELECT balance, last_rescue, rescue_count FROM users WHERE user_id=%s", (str(interaction.user.id),))
     row = c.fetchone()
-    if row[0] > 0: return await interaction.response.send_message(f"💰 還沒破產（餘額: {row[0]}），請這位賭狗先去賭到傾家蕩產！完全歸零時再來領。", ephemeral=True)
-    if row[2] >= 10: return await interaction.response.send_message("🚫 抱歉，你的救濟次數已達 10 次上限。這輩子不能再領了，賭鬼！", ephemeral=True)
+    if row[0] > 0:
+        conn.close()
+        return await interaction.response.send_message(
+            f"💰 還沒破產（餘額: {row[0]}），請這位賭狗先去賭到傾家蕩產！完全歸零時再來領。",
+            ephemeral=True,
+        )
+    if row[2] >= 10:
+        conn.close()
+        return await interaction.response.send_message(
+            "🚫 抱歉，你的救濟次數已達 10 次上限。這輩子不能再領了，賭鬼！",
+            ephemeral=True,
+        )
     
     now = datetime.datetime.now()
     if row[1] and (now - row[1]).total_seconds() < 3600:
         rem = 3600 - (now - row[1]).total_seconds()
+        conn.close()
         return await interaction.response.send_message(f"🕒 銀行還不想給你錢！請再等 `{int(rem//60)}` 分鐘。", ephemeral=True)
         
     inflation_mult, _, _ = get_inflation_multiplier()
     rescue_reward = max(500, min(50000, int(1000 * inflation_mult)))
-    c.execute("UPDATE users SET balance=balance+%s, last_rescue=%s, rescue_count=rescue_count+1 WHERE user_id=%s", (rescue_reward, now, str(interaction.user.id)))
-    conn.commit(); conn.close(); log_transaction(interaction.user.id, rescue_reward, "賭狗破產救濟")
+    c.execute(
+        "UPDATE users SET balance=balance+%s, last_rescue=%s, rescue_count=rescue_count+1 WHERE user_id=%s",
+        (rescue_reward, now, str(interaction.user.id)),
+    )
+    conn.commit()
+    conn.close()
+    log_transaction(interaction.user.id, rescue_reward, "賭狗破產救濟")
     claim_no = row[2] + 1
     embed = discord.Embed(title="✅ 破產救濟發放", color=discord.Color.green())
     embed.add_field(name="獲得", value=f"`{rescue_reward:,}` 東雲幣", inline=False)
@@ -3386,13 +3442,15 @@ async def give_slash(
         return await interaction.response.send_message(err, ephemeral=True)
     member = m_user
     ensure_user_exists(member.id, 0)
-    conn = get_db_connection(); c = conn.cursor()
+    conn = get_db_connection()
+    c = conn.cursor()
     c.execute("SELECT balance FROM users WHERE user_id=%s", (str(member.id),))
     before_row = c.fetchone()
     before_bal = int((before_row[0] if before_row else 0) or 0)
     c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (amount, str(member.id)))
     after_bal = before_bal + amount
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
     note_text = (note or "").strip()
     if len(note_text) > 100:
         note_text = note_text[:100]
@@ -3431,13 +3489,15 @@ async def take_slash(
         return await interaction.response.send_message(err, ephemeral=True)
     member = m_user
     ensure_user_exists(member.id, 0)
-    conn = get_db_connection(); c = conn.cursor()
+    conn = get_db_connection()
+    c = conn.cursor()
     c.execute("SELECT balance FROM users WHERE user_id=%s", (str(member.id),))
     before_row = c.fetchone()
     before_bal = int((before_row[0] if before_row else 0) or 0)
     c.execute("UPDATE users SET balance=GREATEST(0, balance-%s) WHERE user_id=%s", (amount, str(member.id)))
     after_bal = max(0, before_bal - amount)
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
     note_text = (note or "").strip()
     if len(note_text) > 100:
         note_text = note_text[:100]
@@ -3466,9 +3526,11 @@ async def ban_slash(
     if err:
         return await interaction.response.send_message(err, ephemeral=True)
     member = m_user
-    conn = get_db_connection(); c = conn.cursor()
+    conn = get_db_connection()
+    c = conn.cursor()
     c.execute("INSERT IGNORE INTO blacklist (user_id) VALUES (%s)", (str(member.id),))
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
     await interaction.response.send_message(f"{member.mention} 已加入黑名單。")
 
 @bot.tree.command(name="unban", description="[管理員] 將玩家移出黑名單")
@@ -3486,27 +3548,33 @@ async def unban_slash(
     if err:
         return await interaction.response.send_message(err, ephemeral=True)
     member = m_user
-    conn = get_db_connection(); c = conn.cursor()
+    conn = get_db_connection()
+    c = conn.cursor()
     c.execute("DELETE FROM blacklist WHERE user_id=%s", (str(member.id),))
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
     await interaction.response.send_message(f"{member.mention} 已解除黑名單。")
 
 @bot.tree.command(name="resetall_zero", description="[管理員] 全伺服器餘額清零")
 async def resetall_zero_slash(interaction: discord.Interaction):
     if not is_slash_host(interaction):
         return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
-    conn = get_db_connection(); c = conn.cursor()
+    conn = get_db_connection()
+    c = conn.cursor()
     c.execute("UPDATE users SET balance=0")
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
     await interaction.response.send_message("💥 全伺服器帳戶餘額已清零。")
 
 @bot.tree.command(name="resetall_default", description="[管理員] 全伺服器重置為 50,000")
 async def resetall_default_slash(interaction: discord.Interaction):
     if not is_slash_host(interaction):
         return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
-    conn = get_db_connection(); c = conn.cursor()
+    conn = get_db_connection()
+    c = conn.cursor()
     c.execute("UPDATE users SET balance=50000, rescue_count=0, total_games=0, wins=0, total_profit=0")
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
     await interaction.response.send_message("🔄 全服已重置為 50,000，並重置統計。")
 
 @bot.tree.command(name="clear_tournament_players", description="[管理員] 清空比賽報名資料")
