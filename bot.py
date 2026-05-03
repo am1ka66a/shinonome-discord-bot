@@ -1626,8 +1626,8 @@ async def _resolve_relay_dm_user_id(channel: discord.abc.GuildChannel, message: 
     return None
 
 
-async def relay_dm_to_staff_channel(message: discord.Message) -> None:
-    """使用者私訊機器人 -> 轉發到管理頻道並記錄對應訊息 ID。"""
+async def relay_user_message_to_staff_channel(message: discord.Message, *, is_dm: bool) -> None:
+    """私訊或群組 @ 機器人 -> 轉發到管理頻道；管理員回覆轉發訊息可私訊原使用者（共用映射）。"""
     ch = bot.get_channel(DM_RELAY_CHANNEL_ID)
     if ch is None:
         try:
@@ -1640,9 +1640,18 @@ async def relay_dm_to_staff_channel(message: discord.Message) -> None:
         return
     author = message.author
     text = (message.content or "").strip()
-    emb = discord.Embed(title="📩 私訊轉發", color=0x5865F2, timestamp=datetime.datetime.now(datetime.timezone.utc))
+    title = "📩 私訊轉發" if is_dm else "📣 群組 @ 機器人"
+    emb = discord.Embed(title=title, color=0x5865F2, timestamp=datetime.datetime.now(datetime.timezone.utc))
     emb.set_author(name=str(author), icon_url=author.display_avatar.url)
     emb.add_field(name="發送者", value=f"<@{author.id}> ｜ ID `{author.id}`", inline=False)
+    if not is_dm and message.guild:
+        gname = discord.utils.escape_markdown(message.guild.name or "")
+        emb.add_field(name="伺服器", value=f"{gname}（`{message.guild.id}`）", inline=False)
+        emb.add_field(
+            name="頻道／原訊",
+            value=f"{message.channel.mention}\n[前往原訊息]({message.jump_url})",
+            inline=False,
+        )
     emb.description = text[:4096] if text else "（無文字內容）"
     att_urls = [a.url for a in message.attachments[:10]]
     if att_urls:
@@ -1657,6 +1666,11 @@ async def relay_dm_to_staff_channel(message: discord.Message) -> None:
         allowed_mentions=discord.AllowedMentions(users=[discord.Object(id=notify_id)]),
     )
     _relay_bot_msg_to_dm_user[sent.id] = author.id
+
+
+async def relay_dm_to_staff_channel(message: discord.Message) -> None:
+    """使用者私訊機器人 -> 轉發到管理頻道。"""
+    await relay_user_message_to_staff_channel(message, is_dm=True)
 
 
 async def relay_staff_reply_to_dm_user(message: discord.Message) -> bool:
@@ -1759,6 +1773,14 @@ async def on_message(message):
         if message.channel.id == DM_RELAY_CHANNEL_ID:
             if not message.webhook_id and await relay_staff_reply_to_dm_user(message):
                 return
+        # 任一伺服器頻道 @ 機器人（不在轉接頻道本身，避免洗版）-> 與私訊相同轉發並可回覆私訊
+        if (
+            message.guild
+            and message.channel.id != DM_RELAY_CHANNEL_ID
+            and bot.user is not None
+            and bot.user in message.mentions
+        ):
+            await relay_user_message_to_staff_channel(message, is_dm=False)
         if not message.guild:
             return
         user_id = str(message.author.id)
