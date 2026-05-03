@@ -131,8 +131,9 @@ _last_exp_award_ts: typing.Dict[str, float] = {}
 DM_RELAY_CHANNEL_ID = int(os.getenv("DM_RELAY_CHANNEL_ID", "1500383156186906764"))
 # 轉發到頻道時 @ 通知對象（預設此 Discord ID，可用 DM_RELAY_NOTIFY_USER_ID 覆寫）
 DM_RELAY_NOTIFY_USER_ID = int(os.getenv("DM_RELAY_NOTIFY_USER_ID", "531308526262550528"))
-# 轉發訊息 ID -> (原發話者 user_id, 是否允許在管理頻道回覆後自動私訊對方) — 僅私訊轉發為 True；群組 @ 為 False
-_relay_forward_meta: typing.Dict[int, typing.Tuple[int, bool]] = {}
+# 轉發訊息 ID -> (原 user_id, 是否私訊回覆, guild_id, channel_id, message_id)
+# 私訊轉發：(..., True, 0,0,0)；群組 @：(..., False, 原訊所在 guild/channel/message)
+_relay_forward_meta: typing.Dict[int, typing.Tuple[int, bool, int, int, int]] = {}
 
 _discord_log_handler_installed = False
 
@@ -1610,8 +1611,8 @@ bot = ShinonomeBot(command_prefix="!", intents=intents)
 
 async def _resolve_relay_from_staff_reply(
     channel: discord.abc.GuildChannel, message: discord.Message
-) -> typing.Optional[typing.Tuple[int, bool]]:
-    """沿回覆鏈找到機器人轉發訊息，回傳 (原使用者 ID, 是否可私訊回覆)。"""
+) -> typing.Optional[typing.Tuple[int, bool, int, int, int]]:
+    """沿回覆鏈找到機器人轉發訊息，回傳完整 relay meta。"""
     ref_id = message.reference.message_id if message.reference and message.reference.message_id else None
     seen: typing.Set[int] = set()
     while ref_id and ref_id not in seen:
@@ -1669,7 +1670,93 @@ async def relay_user_message_to_staff_channel(message: discord.Message, *, is_dm
         embed=emb,
         allowed_mentions=discord.AllowedMentions(users=[discord.Object(id=notify_id)]),
     )
-    _relay_forward_meta[sent.id] = (author.id, is_dm)
+    if is_dm:
+        _relay_forward_meta[sent.id] = (author.id, True, 0, 0, 0)
+    elif message.guild:
+        _relay_forward_meta[sent.id] = (
+            author.id,
+            False,
+            message.guild.id,
+            message.channel.id,
+            message.id,
+        )
+    else:
+        _relay_forward_meta[sent.id] = (author.id, False, 0, 0, 0)
+
+
+async def _post_staff_reply_to_guild_channel(
+    target_user_id: int,
+    _guild_id: int,
+    channel_id: int,
+    original_message_id: int,
+    staff_msg: discord.Message,
+) -> None:
+    """在原伺服器頻道以機器人身分回覆使用者原訊息（不發私訊）。"""
+    text = (staff_msg.content or "").strip()
+    ch = bot.get_channel(channel_id)
+    if ch is None:
+        try:
+            ch = await bot.fetch_channel(channel_id)
+        except Exception as e:
+            raise RuntimeError(f"無法取得頻道：{e}") from e
+    if not isinstance(ch, discord.abc.Messageable):
+        raise RuntimeError("目標不是可發言頻道")
+
+    ref_msg: typing.Optional[discord.Message] = None
+    try:
+        ref_msg = await ch.fetch_message(original_message_id)
+    except discord.NotFound:
+        ref_msg = None
+
+    files_first: typing.List[discord.File] = []
+    for att in staff_msg.attachments:
+        try:
+            data = await att.read()
+            files_first.append(discord.File(io.BytesIO(data), filename=att.filename or "attachment"))
+        except Exception:
+            continue
+
+    if not text and not files_first:
+        raise RuntimeError("沒有可發送的文字或附件")
+
+    parts: typing.List[str] = []
+    if text:
+        for i in range(0, len(text), 2000):
+            parts.append(text[i : i + 2000])
+    else:
+        parts = [""]
+
+    am = discord.AllowedMentions(users=[discord.Object(id=target_user_id)])
+    first_chunk = True
+    for idx, part in enumerate(parts):
+        use_ref = ref_msg if (first_chunk and ref_msg is not None) else None
+        fs = files_first if idx == 0 else []
+        if part:
+            if first_chunk and ref_msg is None:
+                prefix = f"<@{target_user_id}> "
+                room = max(0, 2000 - len(prefix))
+                body = prefix + part[:room]
+            else:
+                body = part[:2000]
+            kwargs: typing.Dict[str, typing.Any] = {"content": body, "allowed_mentions": am}
+            if use_ref is not None:
+                kwargs["reference"] = use_ref
+            if fs:
+                kwargs["files"] = fs
+            await ch.send(**kwargs)
+        elif idx == 0 and fs:
+            kwargs = {"allowed_mentions": am}
+            if ref_msg is not None:
+                kwargs["reference"] = ref_msg
+                kwargs["files"] = fs
+                await ch.send(**kwargs)
+            else:
+                await ch.send(
+                    content=f"<@{target_user_id}>（附件）",
+                    files=fs,
+                    allowed_mentions=am,
+                )
+        first_chunk = False
 
 
 async def relay_dm_to_staff_channel(message: discord.Message) -> None:
@@ -1678,22 +1765,13 @@ async def relay_dm_to_staff_channel(message: discord.Message) -> None:
 
 
 async def relay_staff_reply_to_dm_user(message: discord.Message) -> bool:
-    """管理員在轉接頻道「回覆」轉發訊息：僅「私訊轉發」會自動私訊對方；群組 @ 轉發只提示至原頻道回覆。"""
+    """管理員在轉接頻道回覆轉發：私訊轉發 -> DM 對方；群組 @ 轉發 -> 在原頻道以機器人代發回覆（不私訊）。"""
     if message.channel.id != DM_RELAY_CHANNEL_ID:
         return False
     resolved = await _resolve_relay_from_staff_reply(message.channel, message)
     if resolved is None:
         return False
-    uid, allow_private_reply = resolved
-    if not allow_private_reply:
-        try:
-            await message.reply(
-                "此則來自群組中的 @ 機器人，**不會**自動私訊對方；請到原頻道／原訊息回覆。",
-                mention_author=False,
-            )
-        except Exception:
-            pass
-        return True
+    uid, allow_private_reply, og_gid, og_cid, og_mid = resolved
     text = (message.content or "").strip()
     if not text and not message.attachments:
         try:
@@ -1701,6 +1779,29 @@ async def relay_staff_reply_to_dm_user(message: discord.Message) -> bool:
         except Exception:
             pass
         return True
+
+    if not allow_private_reply:
+        if not og_cid or not og_mid:
+            try:
+                await message.reply("❌ 找不到原訊息位置，無法代發到群組。", mention_author=False)
+            except Exception:
+                pass
+            return True
+        try:
+            await _post_staff_reply_to_guild_channel(uid, og_gid, og_cid, og_mid, message)
+        except Exception as e:
+            logger.exception("代發群組回覆失敗: %s", e)
+            try:
+                await message.reply(f"❌ 無法在原頻道代發：{e}", mention_author=False)
+            except Exception:
+                pass
+            return True
+        try:
+            await message.add_reaction("✅")
+        except Exception:
+            pass
+        return True
+
     try:
         user = await bot.fetch_user(uid)
         if text:
