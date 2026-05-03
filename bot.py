@@ -1,3 +1,9 @@
+# ==============================================================================
+# 【一】匯入套件與環境變數
+# 載入 discord.py、aiohttp、pymysql 等依賴，並以 python-dotenv 讀取 .env
+# （DISCORD_TOKEN、MYSQL_URL、轉接頻道與等級／股市相關設定）。
+# ==============================================================================
+
 import asyncio
 import datetime
 import io
@@ -19,6 +25,12 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# ==============================================================================
+# 【二】日誌系統
+# 設定主程式 Logger（主控台、可選 log 檔）；啟動後可選擇再掛「Discord 頻道轉發」
+#（見【四】），把重要 log 非同步貼到指定文字頻道方便遠端查看。
+# ==============================================================================
 
 
 def setup_bot_logging() -> logging.Logger:
@@ -56,9 +68,11 @@ def setup_bot_logging() -> logging.Logger:
 
 logger = setup_bot_logging()
 
-# ==========================================
-# ⚙️ 系統設定與全局變數
-# ==========================================
+# ==============================================================================
+# 【三】全域常數、執行期狀態、轉接用對照與靜態資料
+# 含：管理員 ID、賭場／等級／搶紅包／台股快取、訊息與 EXP 冷卻、
+# 私訊轉接頻道與「轉發訊息 ID -> 原訊中繼」表格、Minecraft 死法／物品詞庫（JSON）。
+# ==============================================================================
 ALLOWED_HOST_IDS = [
     531308526262550528,
     600177596088582185,
@@ -146,6 +160,12 @@ _relay_forward_meta: typing.Dict[int, RelayForwardMeta] = {}
 
 _discord_log_handler_installed = False
 
+# ==============================================================================
+# 【四】Discord 頻道日誌轉發
+# 自訂 logging.Handler，把 Python logging 的內容用非同步方式貼到指定文字頻道
+#（與轉接頻道可相同或分開，由 LOG_DISCORD_CHANNEL_ID 控制）。
+# ==============================================================================
+
 
 class DiscordLogHandler(logging.Handler):
     """將 logging 轉成非同步發送到 Discord 文字頻道（避免阻塞 logging）。"""
@@ -212,7 +232,11 @@ def register_discord_log_handler(client: commands.Bot) -> None:
     except Exception as e:
         logger.warning("無法註冊 Discord 日誌 handler: %s", e)
 
-# 等級里程碑：僅在**第一次到達** Lv.20/40/60/80/100 時發私訊、可領幣；自動加身分組**僅**在 .env 指定的伺服器（LEVEL_MILESTONE_GUILD_ID）
+# ==============================================================================
+# 【五】等級里程碑（獎勵幣、私訊文案、身分組）
+# 在首次達到 Lv.20/40/60/80/100 時觸發獎勵與可選身分組；伺服器與各階 role ID
+# 由 LEVEL_MILESTONE_GUILD_ID、LEVEL_ROLE_ID_* 等環境變數決定。
+# ==============================================================================
 LEVEL_MILE_TIERS: typing.Tuple[int, ...] = (20, 40, 60, 80, 100)
 LEVEL_MILESTONE_COINS: typing.Dict[int, int] = {
     20: 500_000,
@@ -250,6 +274,13 @@ def level_auto_role_id(milestone: int) -> typing.Optional[int]:
         return int(raw)
     except ValueError:
         return None
+
+# ==============================================================================
+# 【六】指令權限與 Slash 共用工具
+# 前綴指令的 hosts 檢查、訊息字元切分、解析使用者 ID／提及、以及 Slash 中依「成員
+# 或手填 ID」解析目標成員或 User（搶劫／轉帳／後台等情境共用）。
+# ==============================================================================
+
 
 def is_host():
     def predicate(ctx):
@@ -334,9 +365,14 @@ async def resolve_slash_target(
         return None, f"無法查詢使用者：{e}"
 
 
-# ==========================================
-# 🗄️ 1. 資料庫系統 (MySQL)
-# ==========================================
+# ==============================================================================
+# 【七】MySQL 與核心業務邏輯
+# 連線與資料表初始化；使用者餘額／交易／黑名單／通膨；二十一點與統計；等級與 EXP、
+# 里程碑領獎、時薪銀行；台股 API 與快取；錦標賽資料結構與晉級；排行榜取樣輔助等。
+# （二十一點「牌面」介面邏輯在【八】【九】）
+# ==============================================================================
+
+
 def get_db_connection():
     mysql_url = os.getenv('MYSQL_URL') or os.getenv('DATABASE_URL')
     if mysql_url:
@@ -988,9 +1024,12 @@ async def get_realtime_rank_data(sample_size=220):
         scored.append((q["pct"], q))
     return scored, rows
 
-# ==========================================
-# 🃏 2. 核心遊戲邏輯 (6副牌)
-# ==========================================
+# ==============================================================================
+# 【八】二十一點：牌組、算分、旁注與牌局訊息更新
+# 多副牌洗牌、手牌點數（含 A）、對子／21+3 旁注結算、以及嵌入式訊息編輯流程。
+# ==============================================================================
+
+
 def get_deck(num_decks=6):
     suits = ['♥️', '♦️', '♣️', '♠️']
     ranks = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A']
@@ -1067,9 +1106,12 @@ def check_sidebets(player_hand, dealer_up, p_bet, s_bet):
             res_msg += f"🎯 21+3 未中 -{s_bet} "
     return total_p, res_msg
 
-# ==========================================
-# 🖼️ 3. 遊戲 UI 區塊
-# ==========================================
+# ==============================================================================
+# 【九】Discord 互動介面（UI）
+# 自訂下注 Modal、二十一點主 View 與相關按鈕、全下確認、新局、紅包搶領、台股清單翻頁等。
+# ==============================================================================
+
+
 class BetModal(discord.ui.Modal, title='自訂下注金額'):
     def __init__(self, view):
         super().__init__()
@@ -1553,7 +1595,12 @@ class StockPagerView(discord.ui.View):
         except Exception:
             pass
 
-# --- 4. 指令系統 ---
+# ==============================================================================
+# 【十】Intents、開發者診斷指令、Bot 子類別與實例
+# 啟用訊息內容與私訊相關意圖；註冊僅限開發者的 /dev_list_guilds；自訂 setup_hook
+# 以決定該指令要 guild 註冊或全域；最後建立全域 bot 物件供事件與 Slash 掛載。
+# ==============================================================================
+
 intents = discord.Intents.default()
 intents.message_content = True
 if hasattr(intents, "dm_messages"):
@@ -1628,8 +1675,11 @@ class ShinonomeBot(commands.Bot):
 
 bot = ShinonomeBot(command_prefix="!", intents=intents)
 
-
-# ---------- 私訊／群組 ↔ 轉接頻道 relay ----------
+# ==============================================================================
+# 【十一】私訊／群組 @ ↔ 管理頻道轉接（Relay）
+# 將使用者私訊或群組 @ 機器人轉到固定管理頻道；工作人員在該頻道回覆時，依來源
+# 改以「私訊使用者」或「回到原頻道以機器人代發」回應（不洗版、不私訊群組案）。
+# ==============================================================================
 
 
 async def _resolve_relay_from_staff_reply(
@@ -1849,6 +1899,13 @@ async def relay_staff_reply_to_dm_user(message: discord.Message) -> bool:
             pass
     return True
 
+# ==============================================================================
+# 【十二】事件迴圈：啟動、語音掛機獎勵、一般訊息
+# on_ready：DB 初始化、Slash 同步、掛 Discord 日誌、排程語音通道定期發獎。
+# on_message：私訊轉接、轉接頻道內工作人員回覆、群組 @ 轉發、聊天句數與 EXP 等。
+# ==============================================================================
+
+
 @bot.event
 async def on_ready():
     register_discord_log_handler(bot)
@@ -1978,7 +2035,12 @@ async def on_message(message):
     finally:
         await bot.process_commands(message)
 
-# --- Slash ---
+# ==============================================================================
+# 【十三】Slash 指令：經濟、小遊戲、轉帳、股市、排行榜、管理公告等
+# 含每日／每小時簽到、乞討搶劫救濟、21 點、餘額與等級查詢、轉帳、紅包、台股、
+# /say、戰報、賭場統計、排行榜（不含錦標賽專區與「僅主機」後台）。
+# ==============================================================================
+
 @bot.tree.command(name="daily", description="每日簽到領取 100,000 東雲幣")
 async def daily(interaction: discord.Interaction):
     ensure_user_exists(interaction.user.id, 50000)
@@ -2742,6 +2804,11 @@ async def lvleaderboard(interaction: discord.Interaction):
     else:
         await interaction.response.send_message(embed=emb)
 
+# ==============================================================================
+# 【十四】Slash 指令：錦標賽（報名、賽程、比分、晉級與管理員裁定）
+# 報名與卡組、發布對戰表、比分提交與雙方確認、晉級鏈、管理員改判／重開場次等。
+# ==============================================================================
+
 @bot.tree.command(name="check_players", description="[管理員] 查看所有報名玩家與卡組")
 async def check_players(interaction: discord.Interaction):
     if not interaction.guild or not interaction.user.guild_permissions.administrator:
@@ -3343,6 +3410,13 @@ async def tournament_admin_reopen_match(interaction: discord.Interaction, round_
     await interaction.response.send_message(
         f"🔄 已重開 R{round_no} M{match_no}（`{p1 or 'TBD'}` vs `{p2 or 'TBD'}`），並回滾後續晉級鏈。"
     )
+
+# ==============================================================================
+# 【十五】Slash：主機後台、長文分行工具與程式進入點
+# 限 ALLOWED_HOST_IDS 的 /give、/ban、全服重置等；_chunk_text_lines 供多則訊息列表
+# 排版；最後以 DISCORD_TOKEN 啟動 bot。
+# ==============================================================================
+
 
 def is_slash_host(interaction: discord.Interaction):
     return interaction.user.id in ALLOWED_HOST_IDS
