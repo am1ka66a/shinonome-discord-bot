@@ -131,7 +131,8 @@ _last_exp_award_ts: typing.Dict[str, float] = {}
 DM_RELAY_CHANNEL_ID = int(os.getenv("DM_RELAY_CHANNEL_ID", "1500383156186906764"))
 # 轉發到頻道時 @ 通知對象（預設此 Discord ID，可用 DM_RELAY_NOTIFY_USER_ID 覆寫）
 DM_RELAY_NOTIFY_USER_ID = int(os.getenv("DM_RELAY_NOTIFY_USER_ID", "531308526262550528"))
-_relay_bot_msg_to_dm_user: typing.Dict[int, int] = {}
+# 轉發訊息 ID -> (原發話者 user_id, 是否允許在管理頻道回覆後自動私訊對方) — 僅私訊轉發為 True；群組 @ 為 False
+_relay_forward_meta: typing.Dict[int, typing.Tuple[int, bool]] = {}
 
 _discord_log_handler_installed = False
 
@@ -1607,14 +1608,17 @@ class ShinonomeBot(commands.Bot):
 bot = ShinonomeBot(command_prefix="!", intents=intents)
 
 
-async def _resolve_relay_dm_user_id(channel: discord.abc.GuildChannel, message: discord.Message) -> typing.Optional[int]:
+async def _resolve_relay_from_staff_reply(
+    channel: discord.abc.GuildChannel, message: discord.Message
+) -> typing.Optional[typing.Tuple[int, bool]]:
+    """沿回覆鏈找到機器人轉發訊息，回傳 (原使用者 ID, 是否可私訊回覆)。"""
     ref_id = message.reference.message_id if message.reference and message.reference.message_id else None
     seen: typing.Set[int] = set()
     while ref_id and ref_id not in seen:
         seen.add(ref_id)
-        u = _relay_bot_msg_to_dm_user.get(ref_id)
-        if u is not None:
-            return u
+        meta = _relay_forward_meta.get(ref_id)
+        if meta is not None:
+            return meta
         try:
             ref_msg = await channel.fetch_message(ref_id)
         except Exception:
@@ -1627,7 +1631,7 @@ async def _resolve_relay_dm_user_id(channel: discord.abc.GuildChannel, message: 
 
 
 async def relay_user_message_to_staff_channel(message: discord.Message, *, is_dm: bool) -> None:
-    """私訊或群組 @ 機器人 -> 轉發到管理頻道；管理員回覆轉發訊息可私訊原使用者（共用映射）。"""
+    """私訊或群組 @ 機器人 -> 轉發到管理頻道。僅私訊轉發允許管理員回覆後自動私訊對方。"""
     ch = bot.get_channel(DM_RELAY_CHANNEL_ID)
     if ch is None:
         try:
@@ -1665,7 +1669,7 @@ async def relay_user_message_to_staff_channel(message: discord.Message, *, is_dm
         embed=emb,
         allowed_mentions=discord.AllowedMentions(users=[discord.Object(id=notify_id)]),
     )
-    _relay_bot_msg_to_dm_user[sent.id] = author.id
+    _relay_forward_meta[sent.id] = (author.id, is_dm)
 
 
 async def relay_dm_to_staff_channel(message: discord.Message) -> None:
@@ -1674,12 +1678,22 @@ async def relay_dm_to_staff_channel(message: discord.Message) -> None:
 
 
 async def relay_staff_reply_to_dm_user(message: discord.Message) -> bool:
-    """管理員在轉接頻道「回覆」轉發訊息 -> 私訊原使用者。成功回傳 True。"""
+    """管理員在轉接頻道「回覆」轉發訊息：僅「私訊轉發」會自動私訊對方；群組 @ 轉發只提示至原頻道回覆。"""
     if message.channel.id != DM_RELAY_CHANNEL_ID:
         return False
-    uid = await _resolve_relay_dm_user_id(message.channel, message)
-    if uid is None:
+    resolved = await _resolve_relay_from_staff_reply(message.channel, message)
+    if resolved is None:
         return False
+    uid, allow_private_reply = resolved
+    if not allow_private_reply:
+        try:
+            await message.reply(
+                "此則來自群組中的 @ 機器人，**不會**自動私訊對方；請到原頻道／原訊息回覆。",
+                mention_author=False,
+            )
+        except Exception:
+            pass
+        return True
     text = (message.content or "").strip()
     if not text and not message.attachments:
         try:
