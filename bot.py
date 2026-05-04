@@ -84,6 +84,8 @@ MAX_LEVEL = 100
 # Discord 單則訊息字元上限（與 API 一致）
 DISCORD_MESSAGE_CAP = 2000
 EXP_COOLDOWN_SECONDS = 45
+# 發話經驗 = random(12,20) × 此倍數（冷卻不變）
+CHAT_EXP_MULTIPLIER = 3
 # 每完成一局 21 點結算時加發的隨機 EXP（見 roll_gamble_exp_from_bet）
 GAMBLE_EXP_MIN = 12
 GAMBLE_EXP_MAX = 38
@@ -2046,7 +2048,7 @@ async def on_message(message):
         row = c.fetchone()
 
         if exp_due:
-            exp_gain = random.randint(12, 20)
+            exp_gain = random.randint(12, 20) * CHAT_EXP_MULTIPLIER
             ensure_user_exists(message.author.id, 50000)
             exp_result = add_user_exp(user_id, exp_gain)
             if exp_result and exp_result[1] > exp_result[0]:
