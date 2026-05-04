@@ -1069,9 +1069,11 @@ class SetupView(discord.ui.View):
             return await inter.followup.send("餘額不足", ephemeral=True)
         self.stop()
         gv = BlackjackGame(self.user, self.base_bet, self.p_bet, self.s_bet, upfront_cost=total_cost)
-        await _send_game(inter.channel, gv, interaction=inter)
-        msg = await inter.original_response()
-        asyncio.create_task(gv.check_auto_bj(msg))
+        msg = await _send_game(inter.channel, gv, interaction=inter)
+        if msg is not None:
+            await gv.check_auto_bj(msg)
+        else:
+            logger.error("21點 SetupView.start：_send_game 未回傳訊息，略過自動 BJ 結算 user=%s", inter.user.id)
 
     @discord.ui.button(label="自訂下注金額", style=discord.ButtonStyle.primary)
     async def custom_bet(self, inter, btn):
@@ -1163,8 +1165,10 @@ class BlackjackGame(discord.ui.View):
     async def check_auto_bj(self, message):
         if len(self.p_hand) == 2 and calculate_score(self.p_hand) == 21:
             await asyncio.sleep(1.5)
-            try: await self.advance_hand(message_obj=message)
-            except: pass
+            try:
+                await self.advance_hand(message_obj=message)
+            except Exception:
+                logger.exception("21點 check_auto_bj 自動結算失敗 user=%s", self.user.id)
 
     async def end(self, res, prof, win=False, is_push=False, message_obj=None, interaction=None):
         if getattr(self, '_game_over', False): return
@@ -1302,7 +1306,8 @@ class ConfirmAllInView(discord.ui.View):
         except: pass
         gv = BlackjackGame(self.user, stats[0], 0, 0)
         msg = await _send_game(inter.channel, gv)
-        asyncio.create_task(gv.check_auto_bj(msg))
+        if msg is not None:
+            await gv.check_auto_bj(msg)
 
 class NewGameView(discord.ui.View):
     def __init__(self, user, last_bet, last_p_bet, last_s_bet, current_bal):
@@ -1318,9 +1323,13 @@ class NewGameView(discord.ui.View):
         total_cost = self.last_bet + self.last_p_bet + self.last_s_bet
         if not try_deduct_balance(self.user.id, total_cost, "21點開局扣款"):
             return await inter.followup.send("餘額不足", ephemeral=True)
-        self.stop(); gv = BlackjackGame(self.user, self.last_bet, self.last_p_bet, self.last_s_bet, upfront_cost=total_cost)
-        await _send_game(inter.channel, gv, interaction=inter)
-        msg = await inter.original_response(); asyncio.create_task(gv.check_auto_bj(msg))
+        self.stop()
+        gv = BlackjackGame(self.user, self.last_bet, self.last_p_bet, self.last_s_bet, upfront_cost=total_cost)
+        msg = await _send_game(inter.channel, gv, interaction=inter)
+        if msg is not None:
+            await gv.check_auto_bj(msg)
+        else:
+            logger.error("21點 NewGameView.again：_send_game 未回傳訊息，略過自動 BJ 結算 user=%s", inter.user.id)
     @discord.ui.button(label="雙倍再局 (Double)", style=discord.ButtonStyle.primary)
     async def double_again(self, inter, btn):
         if inter.user.id != self.user.id: return
@@ -1329,9 +1338,13 @@ class NewGameView(discord.ui.View):
         total_cost = new_bet + self.last_p_bet + self.last_s_bet
         if not try_deduct_balance(self.user.id, total_cost, "21點開局扣款"):
             return await inter.followup.send("餘額不足", ephemeral=True)
-        self.stop(); gv = BlackjackGame(self.user, new_bet, self.last_p_bet, self.last_s_bet, upfront_cost=total_cost)
-        await _send_game(inter.channel, gv, interaction=inter)
-        msg = await inter.original_response(); asyncio.create_task(gv.check_auto_bj(msg))
+        self.stop()
+        gv = BlackjackGame(self.user, new_bet, self.last_p_bet, self.last_s_bet, upfront_cost=total_cost)
+        msg = await _send_game(inter.channel, gv, interaction=inter)
+        if msg is not None:
+            await gv.check_auto_bj(msg)
+        else:
+            logger.error("21點 NewGameView.double_again：_send_game 未回傳訊息，略過自動 BJ 結算 user=%s", inter.user.id)
     @discord.ui.button(label="修改下注", style=discord.ButtonStyle.secondary)
     async def modify_bet(self, inter, btn):
         self.stop(); await inter.response.defer()
