@@ -2063,6 +2063,73 @@ async def on_message(message):
 # /say、戰報、賭場統計、排行榜（不含錦標賽專區與「僅主機」後台）。
 # ==============================================================================
 
+
+@bot.tree.command(name="help", description="機器人指令總覽（一般玩家）")
+async def help_slash(interaction: discord.Interaction):
+    """東雲幣、賭場、通緝／警察、等級與錦標賽等 Slash 說明（不含主機／管理員專用指令）。"""
+    emb = discord.Embed(
+        title="📖 東雲機器人指令說明",
+        description="以下為**一般玩家**常用指令；管理／主機專用請見伺服公告或管理員。",
+        color=0x5865F2,
+    )
+    emb.add_field(
+        name="💰 日常與經濟",
+        value=(
+            "`/daily` — 每日簽到領幣\n"
+            "`/hourly` — 每小時簽到（依等級累積）\n"
+            "`/beg` — 乞討\n"
+            "`/rob` — 搶劫（高風險；搶匪身分會累積通緝）\n"
+            "`/rescue` — 破產救濟（餘額 0 時）\n"
+            "`/transfer` — 轉帳給其他玩家\n"
+            "`/redpacket` — 發紅包\n"
+            "`/record` — 最近帳務紀錄（翻頁）\n"
+            "`/balance` — 餘額與戰績"
+        ),
+        inline=False,
+    )
+    emb.add_field(
+        name="🃏 賭場與等級",
+        value=(
+            "`/bj` — 二十一點\n"
+            "`/level` — 等級與 EXP\n"
+            "`/leaderboard` — 餘額榜前 10\n"
+            "`/lvleaderboard` — 等級榜前 10\n"
+            "`/casino_stats` — 賭場金流統計"
+        ),
+        inline=False,
+    )
+    emb.add_field(
+        name="🚔 通緝與警察",
+        value=(
+            "`/role_choose` — 選擇警察或搶匪身分\n"
+            "`/wanted_status` — 自己的通緝、監獄、搶劫紀錄\n"
+            "`/cop_hunt` — 警察追捕通緝犯（僅警察）\n"
+            f"`/bail` — 入獄時繳假釋金 `{BAIL_COST:,}` 出獄"
+        ),
+        inline=False,
+    )
+    emb.add_field(
+        name="🏆 錦標賽（玩家）",
+        value=(
+            "`/tournament_register` — 報名與卡組\n"
+            "`/tournament_update_deck` — 更新卡組\n"
+            "`/tournament_list` — 報名名單（翻頁）\n"
+            "`/tournament_window_show` — 報名時間窗\n"
+            "`/tournament_bracket` — 賽程表\n"
+            "`/tournament_submit_score` — 提交比分\n"
+            "`/tournament_confirm_score` — 確認比分"
+        ),
+        inline=False,
+    )
+    emb.add_field(
+        name="🎮 其他",
+        value="`/kill` — Minecraft 風格隨機死法（需選本群成員）",
+        inline=False,
+    )
+    emb.set_footer(text="私訊轉接、群組 @ 機器人可聯繫管理員｜管理員請用 /adminhelp（僅主機）")
+    await interaction.response.send_message(embed=emb, ephemeral=True)
+
+
 @bot.tree.command(name="daily", description="每日簽到領取 100,000 東雲幣")
 async def daily(interaction: discord.Interaction):
     ensure_user_exists(interaction.user.id, 50000)
@@ -4074,6 +4141,8 @@ async def adminhelp_slash(interaction: discord.Interaction):
     if not is_slash_host(interaction):
         return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
     help_text = """**👑 管理員 Slash 指令清單**
+一般玩家說明請用：`/help`
+
 /give member amount - 發錢
 /take member amount - 扣錢
 /ban member - 黑名單
