@@ -423,6 +423,59 @@ def init_db():
     except: pass
     try: c.execute("ALTER TABLE users ADD COLUMN hourly_bank INT DEFAULT 0")
     except: pass
+    # 警察／搶匪／通緝／監獄
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN role VARCHAR(20) DEFAULT 'civilian'")
+    except Exception:
+        pass
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN wanted_stars INT DEFAULT 0")
+    except Exception:
+        pass
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN wanted_hunted_count INT DEFAULT 0")
+    except Exception:
+        pass
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN last_five_robs TEXT NULL")
+    except Exception:
+        pass
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN in_prison TINYINT(1) DEFAULT 0")
+    except Exception:
+        pass
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN prison_start TIMESTAMP NULL")
+    except Exception:
+        pass
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN arrest_count INT DEFAULT 0")
+    except Exception:
+        pass
+
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS wanted_log (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        criminal_id VARCHAR(255) NOT NULL,
+        cop_id VARCHAR(255) NOT NULL,
+        wanted_stars INT NOT NULL,
+        caught TINYINT(1) DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )"""
+    )
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS prison_records (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        criminal_id VARCHAR(255) NOT NULL,
+        cop_id VARCHAR(255) NOT NULL,
+        wanted_stars INT NOT NULL,
+        confiscated_amount BIGINT NOT NULL,
+        cop_reward BIGINT NOT NULL,
+        bail_cost BIGINT DEFAULT 100000,
+        arrested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        released_at TIMESTAMP NULL
+        )"""
+    )
 
     c.execute('''CREATE TABLE IF NOT EXISTS activity_stats 
                  (user_id VARCHAR(255) PRIMARY KEY, msg_count INT DEFAULT 0, 
@@ -544,6 +597,65 @@ def get_inflation_multiplier():
     # 低風險範圍：避免獎勵暴衝或過低
     multiplier = max(0.5, min(5.0, multiplier))
     return multiplier, circulation, avg_balance
+
+
+# 假釋金（出獄一次）
+BAIL_COST = 100_000
+
+
+def append_rob_history_on_cursor(c, user_id: int, steal_amount: int) -> None:
+    """在同一 DB cursor／交易中更新搶匪最近五次成功搶劫紀錄（JSON 陣列）。"""
+    uid_str = str(user_id)
+    c.execute("SELECT last_five_robs FROM users WHERE user_id=%s", (uid_str,))
+    row = c.fetchone()
+    history: typing.List[typing.Any] = []
+    raw = row[0] if row else None
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            history = parsed if isinstance(parsed, list) else []
+        except Exception:
+            history = []
+    history.append(
+        {
+            "amount": int(steal_amount),
+            "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    )
+    history = history[-5:]
+    c.execute(
+        "UPDATE users SET last_five_robs=%s WHERE user_id=%s",
+        (json.dumps(history, ensure_ascii=False), uid_str),
+    )
+
+
+def get_last_five_robs_total(user_id: typing.Union[int, str]) -> typing.Tuple[int, int, typing.List[typing.Any]]:
+    """回傳 (五次內搶劫總額, 筆數, 明細列表)。"""
+    uid = str(user_id)
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT last_five_robs FROM users WHERE user_id=%s", (uid,))
+    row = c.fetchone()
+    conn.close()
+    if not row or not row[0]:
+        return 0, 0, []
+    try:
+        history = json.loads(row[0])
+    except Exception:
+        return 0, 0, []
+    if not isinstance(history, list):
+        return 0, 0, []
+    total = sum(int(item.get("amount", 0) or 0) for item in history if isinstance(item, dict))
+    return total, len(history), history
+
+
+def clear_rob_history(user_id: typing.Union[int, str]) -> None:
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("UPDATE users SET last_five_robs=NULL WHERE user_id=%s", (str(user_id),))
+    conn.commit()
+    conn.close()
+
 
 def try_deduct_balance(user_id, amount, reason):
     if amount <= 0:
@@ -2069,6 +2181,15 @@ async def rob(
 
     conn = get_db_connection()
     c = conn.cursor()
+    c.execute(
+        "SELECT COALESCE(in_prison,0) FROM users WHERE user_id=%s",
+        (str(interaction.user.id),),
+    )
+    _pr = c.fetchone()
+    if _pr and int(_pr[0] or 0):
+        conn.close()
+        return await interaction.response.send_message("🔒 你在監獄裡無法搶劫。", ephemeral=True)
+
     c.execute("SELECT balance, last_rob, level FROM users WHERE user_id=%s", (str(interaction.user.id),))
     robber_row = c.fetchone()
     c.execute("SELECT balance, level, last_robbed FROM users WHERE user_id=%s", (str(member.id),))
@@ -2121,12 +2242,51 @@ async def rob(
             return await interaction.response.send_message("對方及時把錢藏好了，這次搶劫失敗。")
         c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (steal_amount, str(interaction.user.id)))
         c.execute("UPDATE users SET last_robbed=%s WHERE user_id=%s", (now, str(member.id)))
+        append_rob_history_on_cursor(c, interaction.user.id, steal_amount)
+
+        wanted_info = ""
+        c.execute(
+            "SELECT COALESCE(role,'civilian'), COALESCE(wanted_stars,0) FROM users WHERE user_id=%s",
+            (str(interaction.user.id),),
+        )
+        role_row = c.fetchone()
+        role = (role_row[0] or "civilian") if role_row else "civilian"
+        current_wanted = int(role_row[1] or 0) if role_row else 0
+
+        if role == "criminal":
+            if current_wanted < 5:
+                c.execute(
+                    "UPDATE users SET wanted_stars=LEAST(5, COALESCE(wanted_stars,0)+1), wanted_hunted_count=0 WHERE user_id=%s",
+                    (str(interaction.user.id),),
+                )
+                c.execute("SELECT COALESCE(wanted_stars,0) FROM users WHERE user_id=%s", (str(interaction.user.id),))
+                _nw = c.fetchone()
+                new_wanted = int(_nw[0] or 0) if _nw else 0
+                stars_display = "⭐" * new_wanted + "☆" * (5 - new_wanted)
+                if new_wanted == 5:
+                    wanted_info = (
+                        f"\n🔴 **達到最高通緝！** {stars_display}\n"
+                        f"⚠️ 每次搶劫成功後警察可追捕一次。"
+                    )
+                else:
+                    cap = min(95, 20 + new_wanted * 10)
+                    wanted_info = (
+                        f"\n⚠️ **通緝等級提升** → {stars_display}（{new_wanted}/5）\n"
+                        f"🚔 若遭追捕，成功率約：**{cap}%**"
+                    )
+            else:
+                c.execute(
+                    "UPDATE users SET wanted_hunted_count=0 WHERE user_id=%s",
+                    (str(interaction.user.id),),
+                )
+                wanted_info = "\n🔴 **滿星通緝中** ⭐⭐⭐⭐⭐\n🚔 每次搶劫成功後警察可追捕一次（成功率約 **70%**）。"
+
         conn.commit()
         conn.close()
         log_transaction(interaction.user.id, steal_amount, f"搶劫成功（目標:{member.id}）")
         log_transaction(member.id, -steal_amount, f"被搶劫（搶匪:{interaction.user.id}）")
         return await interaction.response.send_message(
-            f"{robber_name}搶了{victim_name}`{steal_amount:,}`東雲幣!!"
+            f"{robber_name}搶了{victim_name}`{steal_amount:,}`東雲幣!!{wanted_info}"
         )
 
     fail_penalty = int(max(1, min(robber_balance * random.uniform(0.15, 0.45), 1_000_000)))
@@ -2151,6 +2311,348 @@ async def rob(
     return await interaction.response.send_message(
         f"{robber_name}失手了! 反而被{victim_name}搶了`{fail_penalty:,}`東雲幣!"
     )
+
+
+@bot.tree.command(name="role_choose", description="選擇警察或搶匪陣營（影響通緝與追捕玩法）")
+@app_commands.describe(role="陣營：cop=警察、criminal=搶匪")
+@app_commands.choices(
+    role=[
+        app_commands.Choice(name="警察 cop", value="cop"),
+        app_commands.Choice(name="搶匪 criminal", value="criminal"),
+    ]
+)
+async def role_choose_slash(interaction: discord.Interaction, role: str):
+    if role not in ("cop", "criminal"):
+        return await interaction.response.send_message(
+            "❌ 請選擇 **警察 (cop)** 或 **搶匪 (criminal)**。",
+            ephemeral=True,
+        )
+    ensure_user_exists(interaction.user.id, 50000)
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT COALESCE(role,'civilian') FROM users WHERE user_id=%s", (str(interaction.user.id),))
+    row = c.fetchone()
+    old_role = (row[0] or "civilian") if row else "civilian"
+    if role == "cop":
+        c.execute(
+            "UPDATE users SET role=%s, wanted_stars=0, wanted_hunted_count=0 WHERE user_id=%s",
+            (role, str(interaction.user.id)),
+        )
+    else:
+        c.execute("UPDATE users SET role=%s WHERE user_id=%s", (role, str(interaction.user.id)))
+    conn.commit()
+    conn.close()
+
+    role_name = "🚔 警察" if role == "cop" else "🔪 搶匪"
+    old_role_name = (
+        "🚔 警察"
+        if old_role == "cop"
+        else ("🔪 搶匪" if old_role == "criminal" else "👤 平民")
+    )
+    emb = discord.Embed(
+        title="✅ 角色選擇成功",
+        description=f"從 {old_role_name} 切換為 {role_name}",
+        color=0x57F287,
+    )
+    if role == "cop":
+        emb.add_field(
+            name="🚔 警察",
+            value=(
+                "• 使用 `/cop_hunt` 選擇通緝犯並嘗試逮捕\n"
+                "• 成功可獲得其「最近五次搶劫成功」總額\n"
+                "• 通緝規則見 `/wanted_status`"
+            ),
+            inline=False,
+        )
+    else:
+        emb.add_field(
+            name="🔪 搶匪",
+            value=(
+                "• `/rob` 搶劫成功會累積通緝星（最高 5）\n"
+                "• 星級越高，遭追捕時成功率越高\n"
+                "• 入獄後可用 `/bail` 繳假釋金出獄"
+            ),
+            inline=False,
+        )
+    await interaction.response.send_message(embed=emb)
+
+
+@bot.tree.command(name="cop_hunt", description="警察追捕通緝犯（成功可獲贓款、對方入獄）")
+@app_commands.describe(
+    member="通緝犯（選人）",
+    user_id="或填使用者 ID／貼提及",
+)
+async def cop_hunt_slash(
+    interaction: discord.Interaction,
+    member: typing.Optional[discord.Member] = None,
+    user_id: typing.Optional[str] = None,
+):
+    criminal_user, err = await resolve_slash_target(
+        interaction, member, user_id, required=True, in_guild_only=False
+    )
+    if err:
+        return await interaction.response.send_message(err, ephemeral=True)
+
+    ensure_user_exists(interaction.user.id, 50000)
+    ensure_user_exists(criminal_user.id, 0)
+    criminal_id = str(criminal_user.id)
+    cop_id = str(interaction.user.id)
+
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT COALESCE(role,'civilian') FROM users WHERE user_id=%s", (cop_id,))
+    cop_row = c.fetchone()
+    if not cop_row or cop_row[0] != "cop":
+        conn.close()
+        return await interaction.response.send_message(
+            "❌ 只有**警察**可以追捕。請先用 `/role_choose` 選擇警察。",
+            ephemeral=True,
+        )
+
+    c.execute(
+        "SELECT COALESCE(wanted_stars,0), COALESCE(wanted_hunted_count,0), COALESCE(balance,0), COALESCE(in_prison,0) FROM users WHERE user_id=%s",
+        (criminal_id,),
+    )
+    criminal_row = c.fetchone()
+    if not criminal_row:
+        conn.close()
+        return await interaction.response.send_message("❌ 找不到該玩家資料。", ephemeral=True)
+
+    wanted_stars = int(criminal_row[0] or 0)
+    hunted_count = int(criminal_row[1] or 0)
+    criminal_balance = int(criminal_row[2] or 0)
+    in_prison = int(criminal_row[3] or 0)
+
+    if in_prison:
+        conn.close()
+        return await interaction.response.send_message(
+            f"ℹ️ {criminal_user.mention} 已在監獄中，無法追捕。",
+            ephemeral=True,
+        )
+    if wanted_stars <= 0:
+        conn.close()
+        return await interaction.response.send_message(
+            f"ℹ️ {criminal_user.mention} 目前沒有通緝度。",
+            ephemeral=True,
+        )
+    if criminal_id == cop_id:
+        conn.close()
+        return await interaction.response.send_message("❌ 不能追捕自己。", ephemeral=True)
+
+    can_hunt = hunted_count == 0
+    if wanted_stars <= 4:
+        hunt_rule = f"{wanted_stars}★：本星級僅能追捕一次（失敗或成功後需再升星或滿星規則）。"
+    else:
+        hunt_rule = "5★：每次搶劫成功後可追捕一次（本輪若已追捕過則需等對方再搶劫成功）。"
+
+    if not can_hunt:
+        conn.close()
+        return await interaction.response.send_message(
+            f"❌ 目前無法追捕。\n{hunt_rule}",
+            ephemeral=True,
+        )
+
+    capture_chance = min(95, 20 + wanted_stars * 10)
+    is_caught = random.random() * 100.0 < float(capture_chance)
+    now = datetime.datetime.now()
+
+    c.execute(
+        "INSERT INTO wanted_log (criminal_id, cop_id, wanted_stars, caught) VALUES (%s, %s, %s, %s)",
+        (criminal_id, cop_id, wanted_stars, 1 if is_caught else 0),
+    )
+
+    if is_caught:
+        last_five_total, rob_count, rob_history = get_last_five_robs_total(criminal_id)
+        cop_reward = int(last_five_total)
+        c.execute("SELECT COALESCE(balance,0) FROM users WHERE user_id=%s", (criminal_id,))
+        bal_row = c.fetchone()
+        criminal_balance = int(bal_row[0] or 0) if bal_row else 0
+        confiscated_amount = min(int(criminal_balance * 0.4), criminal_balance)
+        remaining_bal = max(0, criminal_balance - confiscated_amount)
+
+        c.execute(
+            """UPDATE users SET in_prison=1, prison_start=%s,
+               balance=GREATEST(0, balance-%s), arrest_count=arrest_count+1,
+               wanted_stars=0, wanted_hunted_count=0, last_five_robs=NULL
+               WHERE user_id=%s""",
+            (now, confiscated_amount, criminal_id),
+        )
+        c.execute(
+            "UPDATE users SET balance=balance+%s WHERE user_id=%s",
+            (cop_reward, cop_id),
+        )
+        c.execute(
+            """INSERT INTO prison_records
+               (criminal_id, cop_id, wanted_stars, confiscated_amount, cop_reward, bail_cost, arrested_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+            (criminal_id, cop_id, wanted_stars, confiscated_amount, cop_reward, BAIL_COST, now),
+        )
+        conn.commit()
+        conn.close()
+
+        log_transaction(criminal_id, -confiscated_amount, f"被警察逮捕沒收 {confiscated_amount:,}")
+        log_transaction(cop_id, cop_reward, f"逮捕通緝犯 {criminal_user.id} 贓款")
+
+        rob_detail = ""
+        if rob_history:
+            rob_detail = "\n**最近搶劫紀錄：**\n"
+            for i, rob in enumerate(rob_history, 1):
+                if isinstance(rob, dict):
+                    rob_detail += f"{i}. `{int(rob.get('amount',0)):,}` 幣（{rob.get('time','')}）\n"
+
+        emb = discord.Embed(
+            title="✅ 追捕成功",
+            description=f"🚔 {interaction.user.mention} 逮捕了 🔪 {criminal_user.mention}",
+            color=0x57F287,
+        )
+        emb.add_field(name="通緝星級", value="⭐" * wanted_stars, inline=True)
+        emb.add_field(name="追捕成功率（本輪）", value=f"`{capture_chance}%`", inline=True)
+        emb.add_field(
+            name="警察獲得（最近五次搶劫成功總額）",
+            value=f"`{cop_reward:,}` 東雲幣（{rob_count} 筆）",
+            inline=False,
+        )
+        emb.add_field(name="沒收（約 40% 餘額）", value=f"`{confiscated_amount:,}` 東雲幣", inline=True)
+        emb.add_field(name="罪犯剩餘餘額", value=f"`{remaining_bal:,}` 東雲幣", inline=True)
+        if rob_detail:
+            emb.add_field(name="搶劫紀錄", value=rob_detail[:1000], inline=False)
+        emb.add_field(
+            name="入獄",
+            value=f"通緝歸零、搶劫紀錄清空。假釋：`{BAIL_COST:,}` 幣（`/bail`）",
+            inline=False,
+        )
+        await interaction.response.send_message(embed=emb)
+        return
+
+    c.execute(
+        "UPDATE users SET wanted_hunted_count=1 WHERE user_id=%s",
+        (criminal_id,),
+    )
+    conn.commit()
+    conn.close()
+
+    last_five_total, rob_count, rob_history = get_last_five_robs_total(criminal_id)
+    rob_detail = ""
+    if rob_history:
+        rob_detail = "\n**最近搶劫紀錄：**\n"
+        for i, rob in enumerate(rob_history, 1):
+            if isinstance(rob, dict):
+                rob_detail += f"{i}. `{int(rob.get('amount',0)):,}` 幣\n"
+
+    emb = discord.Embed(
+        title="❌ 追捕失敗",
+        description=f"🔪 {criminal_user.mention} 逃過了 🚔 {interaction.user.mention} 的追捕",
+        color=0xED4245,
+    )
+    emb.add_field(name="通緝星級", value="⭐" * wanted_stars, inline=True)
+    emb.add_field(name="本次追捕成功率", value=f"`{capture_chance}%`", inline=True)
+    emb.add_field(
+        name="若成功可獲（最近五次搶劫總額）",
+        value=f"`{last_five_total:,}` 東雲幣（{rob_count} 筆）",
+        inline=False,
+    )
+    if rob_detail:
+        emb.add_field(name="搶劫紀錄", value=rob_detail[:1000], inline=False)
+    emb.add_field(name="規則", value=hunt_rule, inline=False)
+    if wanted_stars >= 5:
+        emb.set_footer(text="對方若再次搶劫成功，你可再追捕一次。")
+    else:
+        emb.set_footer(text="對方通緝升星後，你可再嘗試追捕。")
+    await interaction.response.send_message(embed=emb)
+
+
+@bot.tree.command(name="wanted_status", description="查看自己的陣營、通緝、監獄狀態與最近搶劫紀錄")
+async def wanted_status_slash(interaction: discord.Interaction):
+    ensure_user_exists(interaction.user.id, 50000)
+    uid = str(interaction.user.id)
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute(
+        """SELECT COALESCE(role,'civilian'), COALESCE(wanted_stars,0), COALESCE(wanted_hunted_count,0),
+                  COALESCE(in_prison,0), last_five_robs, COALESCE(arrest_count,0)
+           FROM users WHERE user_id=%s""",
+        (uid,),
+    )
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return await interaction.response.send_message("找不到資料。", ephemeral=True)
+    role, stars, hunted, in_pr, raw_hist, arrests = row
+    role_s = role or "civilian"
+    stars_i = int(stars or 0)
+    hunted_i = int(hunted or 0)
+    in_pr_i = int(in_pr or 0)
+    arrests_i = int(arrests or 0)
+
+    role_disp = {"cop": "🚔 警察", "criminal": "🔪 搶匪"}.get(role_s, "👤 平民")
+    emb = discord.Embed(title="📋 通緝／監獄狀態", color=0x5865F2)
+    emb.add_field(name="陣營", value=role_disp, inline=True)
+    emb.add_field(name="通緝星", value=("⭐" * stars_i + "☆" * (5 - stars_i)) if stars_i <= 5 else str(stars_i), inline=True)
+    emb.add_field(name="本輪可追捕", value="否（已嘗試）" if hunted_i else "是", inline=True)
+    emb.add_field(name="監獄", value="🔒 在押" if in_pr_i else "否", inline=True)
+    emb.add_field(name="累計被捕次數", value=str(arrests_i), inline=True)
+
+    hist_lines = ""
+    if raw_hist:
+        try:
+            h = json.loads(raw_hist)
+            if isinstance(h, list) and h:
+                for i, item in enumerate(h[-5:], 1):
+                    if isinstance(item, dict):
+                        hist_lines += f"{i}. `{int(item.get('amount',0)):,}` — {item.get('time','')}\n"
+        except Exception:
+            hist_lines = "（紀錄格式異常）"
+    emb.add_field(
+        name="最近搶劫成功紀錄（最多五筆）",
+        value=hist_lines[:1000] if hist_lines else "（無）",
+        inline=False,
+    )
+    emb.set_footer(text=f"假釋金：{BAIL_COST:,} 幣 ｜ 使用 /bail 出獄")
+    await interaction.response.send_message(embed=emb, ephemeral=True)
+
+
+@bot.tree.command(name="bail", description=f"繳納假釋金 {BAIL_COST:,} 東雲幣出獄")
+async def bail_slash(interaction: discord.Interaction):
+    ensure_user_exists(interaction.user.id, 0)
+    uid = str(interaction.user.id)
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute(
+        "SELECT COALESCE(in_prison,0), COALESCE(balance,0) FROM users WHERE user_id=%s",
+        (uid,),
+    )
+    row = c.fetchone()
+    if not row or not int(row[0] or 0):
+        conn.close()
+        return await interaction.response.send_message("你不在監獄裡。", ephemeral=True)
+    bal = int(row[1] or 0)
+    if bal < BAIL_COST:
+        conn.close()
+        return await interaction.response.send_message(
+            f"假釋需要 `{BAIL_COST:,}` 東雲幣，你的餘額不足。",
+            ephemeral=True,
+        )
+    now = datetime.datetime.now()
+    c.execute(
+        """UPDATE users SET balance=balance-%s, in_prison=0, prison_start=NULL
+           WHERE user_id=%s AND balance >= %s""",
+        (BAIL_COST, uid, BAIL_COST),
+    )
+    if c.rowcount == 0:
+        conn.close()
+        return await interaction.response.send_message("扣款失敗（餘額不足）。", ephemeral=True)
+    c.execute(
+        "UPDATE prison_records SET released_at=%s WHERE criminal_id=%s AND released_at IS NULL ORDER BY id DESC LIMIT 1",
+        (now, uid),
+    )
+    conn.commit()
+    conn.close()
+    log_transaction(interaction.user.id, -BAIL_COST, "監獄假釋金")
+    await interaction.response.send_message(
+        f"✅ 已繳納 `{BAIL_COST:,}` 東雲幣，你已出獄。",
+        ephemeral=True,
+    )
+
 
 @bot.tree.command(name="rescue", description="破產救濟計畫，餘額為 0 元時可領 1,000 (每人限領 10 次)")
 async def rescue(interaction: discord.Interaction):
