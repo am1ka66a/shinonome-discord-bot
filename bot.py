@@ -2115,7 +2115,7 @@ async def help_slash(interaction: discord.Interaction):
     emb.add_field(
         name="🚔 通緝與警察",
         value=(
-            "`/role_choose` — 選擇警察或搶匪身分（搶匪須 **0 星通緝** 才可轉警察）\n"
+            "`/role_choose` — 選警察／搶匪／平民（搶匪須 **0 星通緝** 才可轉警察或平民）\n"
             "`/wanted_status` — 自己的通緝、監獄、搶劫紀錄\n"
             "`/wanted_list` — 目前通緝名單（不含 0 星）與可否追捕\n"
             "`/cop_hunt` — 警察追捕通緝犯（僅警察）\n"
@@ -2413,18 +2413,19 @@ async def rob(
     )
 
 
-@bot.tree.command(name="role_choose", description="選擇警察或搶匪陣營（影響通緝與追捕玩法）")
-@app_commands.describe(role="陣營：cop=警察、criminal=搶匪")
+@bot.tree.command(name="role_choose", description="選擇警察、搶匪或回到平民（影響通緝與追捕玩法）")
+@app_commands.describe(role="陣營：cop=警察、criminal=搶匪、civilian=平民")
 @app_commands.choices(
     role=[
         app_commands.Choice(name="警察 cop", value="cop"),
         app_commands.Choice(name="搶匪 criminal", value="criminal"),
+        app_commands.Choice(name="平民 civilian", value="civilian"),
     ]
 )
 async def role_choose_slash(interaction: discord.Interaction, role: str):
-    if role not in ("cop", "criminal"):
+    if role not in ("cop", "criminal", "civilian"):
         return await interaction.response.send_message(
-            "❌ 請選擇 **警察 (cop)** 或 **搶匪 (criminal)**。",
+            "❌ 請從選單選擇 **警察**、**搶匪** 或 **平民**。",
             ephemeral=True,
         )
     ensure_user_exists(interaction.user.id, 50000)
@@ -2437,13 +2438,16 @@ async def role_choose_slash(interaction: discord.Interaction, role: str):
     row = c.fetchone()
     old_role = (row[0] or "civilian") if row else "civilian"
     wanted_now = int(row[1] or 0) if row else 0
-    if role == "cop" and old_role == "criminal" and wanted_now > 0:
+    if role == "civilian" and old_role == "civilian":
+        conn.close()
+        return await interaction.response.send_message("ℹ️ 你目前已是**平民**。", ephemeral=True)
+    if old_role == "criminal" and wanted_now > 0 and role in ("cop", "civilian"):
         conn.close()
         return await interaction.response.send_message(
-            f"❌ 搶匪轉警察須 **通緝 0 星**（目前 {wanted_now} 星）。請先透過追捕／入獄等流程歸零後再切換。",
+            f"❌ 搶匪轉為警察或平民須 **通緝 0 星**（目前 {wanted_now} 星）。請先透過追捕／入獄等流程歸零後再切換。",
             ephemeral=True,
         )
-    if role == "cop":
+    if role in ("cop", "civilian"):
         c.execute(
             "UPDATE users SET role=%s, wanted_stars=0, wanted_hunted_count=0 WHERE user_id=%s",
             (role, str(interaction.user.id)),
@@ -2453,7 +2457,11 @@ async def role_choose_slash(interaction: discord.Interaction, role: str):
     conn.commit()
     conn.close()
 
-    role_name = "🚔 警察" if role == "cop" else "🔪 搶匪"
+    role_name = (
+        "🚔 警察"
+        if role == "cop"
+        else ("🔪 搶匪" if role == "criminal" else "👤 平民")
+    )
     old_role_name = (
         "🚔 警察"
         if old_role == "cop"
@@ -2474,13 +2482,22 @@ async def role_choose_slash(interaction: discord.Interaction, role: str):
             ),
             inline=False,
         )
-    else:
+    elif role == "criminal":
         emb.add_field(
             name="🔪 搶匪",
             value=(
                 "• `/rob` 搶劫成功會累積通緝星（最高 5）\n"
                 "• 星級越高，遭追捕時成功率越高\n"
                 "• 入獄後可用 `/bail` 繳假釋金出獄"
+            ),
+            inline=False,
+        )
+    else:
+        emb.add_field(
+            name="👤 平民",
+            value=(
+                "• 不再以警察／搶匪身分參與通緝與追捕\n"
+                "• 可隨時再用 `/role_choose` 重新選擇陣營"
             ),
             inline=False,
         )
