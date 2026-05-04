@@ -2115,7 +2115,7 @@ async def help_slash(interaction: discord.Interaction):
     emb.add_field(
         name="🚔 通緝與警察",
         value=(
-            "`/role_choose` — 選擇警察或搶匪身分\n"
+            "`/role_choose` — 選擇警察或搶匪身分（搶匪須 **0 星通緝** 才可轉警察）\n"
             "`/wanted_status` — 自己的通緝、監獄、搶劫紀錄\n"
             "`/wanted_list` — 目前通緝名單（不含 0 星）與可否追捕\n"
             "`/cop_hunt` — 警察追捕通緝犯（僅警察）\n"
@@ -2430,9 +2430,19 @@ async def role_choose_slash(interaction: discord.Interaction, role: str):
     ensure_user_exists(interaction.user.id, 50000)
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT COALESCE(role,'civilian') FROM users WHERE user_id=%s", (str(interaction.user.id),))
+    c.execute(
+        "SELECT COALESCE(role,'civilian'), COALESCE(wanted_stars,0) FROM users WHERE user_id=%s",
+        (str(interaction.user.id),),
+    )
     row = c.fetchone()
     old_role = (row[0] or "civilian") if row else "civilian"
+    wanted_now = int(row[1] or 0) if row else 0
+    if role == "cop" and old_role == "criminal" and wanted_now > 0:
+        conn.close()
+        return await interaction.response.send_message(
+            f"❌ 搶匪轉警察須 **通緝 0 星**（目前 {wanted_now} 星）。請先透過追捕／入獄等流程歸零後再切換。",
+            ephemeral=True,
+        )
     if role == "cop":
         c.execute(
             "UPDATE users SET role=%s, wanted_stars=0, wanted_hunted_count=0 WHERE user_id=%s",
