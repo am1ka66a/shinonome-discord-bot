@@ -649,7 +649,7 @@ BAIL_COST = 100_000
 WANTED_BUYOUT_COST = 300_000
 WANTED_BUYOUT_COOLDOWN_SECONDS = 86400  # 24 小時內不可再次買斷
 # 警察每次 /cop_hunt 追捕前須支付（成敗皆扣）
-COP_HUNT_FEE = 100_000
+COP_HUNT_FEE = 500_000
 # 追捕成功率：min(95, 基底 + 通緝星 × 每星加成)；1★ = 30%
 COP_HUNT_CAPTURE_BASE_PCT = 25
 COP_HUNT_CAPTURE_PER_STAR_PCT = 5
@@ -2665,7 +2665,8 @@ async def cop_hunt_slash(
         c.execute("SELECT COALESCE(balance,0) FROM users WHERE user_id=%s", (criminal_id,))
         bal_row = c.fetchone()
         criminal_balance = int(bal_row[0] or 0) if bal_row else 0
-        confiscated_amount = min(int(criminal_balance * 0.4), criminal_balance)
+        confiscated_base = int(last_five_total * 0.6)
+        confiscated_amount = min(confiscated_base, criminal_balance)
         remaining_bal = max(0, criminal_balance - confiscated_amount)
 
         c.execute(
@@ -2716,7 +2717,7 @@ async def cop_hunt_slash(
             value=f"`{cop_reward:,}` 東雲幣（{rob_count} 筆）",
             inline=False,
         )
-        emb.add_field(name="沒收（約 40% 餘額）", value=f"`{confiscated_amount:,}` 東雲幣", inline=True)
+        emb.add_field(name="沒收（近五次贓款總和 60%）", value=f"`{confiscated_amount:,}` 東雲幣", inline=True)
         emb.add_field(name="罪犯剩餘餘額", value=f"`{remaining_bal:,}` 東雲幣", inline=True)
         if rob_detail:
             emb.add_field(name="搶劫紀錄", value=rob_detail[:1000], inline=False)
