@@ -2,5 +2,4 @@ discord.py==2.3.2
 python-dotenv==1.0.1
 PyMySQL==1.1.0
 DBUtils==3.1.0
-# audioop-lts 僅支援 Python 3.13+；Docker 映像為 3.11，加入會讓 pip 直接失敗。本專案未直接使用 audioop。
-# 若本機為 3.13 且執行時報缺 audioop，可手動：pip install audioop-lts
+audioop-lts>=0.2.1
