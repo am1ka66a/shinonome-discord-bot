@@ -648,6 +648,11 @@ BAIL_COST = 100_000
 # 搶匪付費消除通緝（全部星數與本輪追捕狀態）
 WANTED_BUYOUT_COST = 300_000
 WANTED_BUYOUT_COOLDOWN_SECONDS = 86400  # 24 小時內不可再次買斷
+# 警察每次 /cop_hunt 追捕前須支付（成敗皆扣）
+COP_HUNT_FEE = 100_000
+# 追捕成功率：min(95, 基底 + 通緝星 × 每星加成)
+COP_HUNT_CAPTURE_BASE_PCT = 20
+COP_HUNT_CAPTURE_PER_STAR_PCT = 5
 
 
 def append_rob_history_on_cursor(c, user_id: int, steal_amount: int) -> None:
@@ -2145,7 +2150,7 @@ async def help_slash(interaction: discord.Interaction):
             "`/role_choose` — 選警察／搶匪／平民（搶匪須 **0 星通緝** 才可轉警察或平民）\n"
             "`/wanted_status` — 自己的通緝、監獄、搶劫紀錄\n"
             "`/wanted_list` — 目前通緝名單（不含 0 星）與可否追捕\n"
-            "`/cop_hunt` — 警察追捕通緝犯（僅警察）\n"
+            f"`/cop_hunt` — 警察追捕通緝犯（僅警察；每次 **`{COP_HUNT_FEE:,}`** 東雲幣）\n"
             f"`/wanted_buyout` — [搶匪] 付 `{WANTED_BUYOUT_COST:,}` 消除全部通緝星（**24 小時**冷卻）\n"
             "`/counter_rob` — 平民被搶**成功**後限一次加倍搶回（約 **30%** 基礎、級差 ±1%；結果於**頻道公告**）\n"
             f"`/bail` — 入獄時繳假釋金 `{BAIL_COST:,}` 出獄"
@@ -2386,7 +2391,10 @@ async def rob(
                     f"⚠️ 每次搶劫成功後警察可追捕一次。"
                 )
             else:
-                cap = min(95, 20 + new_wanted * 10)
+                cap = min(
+                    95,
+                    COP_HUNT_CAPTURE_BASE_PCT + new_wanted * COP_HUNT_CAPTURE_PER_STAR_PCT,
+                )
                 wanted_info = (
                     f"\n⚠️ **通緝等級提升** → {stars_display}（{new_wanted}/5）\n"
                     f"🚔 若遭追捕，成功率約：**{cap}%**"
@@ -2396,7 +2404,14 @@ async def rob(
                 "UPDATE users SET wanted_hunted_count=0 WHERE user_id=%s",
                 (str(interaction.user.id),),
             )
-            wanted_info = "\n🔴 **滿星通緝中** ⭐⭐⭐⭐⭐\n🚔 每次搶劫成功後警察可追捕一次（成功率約 **70%**）。"
+            _cap5 = min(
+                95,
+                COP_HUNT_CAPTURE_BASE_PCT + 5 * COP_HUNT_CAPTURE_PER_STAR_PCT,
+            )
+            wanted_info = (
+                f"\n🔴 **滿星通緝中** ⭐⭐⭐⭐⭐\n"
+                f"🚔 每次搶劫成功後警察可追捕一次（成功率約 **`{_cap5}%`**）。"
+            )
 
         revenge_hint = ""
         c.execute(
@@ -2538,7 +2553,10 @@ async def role_choose_slash(interaction: discord.Interaction, role: str):
     await interaction.response.send_message(embed=emb)
 
 
-@bot.tree.command(name="cop_hunt", description="警察追捕通緝犯（成功可獲贓款、對方入獄）")
+@bot.tree.command(
+    name="cop_hunt",
+    description=f"警察追捕通緝犯（每次須付 {COP_HUNT_FEE:,} 東雲幣；成功可獲贓款、對方入獄）",
+)
 @app_commands.describe(
     member="通緝犯（選人）",
     user_id="或填使用者 ID／貼提及",
@@ -2613,7 +2631,21 @@ async def cop_hunt_slash(
             ephemeral=True,
         )
 
-    capture_chance = min(95, 20 + wanted_stars * 10)
+    c.execute(
+        "UPDATE users SET balance=balance-%s WHERE user_id=%s AND balance >= %s",
+        (COP_HUNT_FEE, cop_id, COP_HUNT_FEE),
+    )
+    if c.rowcount == 0:
+        conn.close()
+        return await interaction.response.send_message(
+            f"❌ 每次追捕須支付 **`{COP_HUNT_FEE:,}`** 東雲幣，你的餘額不足。",
+            ephemeral=True,
+        )
+
+    capture_chance = min(
+        95,
+        COP_HUNT_CAPTURE_BASE_PCT + wanted_stars * COP_HUNT_CAPTURE_PER_STAR_PCT,
+    )
     is_caught = random.random() * 100.0 < float(capture_chance)
     now = now_tw_naive()
 
@@ -2651,6 +2683,7 @@ async def cop_hunt_slash(
         conn.commit()
         conn.close()
 
+        log_transaction(cop_id, -COP_HUNT_FEE, "追捕行動費用")
         log_transaction(criminal_id, -confiscated_amount, f"被警察逮捕沒收 {confiscated_amount:,}")
         log_transaction(cop_id, cop_reward, f"逮捕通緝犯 {criminal_user.id} 贓款")
 
@@ -2668,6 +2701,11 @@ async def cop_hunt_slash(
         )
         emb.add_field(name="通緝星級", value="⭐" * wanted_stars, inline=True)
         emb.add_field(name="追捕成功率（本輪）", value=f"`{capture_chance}%`", inline=True)
+        emb.add_field(
+            name="追捕費用（已扣）",
+            value=f"`{COP_HUNT_FEE:,}` 東雲幣",
+            inline=True,
+        )
         emb.add_field(
             name="警察獲得（最近五次搶劫成功總額）",
             value=f"`{cop_reward:,}` 東雲幣（{rob_count} 筆）",
@@ -2692,6 +2730,8 @@ async def cop_hunt_slash(
     conn.commit()
     conn.close()
 
+    log_transaction(cop_id, -COP_HUNT_FEE, "追捕行動費用")
+
     last_five_total, rob_count, rob_history = get_last_five_robs_total(criminal_id)
     rob_detail = ""
     if rob_history:
@@ -2707,6 +2747,11 @@ async def cop_hunt_slash(
     )
     emb.add_field(name="通緝星級", value="⭐" * wanted_stars, inline=True)
     emb.add_field(name="本次追捕成功率", value=f"`{capture_chance}%`", inline=True)
+    emb.add_field(
+        name="追捕費用（已扣）",
+        value=f"`{COP_HUNT_FEE:,}` 東雲幣",
+        inline=True,
+    )
     emb.add_field(
         name="若成功可獲（最近五次搶劫總額）",
         value=f"`{last_five_total:,}` 東雲幣（{rob_count} 筆）",
