@@ -2034,39 +2034,6 @@ async def relay_staff_reply_to_dm_user(message: discord.Message) -> bool:
     return True
 
 
-async def _resolve_message_delete_actor(
-    guild: discord.Guild,
-    message: discord.Message,
-) -> typing.Optional[discord.abc.User]:
-    """嘗試從審計日誌找出刪除者（可能因權限或快取限制而失敗）。"""
-    if guild is None:
-        return None
-    try:
-        if guild.me and not guild.me.guild_permissions.view_audit_log:
-            return None
-    except Exception:
-        return None
-    try:
-        async for entry in guild.audit_logs(limit=6, action=discord.AuditLogAction.message_delete):
-            target = entry.target
-            if not isinstance(target, (discord.Member, discord.User)):
-                continue
-            if target.id != message.author.id:
-                continue
-            if entry.extra and getattr(entry.extra, "channel", None) and entry.extra.channel.id != message.channel.id:
-                continue
-            # 只採信接近刪除事件時間的紀錄（約 10 秒內）
-            try:
-                age = (datetime.datetime.now(datetime.timezone.utc) - entry.created_at).total_seconds()
-                if age > 10:
-                    continue
-            except Exception:
-                pass
-            return entry.user
-    except Exception:
-        return None
-    return None
-
 # ==============================================================================
 # 【十二】事件迴圈：啟動、語音掛機獎勵、一般訊息
 # on_ready：DB 初始化、Slash 同步、掛 Discord 日誌、排程語音通道定期發獎。
@@ -2206,7 +2173,7 @@ async def on_message(message):
 
 @bot.event
 async def on_message_delete(message: discord.Message):
-    """追蹤伺服器訊息刪除，回報原文與可能刪除者。"""
+    """追蹤伺服器訊息刪除，在紀錄頻道備份原文與附件連結。"""
     try:
         if DELETE_LOG_CHANNEL_ID <= 0:
             return
@@ -2223,41 +2190,32 @@ async def on_message_delete(message: discord.Message):
         if not isinstance(log_ch, discord.TextChannel):
             return
 
-        deleter = await _resolve_message_delete_actor(message.guild, message)
         content = (message.content or "").strip()
         if not content:
-            content = "（無文字內容）"
+            content = "*（無文字內容）*"
 
+        guild = message.guild
+        icon = guild.icon.url if guild.icon else None
+        desc_lines = [
+            f"{message.author.mention} · `{message.author.id}`",
+            f"{message.channel.mention} · {guild.name}",
+        ]
+        if message.created_at:
+            desc_lines.append(f"原訊息時間：<t:{int(message.created_at.timestamp())}:F>")
         emb = discord.Embed(
-            title="🗑️ 訊息刪除追蹤",
-            color=0xED4245,
+            title="訊息已刪除",
+            description="\n".join(desc_lines),
+            color=0x5865F2,
             timestamp=datetime.datetime.now(datetime.timezone.utc),
         )
-        emb.add_field(
-            name="原作者",
-            value=f"{message.author.mention}（`{message.author.id}`）",
-            inline=False,
-        )
-        if deleter:
-            emb.add_field(
-                name="疑似刪除者",
-                value=f"{deleter.mention}（`{deleter.id}`）",
-                inline=False,
-            )
-        else:
-            emb.add_field(name="疑似刪除者", value="無法判定（可能是本人刪除/權限不足）", inline=False)
-        emb.add_field(
-            name="位置",
-            value=f"{message.guild.name} / {message.channel.mention}",
-            inline=False,
-        )
-        emb.add_field(name="內容", value=content[:1024], inline=False)
+        emb.set_author(name="刪除紀錄", icon_url=icon)
+        emb.add_field(name="原文", value=content[:1024], inline=False)
         if message.attachments:
-            urls = "\n".join(a.url for a in message.attachments[:8])
-            emb.add_field(name="附件", value=urls[:1024], inline=False)
-        if message.created_at:
-            ts = int(message.created_at.timestamp())
-            emb.set_footer(text=f"原發送時間：<t:{ts}:F>")
+            lines = []
+            for i, a in enumerate(message.attachments[:8], start=1):
+                lines.append(f"[`附件 {i}`]({a.url})")
+            emb.add_field(name="附件", value="\n".join(lines), inline=False)
+        emb.set_footer(text=f"訊息 ID · {message.id}")
         await log_ch.send(embed=emb)
     except Exception as e:
         logger.exception("on_message_delete 錯誤: %s", e)
