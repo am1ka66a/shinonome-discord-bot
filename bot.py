@@ -92,6 +92,10 @@ GAMBLE_EXP_MAX = 38
 RED_PACKET_MIN_SECONDS = 10
 ROB_COOLDOWN_SECONDS = 60
 ROB_VICTIM_PROTECT_SECONDS = 1800
+# /rob 專用：基礎成功率；每 1 級差距 ±1%，再 clamp 至 5%～95%
+ROB_BASE_SUCCESS_RATE = 0.60
+# 平民 `/counter_rob` 加倍搶回專用基礎機率（與 `/rob` 分開）。
+COUNTER_ROB_BASE_SUCCESS_RATE = 0.30
 red_packet_seq = 0
 MSG_DB_FLUSH_EVERY_SECONDS = 8
 MSG_DB_FLUSH_COUNT = 3
@@ -2097,7 +2101,7 @@ async def help_slash(interaction: discord.Interaction):
             "`/daily` — 每日簽到領幣\n"
             "`/hourly` — 每小時簽到（依等級累積）\n"
             "`/beg` — 乞討\n"
-            "`/rob` — 搶劫（高風險；搶匪身分會累積通緝）\n"
+            "`/rob` — 搶劫（**僅搶匪**；高風險；成功會累積通緝）\n"
             "`/rescue` — 破產救濟（餘額 0 時）\n"
             "`/transfer` — 轉帳給其他玩家\n"
             "`/redpacket` — 發紅包\n"
@@ -2241,7 +2245,7 @@ async def beg(interaction: discord.Interaction):
     conn.commit()
     conn.close()
 
-@bot.tree.command(name="rob", description="搶劫其他玩家（高風險高報酬）")
+@bot.tree.command(name="rob", description="搶劫其他玩家（僅搶匪；高風險高報酬）")
 @app_commands.describe(member="要搶劫的對象（選人）", user_id="或填使用者 ID／貼提及")
 async def rob(
     interaction: discord.Interaction,
@@ -2275,6 +2279,16 @@ async def rob(
         conn.close()
         return await interaction.response.send_message("🔒 你在監獄裡無法搶劫。", ephemeral=True)
 
+    c.execute("SELECT COALESCE(role,'civilian') FROM users WHERE user_id=%s", (str(interaction.user.id),))
+    _role_row = c.fetchone()
+    robber_role = (_role_row[0] or "civilian") if _role_row else "civilian"
+    if robber_role != "criminal":
+        conn.close()
+        return await interaction.response.send_message(
+            "❌ 只有**搶匪**可以搶劫。請先用 `/role_choose` 選擇搶匪（criminal）。",
+            ephemeral=True,
+        )
+
     c.execute("SELECT balance, last_rob, level FROM users WHERE user_id=%s", (str(interaction.user.id),))
     robber_row = c.fetchone()
     c.execute("SELECT balance, level, last_robbed FROM users WHERE user_id=%s", (str(member.id),))
@@ -2306,9 +2320,9 @@ async def rob(
         conn.close()
         return await interaction.response.send_message(f"對方目前有保護，請 `{mins}` 分鐘後再試。", ephemeral=True)
 
-    # 基礎成功率 30%，每差 1 等調整 1%
+    # /rob 基礎成功率 ROB_BASE_SUCCESS_RATE；每差 1 等調整 1%
     level_gap = robber_level - target_level
-    success_rate = 0.30 + (level_gap * 0.01)
+    success_rate = ROB_BASE_SUCCESS_RATE + (level_gap * 0.01)
     success_rate = max(0.05, min(0.95, success_rate))
     success = random.random() < success_rate
     c.execute("UPDATE users SET last_rob=%s WHERE user_id=%s", (now, str(interaction.user.id)))
@@ -2724,7 +2738,7 @@ async def wanted_status_slash(interaction: discord.Interaction):
     if int(rev_pend or 0) and (role or "civilian") == "civilian":
         emb.add_field(
             name="加倍搶回",
-            value=f"可使用 `/counter_rob` 一次（約 `{(int(rev_amt or 0) * 2):,}` 幣上限，機率與搶劫相同公式）。",
+            value=f"可使用 `/counter_rob` 一次（約 `{(int(rev_amt or 0) * 2):,}` 幣上限，每級差距 ±1% 公式同搶劫，基礎成功率較低）。",
             inline=False,
         )
 
@@ -2866,7 +2880,8 @@ async def counter_rob_slash(interaction: discord.Interaction):
     doubled = base_amt * 2
     pay = min(doubled, robber_balance)
     level_gap = victim_level - robber_level
-    success_rate = 0.30 + (level_gap * 0.01)
+    # /counter_rob 基礎成功率 COUNTER_ROB_BASE_SUCCESS_RATE；每差 1 等調整 1%
+    success_rate = COUNTER_ROB_BASE_SUCCESS_RATE + (level_gap * 0.01)
     success_rate = max(0.05, min(0.95, success_rate))
     roll_ok = random.random() < success_rate and pay > 0
 
