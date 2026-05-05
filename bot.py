@@ -95,6 +95,15 @@ ROB_VICTIM_PROTECT_SECONDS = 1800
 red_packet_seq = 0
 MSG_DB_FLUSH_EVERY_SECONDS = 8
 MSG_DB_FLUSH_COUNT = 3
+# 台灣時間 (UTC+8)；與 get_db_connection 的 MySQL session time_zone 一致
+TW_TZ = datetime.timezone(datetime.timedelta(hours=8))
+
+
+def now_tw_naive() -> datetime.datetime:
+    """目前台灣本地時間（naive datetime）。"""
+    return datetime.datetime.now(TW_TZ).replace(tzinfo=None)
+
+
 MINECRAFT_DEATH_MESSAGES_PATH = os.path.join(
     os.path.dirname(__file__),
     "data",
@@ -385,7 +394,8 @@ def get_db_connection():
                 user=parsed.username,
                 password=parsed.password,
                 database=(parsed.path or '/').lstrip('/'),
-                charset='utf8mb4'
+                charset='utf8mb4',
+                init_command="SET time_zone = '+08:00'",
             )
 
     return pymysql.connect(
@@ -394,7 +404,8 @@ def get_db_connection():
         user=os.getenv('MYSQLUSER') or os.getenv('DB_USER'),
         password=os.getenv('MYSQLPASSWORD') or os.getenv('DB_PASS'),
         database=os.getenv('MYSQLDATABASE') or os.getenv('DB_NAME'),
-        charset='utf8mb4'
+        charset='utf8mb4',
+        init_command="SET time_zone = '+08:00'",
     )
 
 def init_db():
@@ -633,7 +644,7 @@ def append_rob_history_on_cursor(c, user_id: int, steal_amount: int) -> None:
     history.append(
         {
             "amount": int(steal_amount),
-            "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "time": now_tw_naive().strftime("%Y-%m-%d %H:%M:%S"),
         }
     )
     history = history[-5:]
@@ -853,7 +864,7 @@ async def process_level_ups(member: typing.Union[discord.Member, discord.User], 
         pass
 
 def refresh_hourly_bank(user_id):
-    now = datetime.datetime.now()
+    now = now_tw_naive()
     conn = get_db_connection()
     c = conn.cursor()
     c.execute("SELECT level, last_hourly_claim, hourly_bank FROM users WHERE user_id=%s", (str(user_id),))
@@ -912,18 +923,12 @@ def set_tournament_window(reg_start, reg_end):
 def parse_tw_datetime(text):
     # 接受格式: YYYY-MM-DD HH:MM (台灣時間 UTC+8)
     dt = datetime.datetime.strptime(text.strip(), "%Y-%m-%d %H:%M")
-    tz = datetime.timezone(datetime.timedelta(hours=8))
-    return dt.replace(tzinfo=tz).replace(tzinfo=None)
-
-def now_tw_naive():
-    tz = datetime.timezone(datetime.timedelta(hours=8))
-    return datetime.datetime.now(tz).replace(tzinfo=None)
+    return dt.replace(tzinfo=TW_TZ).replace(tzinfo=None)
 
 def tw_naive_to_discord_ts(dt):
     if not dt:
         return None
-    tz = datetime.timezone(datetime.timedelta(hours=8))
-    return int(dt.replace(tzinfo=tz).timestamp())
+    return int(dt.replace(tzinfo=TW_TZ).timestamp())
 
 def _build_tournament_bracket_lines(matches, total_rounds):
     grouped = {}
@@ -1969,7 +1974,7 @@ async def vc_reward_task():
     await bot.wait_until_ready()
     while not bot.is_closed():
         await asyncio.sleep(600)
-        now = datetime.datetime.now()
+        now = now_tw_naive()
         conn = get_db_connection()
         c = conn.cursor()
         awarded_users: typing.Set[str] = set()
@@ -2021,7 +2026,7 @@ async def on_message(message):
         if not message.guild:
             return
         user_id = str(message.author.id)
-        now = datetime.datetime.now()
+        now = now_tw_naive()
         now_ts = time.time()
 
         _pending_msg_counts[user_id] = _pending_msg_counts.get(user_id, 0) + 1
@@ -2150,10 +2155,7 @@ async def help_slash(interaction: discord.Interaction):
 async def daily(interaction: discord.Interaction):
     ensure_user_exists(interaction.user.id, 50000)
     daily_reward = 100000
-    # 設定台灣時間 (UTC+8)
-    tz = datetime.timezone(datetime.timedelta(hours=8))
-    now_tw = datetime.datetime.now(tz)
-    today_tw = now_tw.date()
+    today_tw = now_tw_naive().date()
     
     conn = get_db_connection()
     c = conn.cursor()
@@ -2162,7 +2164,7 @@ async def daily(interaction: discord.Interaction):
     
     if row and row[0] == today_tw:
         tomorrow_tw = today_tw + datetime.timedelta(days=1)
-        next_claim_dt = datetime.datetime.combine(tomorrow_tw, datetime.time.min, tzinfo=tz)
+        next_claim_dt = datetime.datetime.combine(tomorrow_tw, datetime.time.min, tzinfo=TW_TZ)
         ts = int(next_claim_dt.timestamp())
         conn.close()
         return await interaction.response.send_message(f"⚠️ 你今天已經簽到過囉！下次簽到時間：<t:{ts}:F> (<t:{ts}:R>)", ephemeral=True)
@@ -2179,7 +2181,7 @@ async def daily(interaction: discord.Interaction):
     
     # 計算下一次領取時間
     tomorrow_tw = today_tw + datetime.timedelta(days=1)
-    next_claim_dt = datetime.datetime.combine(tomorrow_tw, datetime.time.min, tzinfo=tz)
+    next_claim_dt = datetime.datetime.combine(tomorrow_tw, datetime.time.min, tzinfo=TW_TZ)
     ts = int(next_claim_dt.timestamp())
     embed = discord.Embed(title="✅ 每日簽到成功", color=discord.Color.green())
     embed.add_field(name="獲得", value=f"`{daily_reward:,}` 東雲幣", inline=False)
@@ -2222,7 +2224,7 @@ async def beg(interaction: discord.Interaction):
     c = conn.cursor()
     c.execute("SELECT balance, last_beg FROM users WHERE user_id=%s", (str(interaction.user.id),))
     row = c.fetchone()
-    now = datetime.datetime.now()
+    now = now_tw_naive()
     if row[1] and (now - row[1]).total_seconds() < 120:
         conn.close()
         return await interaction.response.send_message("太快了", ephemeral=True)
@@ -2284,7 +2286,7 @@ async def rob(
     target_balance = int((target_row[0] if target_row else 0) or 0)
     target_level = int((target_row[1] if target_row else 1) or 1)
     target_last_robbed = target_row[2] if target_row else None
-    now = datetime.datetime.now()
+    now = now_tw_naive()
 
     if last_rob and (now - last_rob).total_seconds() < ROB_COOLDOWN_SECONDS:
         remain = ROB_COOLDOWN_SECONDS - int((now - last_rob).total_seconds())
@@ -2581,7 +2583,7 @@ async def cop_hunt_slash(
 
     capture_chance = min(95, 20 + wanted_stars * 10)
     is_caught = random.random() * 100.0 < float(capture_chance)
-    now = datetime.datetime.now()
+    now = now_tw_naive()
 
     c.execute(
         "INSERT INTO wanted_log (criminal_id, cop_id, wanted_stars, caught) VALUES (%s, %s, %s, %s)",
@@ -2928,7 +2930,7 @@ async def bail_slash(interaction: discord.Interaction):
             f"假釋需要 `{BAIL_COST:,}` 東雲幣，你的餘額不足。",
             ephemeral=True,
         )
-    now = datetime.datetime.now()
+    now = now_tw_naive()
     c.execute(
         """UPDATE users SET balance=balance-%s, in_prison=0, prison_start=NULL
            WHERE user_id=%s AND balance >= %s""",
@@ -2970,7 +2972,7 @@ async def rescue(interaction: discord.Interaction):
             ephemeral=True,
         )
     
-    now = datetime.datetime.now()
+    now = now_tw_naive()
     if row[1] and (now - row[1]).total_seconds() < 3600:
         rem = 3600 - (now - row[1]).total_seconds()
         conn.close()
@@ -3147,7 +3149,7 @@ async def transfer(
     log_transaction(interaction.user.id, -amount, out_reason)
     log_transaction(member.id, amount, in_reason)
 
-    now_text = datetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+    now_text = now_tw_naive().strftime("%Y/%m/%d %H:%M:%S")
 
     embed = discord.Embed(
         title="✅ 轉帳成功",
@@ -3627,7 +3629,7 @@ async def publish_bracket(interaction: discord.Interaction):
             title="🏆 BO3 單淘汰賽程已建立",
             description=f"總人數：**{num_p}**｜總輪數：**{total_rounds}**",
             color=discord.Color.gold(),
-            timestamp=datetime.datetime.now()
+            timestamp=datetime.datetime.now(datetime.timezone.utc)
         )
         if first_round_pairs:
             embed.add_field(name="⚔️ 第一輪對戰", value="\n".join(first_round_pairs)[:1024], inline=False)
