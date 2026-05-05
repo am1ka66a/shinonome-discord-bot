@@ -2179,7 +2179,8 @@ async def on_message_delete(message: discord.Message):
             return
         if message.guild is None:
             return
-        if message.author and message.author.bot:
+        author = message.author
+        if author is not None and author.bot:
             return
         log_ch = bot.get_channel(DELETE_LOG_CHANNEL_ID)
         if log_ch is None:
@@ -2195,10 +2196,26 @@ async def on_message_delete(message: discord.Message):
             content = "*（無文字內容）*"
 
         guild = message.guild
-        icon = guild.icon.url if guild.icon else None
+        icon = None
+        try:
+            if guild.icon:
+                icon = str(guild.icon.url)
+        except Exception:
+            icon = None
+
+        if author is None:
+            author_line = "發送者：`（訊息未在快取中，無法還原發送者）`"
+        else:
+            author_line = f"{author.mention} · `{author.id}`"
+
+        try:
+            ch_label = message.channel.mention
+        except Exception:
+            ch_label = f"<#{getattr(message.channel, 'id', 0)}>"
+
         desc_lines = [
-            f"{message.author.mention} · `{message.author.id}`",
-            f"{message.channel.mention} · {guild.name}",
+            author_line,
+            f"{ch_label} · {guild.name}",
         ]
         if message.created_at:
             desc_lines.append(f"原訊息時間：<t:{int(message.created_at.timestamp())}:F>")
@@ -2208,13 +2225,22 @@ async def on_message_delete(message: discord.Message):
             color=0x5865F2,
             timestamp=datetime.datetime.now(datetime.timezone.utc),
         )
-        emb.set_author(name="刪除紀錄", icon_url=icon)
+        if icon and icon.startswith("http"):
+            emb.set_author(name="刪除紀錄", icon_url=icon)
+        else:
+            emb.set_author(name="刪除紀錄")
         emb.add_field(name="原文", value=content[:1024], inline=False)
         if message.attachments:
             lines = []
             for i, a in enumerate(message.attachments[:8], start=1):
-                lines.append(f"[`附件 {i}`]({a.url})")
-            emb.add_field(name="附件", value="\n".join(lines), inline=False)
+                try:
+                    url = a.url
+                except Exception:
+                    continue
+                if url:
+                    lines.append(f"[`附件 {i}`]({url})")
+            if lines:
+                emb.add_field(name="附件", value="\n".join(lines), inline=False)
         emb.set_footer(text=f"訊息 ID · {message.id}")
         await log_ch.send(embed=emb)
     except Exception as e:
