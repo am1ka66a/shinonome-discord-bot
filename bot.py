@@ -2171,6 +2171,21 @@ async def on_message(message):
         await bot.process_commands(message)
 
 
+_IMAGE_ATTACHMENT_SUFFIX = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".avif")
+_VIDEO_ATTACHMENT_SUFFIX = (".mp4", ".webm", ".mov", ".mkv")
+
+
+def _classify_attachment(a: discord.Attachment) -> str:
+    """回傳 image / video / file（供刪除訊息紀錄預覽用）。"""
+    ct = (getattr(a, "content_type", None) or "").lower()
+    fn = (getattr(a, "filename", "") or "").lower()
+    if ct.startswith("image/") or any(fn.endswith(s) for s in _IMAGE_ATTACHMENT_SUFFIX):
+        return "image"
+    if ct.startswith("video/") or any(fn.endswith(s) for s in _VIDEO_ATTACHMENT_SUFFIX):
+        return "video"
+    return "file"
+
+
 @bot.event
 async def on_message_delete(message: discord.Message):
     """追蹤伺服器訊息刪除，在紀錄頻道備份原文與附件連結。"""
@@ -2230,19 +2245,51 @@ async def on_message_delete(message: discord.Message):
         else:
             emb.set_author(name="刪除紀錄")
         emb.add_field(name="原文", value=content[:1024], inline=False)
+
+        send_extra = ""
         if message.attachments:
-            lines = []
-            for i, a in enumerate(message.attachments[:8], start=1):
+            images: typing.List[typing.Tuple[discord.Attachment, str]] = []
+            videos: typing.List[typing.Tuple[discord.Attachment, str]] = []
+            other_files: typing.List[typing.Tuple[discord.Attachment, str]] = []
+            for a in message.attachments[:10]:
                 try:
                     url = a.url
                 except Exception:
                     continue
-                if url:
-                    lines.append(f"[`附件 {i}`]({url})")
-            if lines:
-                emb.add_field(name="附件", value="\n".join(lines), inline=False)
+                if not url:
+                    continue
+                kind = _classify_attachment(a)
+                if kind == "image":
+                    images.append((a, url))
+                elif kind == "video":
+                    videos.append((a, url))
+                else:
+                    other_files.append((a, url))
+
+            if images:
+                emb.set_image(url=images[0][1])
+            if len(images) >= 2:
+                emb.set_thumbnail(url=images[1][1])
+
+            unfurl_lines: typing.List[str] = []
+            unfurl_lines.extend(u for _, u in images[2:])
+            unfurl_lines.extend(u for _, u in videos)
+
+            if other_files:
+                link_lines = []
+                for i, (a, url) in enumerate(other_files, start=1):
+                    name = getattr(a, "filename", None) or f"附件{i}"
+                    link_lines.append(f"[`{name}`]({url})")
+                emb.add_field(name="附件（檔案）", value="\n".join(link_lines)[:1024], inline=False)
+
+            if unfurl_lines:
+                send_extra = "\n".join(unfurl_lines)[:2000]
+
         emb.set_footer(text=f"訊息 ID · {message.id}")
-        await log_ch.send(embed=emb)
+        if send_extra:
+            await log_ch.send(content=send_extra, embed=emb)
+        else:
+            await log_ch.send(embed=emb)
     except Exception as e:
         logger.exception("on_message_delete 錯誤: %s", e)
 
