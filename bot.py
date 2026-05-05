@@ -2722,6 +2722,8 @@ async def cop_hunt_slash(
     description=f"[搶匪] 支付 {WANTED_BUYOUT_COST:,} 東雲幣消除全部通緝星與本輪追捕狀態",
 )
 async def wanted_buyout_slash(interaction: discord.Interaction):
+    if not interaction.guild:
+        return await interaction.response.send_message("請在伺服器頻道使用。", ephemeral=True)
     ensure_user_exists(interaction.user.id, 50000)
     uid = str(interaction.user.id)
     cost = WANTED_BUYOUT_COST
@@ -2769,13 +2771,18 @@ async def wanted_buyout_slash(interaction: discord.Interaction):
     conn.close()
     log_transaction(interaction.user.id, -cost, "通緝買斷（消除通緝星）")
     new_bal = get_user_stats(interaction.user.id)[0]
+    stars_was = stars
     emb = discord.Embed(
-        title="✅ 通緝已消除",
-        description=f"已支付 `{cost:,}` 東雲幣，通緝星與追捕計數已歸零。",
+        title="✅ 通緝買斷成功（頻道公告）",
+        description=(
+            f"{interaction.user.mention} 支付 **`{cost:,}`** 東雲幣，"
+            f"原通緝 **{stars_was}** 星已消除，追捕計數已歸零。"
+        ),
         color=0x57F287,
     )
     emb.add_field(name="目前餘額", value=f"`{new_bal:,}` 東雲幣", inline=False)
-    await interaction.response.send_message(embed=emb, ephemeral=True)
+    _am = discord.AllowedMentions(users=[discord.Object(id=interaction.user.id)])
+    await interaction.response.send_message(embed=emb, ephemeral=False, allowed_mentions=_am)
 
 
 @bot.tree.command(name="wanted_status", description="查看自己的陣營、通緝、監獄狀態與最近搶劫紀錄")
