@@ -650,8 +650,8 @@ WANTED_BUYOUT_COST = 300_000
 WANTED_BUYOUT_COOLDOWN_SECONDS = 86400  # 24 小時內不可再次買斷
 # 警察每次 /cop_hunt 追捕前須支付（成敗皆扣）
 COP_HUNT_FEE = 100_000
-# 追捕成功率：min(95, 基底 + 通緝星 × 每星加成)
-COP_HUNT_CAPTURE_BASE_PCT = 20
+# 追捕成功率：min(95, 基底 + 通緝星 × 每星加成)；1★ = 30%
+COP_HUNT_CAPTURE_BASE_PCT = 25
 COP_HUNT_CAPTURE_PER_STAR_PCT = 5
 
 
@@ -2118,13 +2118,17 @@ async def help_slash(interaction: discord.Interaction):
         description="以下為**一般玩家**常用指令；管理／主機專用請見伺服公告或管理員。",
         color=0x5865F2,
     )
+    _cop_hunt_pct_1star = min(
+        95,
+        COP_HUNT_CAPTURE_BASE_PCT + COP_HUNT_CAPTURE_PER_STAR_PCT,
+    )
     emb.add_field(
         name="💰 日常與經濟",
         value=(
             "`/daily` — 每日簽到領幣\n"
             "`/hourly` — 每小時簽到（依等級累積）\n"
             "`/beg` — 乞討\n"
-            "`/rob` — 搶劫（**僅搶匪**；約 **60%** 基礎成功率、每級差 ±1%；成功累積通緝）\n"
+            f"`/rob` — 搶劫（**僅搶匪**；約 **{int(round(ROB_BASE_SUCCESS_RATE * 100))}%** 基礎成功率、每級差 ±1%；成功累積通緝）\n"
             "`/rescue` — 破產救濟（餘額 0 時）\n"
             "`/transfer` — 轉帳給其他玩家\n"
             "`/redpacket` — 發紅包\n"
@@ -2150,9 +2154,10 @@ async def help_slash(interaction: discord.Interaction):
             "`/role_choose` — 選警察／搶匪／平民（搶匪須 **0 星通緝** 才可轉警察或平民）\n"
             "`/wanted_status` — 自己的通緝、監獄、搶劫紀錄\n"
             "`/wanted_list` — 目前通緝名單（不含 0 星）與可否追捕\n"
-            f"`/cop_hunt` — 警察追捕通緝犯（僅警察；每次 **`{COP_HUNT_FEE:,}`** 東雲幣）\n"
+            f"`/cop_hunt` — 警察追捕（僅警察；每次 **`{COP_HUNT_FEE:,}`** 幣、成敗皆扣）。"
+            f"成功率 **1★ 約 {_cop_hunt_pct_1star}%** 起，通緝每多 **1** 星 **+{COP_HUNT_CAPTURE_PER_STAR_PCT}%**（上限 **95%**）\n"
             f"`/wanted_buyout` — [搶匪] 付 `{WANTED_BUYOUT_COST:,}` 消除全部通緝星（**24 小時**冷卻）\n"
-            "`/counter_rob` — 平民被搶**成功**後限一次加倍搶回（約 **30%** 基礎、級差 ±1%；結果於**頻道公告**）\n"
+            f"`/counter_rob` — 平民被搶**成功**後限一次加倍搶回（約 **{int(round(COUNTER_ROB_BASE_SUCCESS_RATE * 100))}%** 基礎、級差 ±1%；結果於**頻道公告**）\n"
             f"`/bail` — 入獄時繳假釋金 `{BAIL_COST:,}` 出獄"
         ),
         inline=False,
