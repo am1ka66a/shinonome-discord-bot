@@ -101,6 +101,9 @@ COUNTER_ROB_BASE_SUCCESS_RATE = 0.30
 red_packet_seq = 0
 MSG_DB_FLUSH_EVERY_SECONDS = 8
 MSG_DB_FLUSH_COUNT = 3
+# logs 流水表：只保留最近 N 天，排程定期刪除更早資料（與 MySQL session 時區一致）
+LOG_RETENTION_DAYS = int(os.getenv("LOG_RETENTION_DAYS", "14"))
+LOG_PURGE_INTERVAL_SECONDS = int(os.getenv("LOG_PURGE_INTERVAL_SECONDS", str(24 * 3600)))
 # 台灣時間 (UTC+8)；與 get_db_connection 的 MySQL session time_zone 一致
 TW_TZ = datetime.timezone(datetime.timedelta(hours=8))
 
@@ -2064,7 +2067,7 @@ async def relay_staff_reply_to_dm_user(message: discord.Message) -> bool:
 
 # ==============================================================================
 # 【十二】事件迴圈：啟動、語音掛機獎勵、一般訊息
-# on_ready：DB 初始化、Slash 同步、掛 Discord 日誌、排程語音通道定期發獎。
+# on_ready：DB 初始化、Slash 同步、掛 Discord 日誌、排程語音通道定期發獎、logs 過期清理。
 # on_message：私訊轉接、轉接頻道內工作人員回覆、群組 @ 轉發、聊天句數與 EXP 等。
 # ==============================================================================
 
@@ -2090,7 +2093,37 @@ async def on_ready():
         except Exception as e:
             logger.exception("Guild 同步失敗 %s: %s", guild.id, e)
     bot.loop.create_task(vc_reward_task())
+    bot.loop.create_task(logs_retention_task())
     logger.info("機器人已啟動: %s（伺服器數 %s）", bot.user, len(bot.guilds))
+
+
+async def logs_retention_task():
+    """依 LOG_RETENTION_DAYS 刪除過期帳務流水（預設至少保留 14 天內）。"""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            if LOG_RETENTION_DAYS <= 0:
+                await asyncio.sleep(LOG_PURGE_INTERVAL_SECONDS)
+                continue
+            conn = get_db_connection()
+            c = conn.cursor()
+            c.execute(
+                "DELETE FROM logs WHERE created_at < DATE_SUB(NOW(), INTERVAL %s DAY)",
+                (LOG_RETENTION_DAYS,),
+            )
+            removed = c.rowcount if c.rowcount is not None else 0
+            conn.commit()
+            conn.close()
+            if removed:
+                logger.info(
+                    "logs 保留最近 %s 天：已刪除 %s 筆過期紀錄",
+                    LOG_RETENTION_DAYS,
+                    removed,
+                )
+        except Exception as e:
+            logger.exception("logs 定期清理失敗: %s", e)
+        await asyncio.sleep(LOG_PURGE_INTERVAL_SECONDS)
+
 
 async def vc_reward_task():
     await bot.wait_until_ready()
