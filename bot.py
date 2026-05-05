@@ -27,6 +27,19 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# ------------------------------------------------------------------------------
+# bot.py 大區索引（細節仍見各段「【數字】」標題）
+#
+#   [A · 基礎]           【一】匯入 【二】日誌 【三】常數／靜態資料／轉接表
+#   [B · Discord 工具]   【四】Logging Handler 【五】等級里程碑 【六】Slash 共用工具
+#   [C · 資料與持久化]   【七】MySQL／連線池／init_db／使用者與錦標賽資料存取
+#   [D · 二十一點與 UI]  【八】牌組與結算 【九】Modal／View／按鈕／翻頁
+#   [E · Bot 與轉接]     【十】Intents／Bot 【十一】私訊與頻道 Relay
+#   [F · 事件迴圈]       【十二】on_ready／語音獎勵／logs 清理／聊天／刪除訊息紀錄
+#   [G · 玩家 Slash]     【十三】經濟與一般 【十四】錦標賽
+#   [H · 主機與進入點]   【十五】/give 等與 bot.run
+# ------------------------------------------------------------------------------
+
 # ==============================================================================
 # 【二】日誌系統
 # 設定主程式 Logger（主控台、可選 log 檔）；啟動後可選擇再掛「Discord 頻道轉發」
@@ -385,6 +398,10 @@ async def resolve_slash_target(
     except discord.HTTPException as e:
         return None, f"無法查詢使用者：{e}"
 
+
+# ··············································································
+# [C · 資料與持久化]
+# ··············································································
 
 # ==============================================================================
 # 【七】MySQL 與核心業務邏輯
@@ -1109,6 +1126,10 @@ def _refresh_champion_if_single_left(conn):
         champion = next(iter(alive))
         c.execute("UPDATE tournament_meta SET status='finished', champion_player_id=%s WHERE id=1", (champion,))
 
+# ··············································································
+# [D · 二十一點與 UI]
+# ··············································································
+
 # ==============================================================================
 # 【八】二十一點：牌組、算分、旁注與牌局訊息更新
 # 多副牌洗牌、手牌點數（含 A）、對子／21+3 旁注結算、以及嵌入式訊息編輯流程。
@@ -1760,6 +1781,10 @@ class LinePagerView(discord.ui.View):
         except Exception:
             pass
 
+# ··············································································
+# [E · Bot 核心與私訊／頻道轉接]
+# ··············································································
+
 # ==============================================================================
 # 【十】Intents、開發者診斷指令、Bot 子類別與實例
 # 啟用訊息內容與私訊相關意圖；註冊僅限開發者的 /dev_list_guilds；自訂 setup_hook
@@ -2065,6 +2090,10 @@ async def relay_staff_reply_to_dm_user(message: discord.Message) -> bool:
     return True
 
 
+# ··············································································
+# [F · 事件迴圈]
+# ··············································································
+
 # ==============================================================================
 # 【十二】事件迴圈：啟動、語音掛機獎勵、一般訊息
 # on_ready：DB 初始化、Slash 同步、掛 Discord 日誌、排程語音通道定期發獎、logs 過期清理。
@@ -2232,6 +2261,10 @@ async def on_message(message):
         await bot.process_commands(message)
 
 
+DELETE_LOG_EMBED_COLOR = 0x5865F2
+# Discord 單則訊息最多 10 個 embed；圖片預覽用滿後其餘再發後續訊息
+DELETE_LOG_MAX_EMBEDS_PER_MESSAGE = 10
+
 _IMAGE_ATTACHMENT_SUFFIX = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".avif")
 _VIDEO_ATTACHMENT_SUFFIX = (".mp4", ".webm", ".mov", ".mkv")
 
@@ -2245,6 +2278,43 @@ def _classify_attachment(a: discord.Attachment) -> str:
     if ct.startswith("video/") or any(fn.endswith(s) for s in _VIDEO_ATTACHMENT_SUFFIX):
         return "video"
     return "file"
+
+
+def _delete_log_image_embed(url: str) -> discord.Embed:
+    """僅含大圖預覽的嵌入（與主紀錄 embed 同色）。"""
+    e = discord.Embed(color=DELETE_LOG_EMBED_COLOR)
+    e.set_image(url=url)
+    return e
+
+
+def _chunk_plain_url_lines(urls: typing.Sequence[str], limit: int = 1950) -> typing.List[str]:
+    """將多個 URL 切成多段訊息文字（供影片連結預覽），避免超過 Discord 上限。"""
+    chunks: typing.List[str] = []
+    buf: typing.List[str] = []
+    size = 0
+    for u in urls:
+        add = len(u) + (1 if buf else 0)
+        if buf and size + add > limit:
+            chunks.append("\n".join(buf))
+            buf = [u]
+            size = len(u)
+        else:
+            if buf:
+                size += 1
+            buf.append(u)
+            size += len(u)
+    if buf:
+        chunks.append("\n".join(buf))
+    return chunks
+
+
+async def _send_delete_log_image_overflow(ch: discord.TextChannel, urls: typing.Sequence[str]) -> None:
+    """第一則已塞滿 10 個 embed 時，其餘圖片改為每則訊息最多 10 張預覽。"""
+    if not urls:
+        return
+    for i in range(0, len(urls), DELETE_LOG_MAX_EMBEDS_PER_MESSAGE):
+        part = urls[i : i + DELETE_LOG_MAX_EMBEDS_PER_MESSAGE]
+        await ch.send(embeds=[_delete_log_image_embed(u) for u in part])
 
 
 @bot.event
@@ -2298,7 +2368,7 @@ async def on_message_delete(message: discord.Message):
         emb = discord.Embed(
             title="訊息已刪除",
             description="\n".join(desc_lines),
-            color=0x5865F2,
+            color=DELETE_LOG_EMBED_COLOR,
             timestamp=datetime.datetime.now(datetime.timezone.utc),
         )
         if icon and icon.startswith("http"):
@@ -2307,12 +2377,14 @@ async def on_message_delete(message: discord.Message):
             emb.set_author(name="刪除紀錄")
         emb.add_field(name="原文", value=content[:1024], inline=False)
 
-        send_extra = ""
+        embeds_out: typing.List[discord.Embed] = [emb]
+        overflow_image_urls: typing.List[str] = []
+        images: typing.List[typing.Tuple[discord.Attachment, str]] = []
+        videos: typing.List[typing.Tuple[discord.Attachment, str]] = []
+        other_files: typing.List[typing.Tuple[discord.Attachment, str]] = []
+
         if message.attachments:
-            images: typing.List[typing.Tuple[discord.Attachment, str]] = []
-            videos: typing.List[typing.Tuple[discord.Attachment, str]] = []
-            other_files: typing.List[typing.Tuple[discord.Attachment, str]] = []
-            for a in message.attachments[:10]:
+            for a in message.attachments:
                 try:
                     url = a.url
                 except Exception:
@@ -2328,13 +2400,13 @@ async def on_message_delete(message: discord.Message):
                     other_files.append((a, url))
 
             if images:
-                emb.set_image(url=images[0][1])
-            if len(images) >= 2:
-                emb.set_thumbnail(url=images[1][1])
-
-            unfurl_lines: typing.List[str] = []
-            unfurl_lines.extend(u for _, u in images[2:])
-            unfurl_lines.extend(u for _, u in videos)
+                urls_only = [u for _, u in images]
+                emb.set_image(url=urls_only[0])
+                idx = 1
+                while idx < len(urls_only) and len(embeds_out) < DELETE_LOG_MAX_EMBEDS_PER_MESSAGE:
+                    embeds_out.append(_delete_log_image_embed(urls_only[idx]))
+                    idx += 1
+                overflow_image_urls = list(urls_only[idx:])
 
             if other_files:
                 link_lines = []
@@ -2343,16 +2415,27 @@ async def on_message_delete(message: discord.Message):
                     link_lines.append(f"[`{name}`]({url})")
                 emb.add_field(name="附件（檔案）", value="\n".join(link_lines)[:1024], inline=False)
 
-            if unfurl_lines:
-                send_extra = "\n".join(unfurl_lines)[:2000]
-
         emb.set_footer(text=f"訊息 ID · {message.id}")
-        if send_extra:
-            await log_ch.send(content=send_extra, embed=emb)
-        else:
-            await log_ch.send(embed=emb)
+
+        video_urls = [u for _, u in videos]
+        video_chunks = _chunk_plain_url_lines(video_urls) if video_urls else []
+
+        send_kw: typing.Dict[str, typing.Any] = {"embeds": embeds_out}
+        if video_chunks:
+            send_kw["content"] = video_chunks[0]
+        await log_ch.send(**send_kw)
+
+        for vc in video_chunks[1:]:
+            await log_ch.send(content=vc)
+
+        if overflow_image_urls:
+            await _send_delete_log_image_overflow(log_ch, overflow_image_urls)
     except Exception as e:
         logger.exception("on_message_delete 錯誤: %s", e)
+
+# ··············································································
+# [G · 玩家 Slash 指令]
+# ··············································································
 
 # ==============================================================================
 # 【十三】Slash 指令：經濟、小遊戲、轉帳、排行榜、管理公告等
@@ -3944,6 +4027,10 @@ async def lvleaderboard(interaction: discord.Interaction):
     else:
         await interaction.response.send_message(embed=emb)
 
+# ··············································································
+# （【十四】錦標賽 — 仍屬 [G · 玩家 Slash]）
+# ··············································································
+
 # ==============================================================================
 # 【十四】Slash 指令：錦標賽（報名、賽程、比分、晉級與管理員裁定）
 # 報名與卡組、發布對戰表、比分提交與雙方確認、晉級鏈、管理員改判／重開場次等。
@@ -4550,6 +4637,10 @@ async def tournament_admin_reopen_match(interaction: discord.Interaction, round_
     await interaction.response.send_message(
         f"🔄 已重開 R{round_no} M{match_no}（`{p1 or 'TBD'}` vs `{p2 or 'TBD'}`），並回滾後續晉級鏈。"
     )
+
+# ··············································································
+# [H · 主機後台與程式進入點]
+# ··············································································
 
 # ==============================================================================
 # 【十五】Slash：主機後台、長文分行工具與程式進入點
