@@ -485,6 +485,10 @@ def init_db():
         c.execute("ALTER TABLE users ADD COLUMN last_wanted_buyout TIMESTAMP NULL")
     except Exception:
         pass
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN last_role_change TIMESTAMP NULL")
+    except Exception:
+        pass
 
     c.execute(
         """CREATE TABLE IF NOT EXISTS wanted_log (
@@ -653,6 +657,8 @@ COP_HUNT_FEE = 500_000
 # 追捕成功率：min(95, 基底 + 通緝星 × 每星加成)；1★ = 30%
 COP_HUNT_CAPTURE_BASE_PCT = 25
 COP_HUNT_CAPTURE_PER_STAR_PCT = 5
+# 陣營轉職冷卻（24 小時）
+ROLE_CHANGE_COOLDOWN_SECONDS = 86400
 
 
 def append_rob_history_on_cursor(c, user_id: int, steal_amount: int) -> None:
@@ -1336,14 +1342,17 @@ class BlackjackGame(discord.ui.View):
         settlement_credit = self.total_deducted + total_p
         update_game_result(self.user.id, settlement_credit, total_p, win, is_push)
 
-        exp_gain = roll_gamble_exp_from_bet(self.bet)
-        ensure_user_exists(self.user.id, 50000)
-        exp_result = add_user_exp(self.user.id, exp_gain)
-        if exp_result and exp_result[1] > exp_result[0]:
-            old_lv, new_lv = exp_result[0], exp_result[1]
-            if any(old_lv < m <= new_lv for m in LEVEL_MILE_TIERS):
-                asyncio.create_task(process_level_ups(self.user, old_lv, new_lv))
-        res = f"{res}\n✨ 經驗值 `+{exp_gain}`"
+        if total_p >= 0:
+            exp_gain = roll_gamble_exp_from_bet(self.bet)
+            ensure_user_exists(self.user.id, 50000)
+            exp_result = add_user_exp(self.user.id, exp_gain)
+            if exp_result and exp_result[1] > exp_result[0]:
+                old_lv, new_lv = exp_result[0], exp_result[1]
+                if any(old_lv < m <= new_lv for m in LEVEL_MILE_TIERS):
+                    asyncio.create_task(process_level_ups(self.user, old_lv, new_lv))
+            res = f"{res}\n✨ 經驗值 `+{exp_gain}`"
+        else:
+            res = f"{res}\n🧊 本局失利，不獲得 EXP"
 
         for c in self.children: c.disabled = True
         stats = get_user_stats(self.user.id)
@@ -2151,7 +2160,7 @@ async def help_slash(interaction: discord.Interaction):
     emb.add_field(
         name="🚔 通緝與警察",
         value=(
-            "`/role_choose` — 選警察／搶匪／平民（搶匪須 **0 星通緝** 才可轉警察或平民）\n"
+            "`/role_choose` — 選警察／搶匪／平民（轉職 **24 小時冷卻**；搶匪須 **0 星通緝** 才可轉警察或平民）\n"
             "`/wanted_status` — 自己的通緝、監獄、搶劫紀錄\n"
             "`/wanted_list` — 目前通緝名單（不含 0 星）與可否追捕\n"
             f"`/cop_hunt` — 警察追捕（僅警察；每次 **`{COP_HUNT_FEE:,}`** 幣、成敗皆扣）。"
@@ -2486,12 +2495,24 @@ async def role_choose_slash(interaction: discord.Interaction, role: str):
     conn = get_db_connection()
     c = conn.cursor()
     c.execute(
-        "SELECT COALESCE(role,'civilian'), COALESCE(wanted_stars,0) FROM users WHERE user_id=%s",
+        "SELECT COALESCE(role,'civilian'), COALESCE(wanted_stars,0), last_role_change FROM users WHERE user_id=%s",
         (str(interaction.user.id),),
     )
     row = c.fetchone()
     old_role = (row[0] or "civilian") if row else "civilian"
     wanted_now = int(row[1] or 0) if row else 0
+    last_role_change = row[2] if row else None
+    now = now_tw_naive()
+    if role != old_role and last_role_change is not None:
+        elapsed = (now - last_role_change).total_seconds()
+        if elapsed < ROLE_CHANGE_COOLDOWN_SECONDS:
+            next_dt = last_role_change + datetime.timedelta(seconds=ROLE_CHANGE_COOLDOWN_SECONDS)
+            ts = tw_naive_to_discord_ts(next_dt)
+            conn.close()
+            return await interaction.response.send_message(
+                f"⏳ 轉職冷卻中，下次可於 <t:{ts}:F>（<t:{ts}:R>）再切換陣營。",
+                ephemeral=True,
+            )
     if role == "civilian" and old_role == "civilian":
         conn.close()
         return await interaction.response.send_message("ℹ️ 你目前已是**平民**。", ephemeral=True)
@@ -2503,11 +2524,11 @@ async def role_choose_slash(interaction: discord.Interaction, role: str):
         )
     if role in ("cop", "civilian"):
         c.execute(
-            "UPDATE users SET role=%s, wanted_stars=0, wanted_hunted_count=0 WHERE user_id=%s",
-            (role, str(interaction.user.id)),
+            "UPDATE users SET role=%s, wanted_stars=0, wanted_hunted_count=0, last_role_change=%s WHERE user_id=%s",
+            (role, now, str(interaction.user.id)),
         )
     else:
-        c.execute("UPDATE users SET role=%s WHERE user_id=%s", (role, str(interaction.user.id)))
+        c.execute("UPDATE users SET role=%s, last_role_change=%s WHERE user_id=%s", (role, now, str(interaction.user.id)))
     conn.commit()
     conn.close()
 
