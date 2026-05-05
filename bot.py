@@ -481,6 +481,10 @@ def init_db():
         c.execute("ALTER TABLE users ADD COLUMN revenge_amount BIGINT DEFAULT 0")
     except Exception:
         pass
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN last_wanted_buyout TIMESTAMP NULL")
+    except Exception:
+        pass
 
     c.execute(
         """CREATE TABLE IF NOT EXISTS wanted_log (
@@ -643,6 +647,7 @@ def get_inflation_multiplier():
 BAIL_COST = 100_000
 # 搶匪付費消除通緝（全部星數與本輪追捕狀態）
 WANTED_BUYOUT_COST = 300_000
+WANTED_BUYOUT_COOLDOWN_SECONDS = 86400  # 24 小時內不可再次買斷
 
 
 def append_rob_history_on_cursor(c, user_id: int, steal_amount: int) -> None:
@@ -2141,7 +2146,7 @@ async def help_slash(interaction: discord.Interaction):
             "`/wanted_status` — 自己的通緝、監獄、搶劫紀錄\n"
             "`/wanted_list` — 目前通緝名單（不含 0 星）與可否追捕\n"
             "`/cop_hunt` — 警察追捕通緝犯（僅警察）\n"
-            f"`/wanted_buyout` — [搶匪] 付 `{WANTED_BUYOUT_COST:,}` 消除全部通緝星\n"
+            f"`/wanted_buyout` — [搶匪] 付 `{WANTED_BUYOUT_COST:,}` 消除全部通緝星（**24 小時**冷卻）\n"
             "`/counter_rob` — 平民被搶**成功**後限一次加倍搶回（約 **30%** 基礎、級差 ±1%；結果於**頻道公告**）\n"
             f"`/bail` — 入獄時繳假釋金 `{BAIL_COST:,}` 出獄"
         ),
@@ -2719,7 +2724,7 @@ async def cop_hunt_slash(
 
 @bot.tree.command(
     name="wanted_buyout",
-    description=f"[搶匪] 支付 {WANTED_BUYOUT_COST:,} 東雲幣消除全部通緝星與本輪追捕狀態",
+    description=f"[搶匪] 支付 {WANTED_BUYOUT_COST:,} 東雲幣消除通緝（24 小時僅能一次）",
 )
 async def wanted_buyout_slash(interaction: discord.Interaction):
     if not interaction.guild:
@@ -2730,7 +2735,7 @@ async def wanted_buyout_slash(interaction: discord.Interaction):
     conn = get_db_connection()
     c = conn.cursor()
     c.execute(
-        "SELECT role, COALESCE(wanted_stars,0), COALESCE(balance,0), COALESCE(in_prison,0) FROM users WHERE user_id=%s",
+        "SELECT role, COALESCE(wanted_stars,0), COALESCE(balance,0), COALESCE(in_prison,0), last_wanted_buyout FROM users WHERE user_id=%s",
         (uid,),
     )
     row = c.fetchone()
@@ -2741,6 +2746,7 @@ async def wanted_buyout_slash(interaction: discord.Interaction):
     stars = int(row[1] or 0)
     bal = int(row[2] or 0)
     in_pr = int(row[3] or 0)
+    last_buyout = row[4]
 
     if role != "criminal":
         conn.close()
@@ -2758,11 +2764,23 @@ async def wanted_buyout_slash(interaction: discord.Interaction):
             ephemeral=True,
         )
 
+    now = now_tw_naive()
+    if last_buyout is not None:
+        elapsed = (now - last_buyout).total_seconds()
+        if elapsed < WANTED_BUYOUT_COOLDOWN_SECONDS:
+            next_dt = last_buyout + datetime.timedelta(seconds=WANTED_BUYOUT_COOLDOWN_SECONDS)
+            ts = tw_naive_to_discord_ts(next_dt)
+            conn.close()
+            return await interaction.response.send_message(
+                f"⏳ 通緝買斷冷卻中，下次可於 <t:{ts}:F>（<t:{ts}:R>）再使用。",
+                ephemeral=True,
+            )
+
     c.execute(
         """UPDATE users SET balance=balance-%s,
-           wanted_stars=0, wanted_hunted_count=0
+           wanted_stars=0, wanted_hunted_count=0, last_wanted_buyout=%s
            WHERE user_id=%s AND balance >= %s""",
-        (cost, uid, cost),
+        (cost, now, uid, cost),
     )
     if c.rowcount == 0:
         conn.close()
@@ -3484,7 +3502,7 @@ async def leaderboard(interaction: discord.Interaction):
         title = "🏆 排行榜（全站）"
         note = "\n\n※ 在伺服器頻道使用時，榜單會改為**僅本伺服器成員**。"
 
-    lines = [f"{i+1}. <@{uid}>: {bal}" for i, (uid, bal) in enumerate(data)]
+    lines = [f"{i+1}. <@{uid}>: {int(bal):,}" for i, (uid, bal) in enumerate(data)]
     msg = "\n".join(lines) if lines else "（尚無符合條件的成員）"
     msg += f"\n\n📍 你的目前名次：**#{my_rank}**（餘額 `{my_bal:,}`）{note}"
     emb = discord.Embed(title=title, description=msg)
@@ -3598,8 +3616,10 @@ async def lvleaderboard(interaction: discord.Interaction):
             "目前沒有符合條件的等級資料。", ephemeral=True
         )
 
-    msg = "\n".join([f"{i+1}. <@{uid}>: Lv.{lv} | EXP {exp}" for i, (uid, lv, exp) in enumerate(data)])
-    msg += f"\n\n📍 你的目前名次：**#{my_rank}**（Lv.{my_level} | EXP {my_exp}）{note}"
+    msg = "\n".join(
+        [f"{i+1}. <@{uid}>: Lv.{int(lv)} | EXP {int(exp):,}" for i, (uid, lv, exp) in enumerate(data)]
+    )
+    msg += f"\n\n📍 你的目前名次：**#{my_rank}**（Lv.{my_level} | EXP {my_exp:,}）{note}"
     emb = discord.Embed(title=title, description=msg)
     if guild:
         await interaction.followup.send(embed=emb)
