@@ -19,6 +19,8 @@ from urllib.parse import urlparse
 
 import discord
 import pymysql
+import threading
+from dbutils.pooled_db import PooledDB
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
@@ -388,31 +390,57 @@ async def resolve_slash_target(
 # （二十一點「牌面」介面邏輯在【八】【九】）
 # ==============================================================================
 
+_mysql_pool: typing.Optional[PooledDB] = None
+_mysql_pool_lock = threading.Lock()
 
-def get_db_connection():
-    mysql_url = os.getenv('MYSQL_URL') or os.getenv('DATABASE_URL')
+
+def _mysql_connect_kwargs() -> dict:
+    """供連線池建立時傳入 pymysql.connect 的參數。"""
+    mysql_url = os.getenv("MYSQL_URL") or os.getenv("DATABASE_URL")
     if mysql_url:
         parsed = urlparse(mysql_url)
-        if parsed.scheme.startswith('mysql'):
-            return pymysql.connect(
-                host=parsed.hostname,
-                port=parsed.port or 3306,
-                user=parsed.username,
-                password=parsed.password,
-                database=(parsed.path or '/').lstrip('/'),
-                charset='utf8mb4',
-                init_command="SET time_zone = '+08:00'",
-            )
+        if parsed.scheme.startswith("mysql"):
+            return {
+                "host": parsed.hostname,
+                "port": parsed.port or 3306,
+                "user": parsed.username,
+                "password": parsed.password,
+                "database": (parsed.path or "/").lstrip("/"),
+                "charset": "utf8mb4",
+                "init_command": "SET time_zone = '+08:00'",
+            }
+    return {
+        "host": os.getenv("MYSQLHOST") or os.getenv("DB_HOST"),
+        "port": int(os.getenv("MYSQLPORT") or os.getenv("DB_PORT", 3306)),
+        "user": os.getenv("MYSQLUSER") or os.getenv("DB_USER"),
+        "password": os.getenv("MYSQLPASSWORD") or os.getenv("DB_PASS"),
+        "database": os.getenv("MYSQLDATABASE") or os.getenv("DB_NAME"),
+        "charset": "utf8mb4",
+        "init_command": "SET time_zone = '+08:00'",
+    }
 
-    return pymysql.connect(
-        host=os.getenv('MYSQLHOST') or os.getenv('DB_HOST'),
-        port=int(os.getenv('MYSQLPORT') or os.getenv('DB_PORT', 3306)),
-        user=os.getenv('MYSQLUSER') or os.getenv('DB_USER'),
-        password=os.getenv('MYSQLPASSWORD') or os.getenv('DB_PASS'),
-        database=os.getenv('MYSQLDATABASE') or os.getenv('DB_NAME'),
-        charset='utf8mb4',
-        init_command="SET time_zone = '+08:00'",
-    )
+
+def _get_mysql_pool() -> PooledDB:
+    global _mysql_pool
+    if _mysql_pool is None:
+        with _mysql_pool_lock:
+            if _mysql_pool is None:
+                kw = _mysql_connect_kwargs()
+                _mysql_pool = PooledDB(
+                    creator=pymysql,
+                    mincached=int(os.getenv("MYSQL_POOL_MINCACHED", "1")),
+                    maxcached=int(os.getenv("MYSQL_POOL_MAXCACHED", "8")),
+                    maxconnections=int(os.getenv("MYSQL_POOL_MAX", "16")),
+                    blocking=True,
+                    ping=1,
+                    **kw,
+                )
+    return _mysql_pool
+
+
+def get_db_connection():
+    """從連線池取得連線；用完請 commit／rollback 並 close（會歸還池中）。"""
+    return _get_mysql_pool().connection()
 
 def init_db():
     conn = get_db_connection()
