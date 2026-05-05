@@ -167,6 +167,8 @@ _last_exp_award_ts: typing.Dict[str, float] = {}
 DM_RELAY_CHANNEL_ID = int(os.getenv("DM_RELAY_CHANNEL_ID", "1500383156186906764"))
 # 轉發到頻道時 @ 通知對象（預設此 Discord ID，可用 DM_RELAY_NOTIFY_USER_ID 覆寫）
 DM_RELAY_NOTIFY_USER_ID = int(os.getenv("DM_RELAY_NOTIFY_USER_ID", "531308526262550528"))
+# 訊息刪除追蹤頻道（0 表示停用；未設時沿用 DM 轉接頻道）
+DELETE_LOG_CHANNEL_ID = int(os.getenv("DELETE_LOG_CHANNEL_ID", str(DM_RELAY_CHANNEL_ID)))
 # 轉發訊息 ID -> (原 user_id, 是否走 DM 回覆, guild_id, channel_id, message_id)
 # 私訊轉發：(..., True, 0, 0, 0)；群組 @：(..., False, 原訊 guild/channel/message)
 RelayForwardMeta = typing.Tuple[int, bool, int, int, int]
@@ -2031,6 +2033,40 @@ async def relay_staff_reply_to_dm_user(message: discord.Message) -> bool:
             pass
     return True
 
+
+async def _resolve_message_delete_actor(
+    guild: discord.Guild,
+    message: discord.Message,
+) -> typing.Optional[discord.abc.User]:
+    """嘗試從審計日誌找出刪除者（可能因權限或快取限制而失敗）。"""
+    if guild is None:
+        return None
+    try:
+        if guild.me and not guild.me.guild_permissions.view_audit_log:
+            return None
+    except Exception:
+        return None
+    try:
+        async for entry in guild.audit_logs(limit=6, action=discord.AuditLogAction.message_delete):
+            target = entry.target
+            if not isinstance(target, (discord.Member, discord.User)):
+                continue
+            if target.id != message.author.id:
+                continue
+            if entry.extra and getattr(entry.extra, "channel", None) and entry.extra.channel.id != message.channel.id:
+                continue
+            # 只採信接近刪除事件時間的紀錄（約 10 秒內）
+            try:
+                age = (datetime.datetime.now(datetime.timezone.utc) - entry.created_at).total_seconds()
+                if age > 10:
+                    continue
+            except Exception:
+                pass
+            return entry.user
+    except Exception:
+        return None
+    return None
+
 # ==============================================================================
 # 【十二】事件迴圈：啟動、語音掛機獎勵、一般訊息
 # on_ready：DB 初始化、Slash 同步、掛 Discord 日誌、排程語音通道定期發獎。
@@ -2166,6 +2202,65 @@ async def on_message(message):
         logger.exception("on_message 錯誤: %s", e)
     finally:
         await bot.process_commands(message)
+
+
+@bot.event
+async def on_message_delete(message: discord.Message):
+    """追蹤伺服器訊息刪除，回報原文與可能刪除者。"""
+    try:
+        if DELETE_LOG_CHANNEL_ID <= 0:
+            return
+        if message.guild is None:
+            return
+        if message.author and message.author.bot:
+            return
+        log_ch = bot.get_channel(DELETE_LOG_CHANNEL_ID)
+        if log_ch is None:
+            try:
+                log_ch = await bot.fetch_channel(DELETE_LOG_CHANNEL_ID)
+            except Exception:
+                return
+        if not isinstance(log_ch, discord.TextChannel):
+            return
+
+        deleter = await _resolve_message_delete_actor(message.guild, message)
+        content = (message.content or "").strip()
+        if not content:
+            content = "（無文字內容）"
+
+        emb = discord.Embed(
+            title="🗑️ 訊息刪除追蹤",
+            color=0xED4245,
+            timestamp=datetime.datetime.now(datetime.timezone.utc),
+        )
+        emb.add_field(
+            name="原作者",
+            value=f"{message.author.mention}（`{message.author.id}`）",
+            inline=False,
+        )
+        if deleter:
+            emb.add_field(
+                name="疑似刪除者",
+                value=f"{deleter.mention}（`{deleter.id}`）",
+                inline=False,
+            )
+        else:
+            emb.add_field(name="疑似刪除者", value="無法判定（可能是本人刪除/權限不足）", inline=False)
+        emb.add_field(
+            name="位置",
+            value=f"{message.guild.name} / {message.channel.mention}",
+            inline=False,
+        )
+        emb.add_field(name="內容", value=content[:1024], inline=False)
+        if message.attachments:
+            urls = "\n".join(a.url for a in message.attachments[:8])
+            emb.add_field(name="附件", value=urls[:1024], inline=False)
+        if message.created_at:
+            ts = int(message.created_at.timestamp())
+            emb.set_footer(text=f"原發送時間：<t:{ts}:F>")
+        await log_ch.send(embed=emb)
+    except Exception as e:
+        logger.exception("on_message_delete 錯誤: %s", e)
 
 # ==============================================================================
 # 【十三】Slash 指令：經濟、小遊戲、轉帳、排行榜、管理公告等
