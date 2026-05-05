@@ -641,6 +641,8 @@ def get_inflation_multiplier():
 
 # 假釋金（出獄一次）
 BAIL_COST = 100_000
+# 搶匪付費消除通緝（全部星數與本輪追捕狀態）
+WANTED_BUYOUT_COST = 300_000
 
 
 def append_rob_history_on_cursor(c, user_id: int, steal_amount: int) -> None:
@@ -2139,6 +2141,7 @@ async def help_slash(interaction: discord.Interaction):
             "`/wanted_status` — 自己的通緝、監獄、搶劫紀錄\n"
             "`/wanted_list` — 目前通緝名單（不含 0 星）與可否追捕\n"
             "`/cop_hunt` — 警察追捕通緝犯（僅警察）\n"
+            f"`/wanted_buyout` — [搶匪] 付 `{WANTED_BUYOUT_COST:,}` 消除全部通緝星\n"
             "`/counter_rob` — 平民被搶**成功**後限一次加倍搶回（約 **30%** 基礎、級差 ±1%；結果於**頻道公告**）\n"
             f"`/bail` — 入獄時繳假釋金 `{BAIL_COST:,}` 出獄"
         ),
@@ -2712,6 +2715,67 @@ async def cop_hunt_slash(
     else:
         emb.set_footer(text="對方通緝升星後，你可再嘗試追捕。")
     await interaction.response.send_message(embed=emb)
+
+
+@bot.tree.command(
+    name="wanted_buyout",
+    description=f"[搶匪] 支付 {WANTED_BUYOUT_COST:,} 東雲幣消除全部通緝星與本輪追捕狀態",
+)
+async def wanted_buyout_slash(interaction: discord.Interaction):
+    ensure_user_exists(interaction.user.id, 50000)
+    uid = str(interaction.user.id)
+    cost = WANTED_BUYOUT_COST
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute(
+        "SELECT role, COALESCE(wanted_stars,0), COALESCE(balance,0), COALESCE(in_prison,0) FROM users WHERE user_id=%s",
+        (uid,),
+    )
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return await interaction.response.send_message("找不到帳號資料。", ephemeral=True)
+    role = _user_role_value(row[0])
+    stars = int(row[1] or 0)
+    bal = int(row[2] or 0)
+    in_pr = int(row[3] or 0)
+
+    if role != "criminal":
+        conn.close()
+        return await interaction.response.send_message("❌ 僅**搶匪**可使用此指令。", ephemeral=True)
+    if in_pr:
+        conn.close()
+        return await interaction.response.send_message("❌ 你在監獄中，無法消除通緝。", ephemeral=True)
+    if stars <= 0:
+        conn.close()
+        return await interaction.response.send_message("ℹ️ 你目前沒有通緝星。", ephemeral=True)
+    if bal < cost:
+        conn.close()
+        return await interaction.response.send_message(
+            f"❌ 需要 `{cost:,}` 東雲幣，你的餘額不足（目前 `{bal:,}`）。",
+            ephemeral=True,
+        )
+
+    c.execute(
+        """UPDATE users SET balance=balance-%s,
+           wanted_stars=0, wanted_hunted_count=0
+           WHERE user_id=%s AND balance >= %s""",
+        (cost, uid, cost),
+    )
+    if c.rowcount == 0:
+        conn.close()
+        return await interaction.response.send_message("扣款失敗（餘額不足）。", ephemeral=True)
+    conn.commit()
+    conn.close()
+    log_transaction(interaction.user.id, -cost, "通緝買斷（消除通緝星）")
+    new_bal = get_user_stats(interaction.user.id)[0]
+    emb = discord.Embed(
+        title="✅ 通緝已消除",
+        description=f"已支付 `{cost:,}` 東雲幣，通緝星與追捕計數已歸零。",
+        color=0x57F287,
+    )
+    emb.add_field(name="目前餘額", value=f"`{new_bal:,}` 東雲幣", inline=False)
+    await interaction.response.send_message(embed=emb, ephemeral=True)
 
 
 @bot.tree.command(name="wanted_status", description="查看自己的陣營、通緝、監獄狀態與最近搶劫紀錄")
