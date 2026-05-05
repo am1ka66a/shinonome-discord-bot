@@ -1334,7 +1334,7 @@ class BlackjackGame(discord.ui.View):
             except Exception:
                 logger.exception("21點 check_auto_bj 自動結算失敗 user=%s", self.user.id)
 
-    async def end(self, res, prof, win=False, is_push=False, message_obj=None, interaction=None):
+    async def end(self, res, prof, win=False, is_push=False, message_obj=None, interaction=None, exp_gain=0, exp_detail=""):
         if getattr(self, '_game_over', False): return
         self._game_over = True
         
@@ -1342,8 +1342,7 @@ class BlackjackGame(discord.ui.View):
         settlement_credit = self.total_deducted + total_p
         update_game_result(self.user.id, settlement_credit, total_p, win, is_push)
 
-        if total_p >= 0:
-            exp_gain = roll_gamble_exp_from_bet(self.bet)
+        if exp_gain > 0:
             ensure_user_exists(self.user.id, 50000)
             exp_result = add_user_exp(self.user.id, exp_gain)
             if exp_result and exp_result[1] > exp_result[0]:
@@ -1353,6 +1352,8 @@ class BlackjackGame(discord.ui.View):
             res = f"{res}\n✨ 經驗值 `+{exp_gain}`"
         else:
             res = f"{res}\n🧊 本局失利，不獲得 EXP"
+        if exp_detail:
+            res = f"{res}\n{exp_detail}"
 
         for c in self.children: c.disabled = True
         stats = get_user_stats(self.user.id)
@@ -1385,6 +1386,8 @@ class BlackjackGame(discord.ui.View):
                 await self._edit(message=message_obj, interaction=None, animating=True)
                 await asyncio.sleep(1.2)
         total_prof, final_res_texts = 0, []
+        total_exp_gain = 0
+        exp_detail_texts = []
         ds = calculate_score(self.d_hand)
         dealer_bj = len(self.d_hand) == 2 and ds == 21
         dealer_5_card = len(self.d_hand) == 5 and ds <= 21
@@ -1392,22 +1395,74 @@ class BlackjackGame(discord.ui.View):
             if self.hand_results[i] is not None:
                 r, p, w = self.hand_results[i]
                 final_res_texts.append(f"第 {i+1} 手: {r}" if len(self.hands)>1 else r)
-                total_prof += p
+                hand_profit = p
+                total_prof += hand_profit
+                hand_exp_base = roll_gamble_exp_from_bet(self.hand_bets[i])
+                if hand_profit > 0:
+                    hand_exp_award = hand_exp_base
+                elif hand_profit == 0:
+                    hand_exp_award = max(1, hand_exp_base // 2)
+                else:
+                    hand_exp_award = 0
+                total_exp_gain += hand_exp_award
+                if len(self.hands) > 1:
+                    exp_detail_texts.append(f"第 {i+1} 手 EXP `+{hand_exp_award}`")
                 continue
             ps = calculate_score(hand)
             player_bj, player_5_card = (len(hand) == 2 and ps == 21), (len(hand) == 5 and ps <= 21)
-            if player_5_card and dealer_5_card: final_res_texts.append("🤝 雙方皆過五關！平手")
-            elif player_5_card: final_res_texts.append("🐉 你過五關啦！爽贏 2.5 倍！"); total_prof += int(self.hand_bets[i] * 2.5)
-            elif dealer_5_card: final_res_texts.append("🐉 老子過五關啦！你這低能兒～"); total_prof -= self.hand_bets[i]
-            elif player_bj and dealer_bj: final_res_texts.append("🤝 雙方皆為 BlackJack！平手")
-            elif player_bj: final_res_texts.append("🌟 BlackJack！1.5倍賠率！"); total_prof += int(self.hand_bets[i] * 1.5)
-            elif dealer_bj: final_res_texts.append("💀 莊家 BlackJack！你輸啦～雜魚～"); total_prof -= self.hand_bets[i]
-            elif ds > 21 or ps > ds: final_res_texts.append("🎉 這次算你贏啦，腦殘！"); total_prof += self.hand_bets[i]
-            elif ps < ds: final_res_texts.append("💀 你輸啦～雜魚～"); total_prof -= self.hand_bets[i]
-            else: final_res_texts.append("🤝 就這點技術阿腦殘？")
+            if player_5_card and dealer_5_card:
+                final_res_texts.append("🤝 雙方皆過五關！平手")
+                hand_profit = 0
+            elif player_5_card:
+                final_res_texts.append("🐉 你過五關啦！爽贏 2.5 倍！")
+                hand_profit = int(self.hand_bets[i] * 2.5)
+            elif dealer_5_card:
+                final_res_texts.append("🐉 老子過五關啦！你這低能兒～")
+                hand_profit = -self.hand_bets[i]
+            elif player_bj and dealer_bj:
+                final_res_texts.append("🤝 雙方皆為 BlackJack！平手")
+                hand_profit = 0
+            elif player_bj:
+                final_res_texts.append("🌟 BlackJack！1.5倍賠率！")
+                hand_profit = int(self.hand_bets[i] * 1.5)
+            elif dealer_bj:
+                final_res_texts.append("💀 莊家 BlackJack！你輸啦～雜魚～")
+                hand_profit = -self.hand_bets[i]
+            elif ds > 21 or ps > ds:
+                final_res_texts.append("🎉 這次算你贏啦，腦殘！")
+                hand_profit = self.hand_bets[i]
+            elif ps < ds:
+                final_res_texts.append("💀 你輸啦～雜魚～")
+                hand_profit = -self.hand_bets[i]
+            else:
+                final_res_texts.append("🤝 就這點技術阿腦殘？")
+                hand_profit = 0
+            total_prof += hand_profit
+            hand_exp_base = roll_gamble_exp_from_bet(self.hand_bets[i])
+            if hand_profit > 0:
+                hand_exp_award = hand_exp_base
+            elif hand_profit == 0:
+                hand_exp_award = max(1, hand_exp_base // 2)
+            else:
+                hand_exp_award = 0
+            total_exp_gain += hand_exp_award
+            if len(self.hands) > 1:
+                exp_detail_texts.append(f"第 {i+1} 手 EXP `+{hand_exp_award}`")
         final_msg = "\n".join(final_res_texts)
         total_combined = total_prof + getattr(self, 'side_p', 0)
-        await self.end(final_msg, total_prof, total_combined > 0, total_combined == 0, message_obj=message_obj, interaction=interaction)
+        exp_detail = ""
+        if len(self.hands) > 1 and exp_detail_texts:
+            exp_detail = "🧮 分牌 EXP 明細\n" + "\n".join(exp_detail_texts)
+        await self.end(
+            final_msg,
+            total_prof,
+            total_combined > 0,
+            total_combined == 0,
+            message_obj=message_obj,
+            interaction=interaction,
+            exp_gain=total_exp_gain,
+            exp_detail=exp_detail,
+        )
 
     @discord.ui.button(label="要牌", style=discord.ButtonStyle.success)
     async def hit(self, inter, btn):
@@ -2160,11 +2215,11 @@ async def help_slash(interaction: discord.Interaction):
     emb.add_field(
         name="🚔 通緝與警察",
         value=(
-            "`/role_choose` — 選警察／搶匪／平民（轉職 **24 小時冷卻**；搶匪須 **0 星通緝** 才可轉警察或平民）\n"
+            "`/role_choose` — 選警察／搶匪／平民\n"
             "`/wanted_status` — 自己的通緝、監獄、搶劫紀錄\n"
-            "`/wanted_list` — 目前通緝名單（不含 0 星）與可否追捕\n"
+            "`/wanted_list` — 目前通緝名單與可否追捕\n"
             f"`/cop_hunt` — 警察追捕（僅警察；每次 **`{COP_HUNT_FEE:,}`** 幣、成敗皆扣）。"
-            f"成功率 **1★ 約 {_cop_hunt_pct_1star}%** 起，通緝每多 **1** 星 **+{COP_HUNT_CAPTURE_PER_STAR_PCT}%**（上限 **95%**）\n"
+            f"成功率 **1★ 約 {_cop_hunt_pct_1star}%** 起，通緝每多 **1** 星 **+{COP_HUNT_CAPTURE_PER_STAR_PCT}%**，並受等級差影響（每級 ±1%，上限 **95%**）\n"
             f"`/wanted_buyout` — [搶匪] 付 `{WANTED_BUYOUT_COST:,}` 消除全部通緝星（**24 小時**冷卻）\n"
             f"`/counter_rob` — 平民被搶**成功**後限一次加倍搶回（約 **{int(round(COUNTER_ROB_BASE_SUCCESS_RATE * 100))}%** 基礎、級差 ±1%；結果於**頻道公告**）\n"
             f"`/bail` — 入獄時繳假釋金 `{BAIL_COST:,}` 出獄"
@@ -2411,7 +2466,7 @@ async def rob(
                 )
                 wanted_info = (
                     f"\n⚠️ **通緝等級提升** → {stars_display}（{new_wanted}/5）\n"
-                    f"🚔 若遭追捕，成功率約：**{cap}%**"
+                    f"🚔 追捕成功率基準約：**{cap}%**（實際另受警匪等級差影響，每級 ±1%）"
                 )
         else:
             c.execute(
@@ -2424,7 +2479,7 @@ async def rob(
             )
             wanted_info = (
                 f"\n🔴 **滿星通緝中** ⭐⭐⭐⭐⭐\n"
-                f"🚔 每次搶劫成功後警察可追捕一次（成功率約 **`{_cap5}%`**）。"
+                f"🚔 每次搶劫成功後警察可追捕一次（基準約 **`{_cap5}%`**，實際另受警匪等級差影響，每級 ±1%）。"
             )
 
         revenge_hint = ""
@@ -2552,6 +2607,8 @@ async def role_choose_slash(interaction: discord.Interaction, role: str):
             name="🚔 警察",
             value=(
                 "• 使用 `/cop_hunt` 選擇通緝犯並嘗試逮捕\n"
+                f"• 每次追捕會先扣 `{COP_HUNT_FEE:,}`（成敗皆扣）\n"
+                f"• 成功率：通緝星級每星 +{COP_HUNT_CAPTURE_PER_STAR_PCT}%，並受雙方等級差影響（每級 ±1%）\n"
                 "• 成功可獲得其「最近五次搶劫成功」總額\n"
                 "• 通緝規則見 `/wanted_status`"
             ),
@@ -2562,7 +2619,7 @@ async def role_choose_slash(interaction: discord.Interaction, role: str):
             name="🔪 搶匪",
             value=(
                 "• `/rob` 搶劫成功會累積通緝星（最高 5）\n"
-                "• 星級越高，遭追捕時成功率越高\n"
+                "• 通緝星級越高，且你等級越低於警察時，遭追捕成功率越高\n"
                 "• 入獄後可用 `/bail` 繳假釋金出獄"
             ),
             inline=False,
@@ -2605,7 +2662,7 @@ async def cop_hunt_slash(
 
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT COALESCE(role,'civilian') FROM users WHERE user_id=%s", (cop_id,))
+    c.execute("SELECT COALESCE(role,'civilian'), COALESCE(level,1) FROM users WHERE user_id=%s", (cop_id,))
     cop_row = c.fetchone()
     if not cop_row or cop_row[0] != "cop":
         conn.close()
@@ -2613,9 +2670,10 @@ async def cop_hunt_slash(
             "❌ 只有**警察**可以追捕。請先用 `/role_choose` 選擇警察。",
             ephemeral=True,
         )
+    cop_level = int(cop_row[1] or 1)
 
     c.execute(
-        "SELECT COALESCE(wanted_stars,0), COALESCE(wanted_hunted_count,0), COALESCE(balance,0), COALESCE(in_prison,0) FROM users WHERE user_id=%s",
+        "SELECT COALESCE(wanted_stars,0), COALESCE(wanted_hunted_count,0), COALESCE(balance,0), COALESCE(in_prison,0), COALESCE(level,1) FROM users WHERE user_id=%s",
         (criminal_id,),
     )
     criminal_row = c.fetchone()
@@ -2627,6 +2685,7 @@ async def cop_hunt_slash(
     hunted_count = int(criminal_row[1] or 0)
     criminal_balance = int(criminal_row[2] or 0)
     in_prison = int(criminal_row[3] or 0)
+    criminal_level = int(criminal_row[4] or 1)
 
     if in_prison:
         conn.close()
@@ -2670,7 +2729,7 @@ async def cop_hunt_slash(
 
     capture_chance = min(
         95,
-        COP_HUNT_CAPTURE_BASE_PCT + wanted_stars * COP_HUNT_CAPTURE_PER_STAR_PCT,
+        COP_HUNT_CAPTURE_BASE_PCT + wanted_stars * COP_HUNT_CAPTURE_PER_STAR_PCT + (cop_level - criminal_level),
     )
     is_caught = random.random() * 100.0 < float(capture_chance)
     now = now_tw_naive()
@@ -3086,7 +3145,7 @@ async def counter_rob_slash(interaction: discord.Interaction):
             ]
         )
         return await interaction.response.send_message(
-            f"{interaction.user.mention} **【全頻公告】加倍搶回成功！**（本次成功率約 {pct}%）\n"
+            f"{interaction.user.mention} **加倍搶回成功！**（本次成功率約 {pct}%）\n"
             f"<@{robber_id}>（`{discord.utils.escape_markdown(rn)}`）被反制：搶回 **`{transferred:,}`** 東雲幣"
             f"（目標加倍 `{doubled:,}`，以搶匪當時餘額為上限）。",
             ephemeral=False,
@@ -3095,13 +3154,13 @@ async def counter_rob_slash(interaction: discord.Interaction):
     _am_shout = discord.AllowedMentions(users=[discord.Object(id=interaction.user.id)])
     if pay <= 0:
         return await interaction.response.send_message(
-            f"{interaction.user.mention} ❌ **【全頻公告】搶匪餘額為 0**，無法搶回；你的機會已消耗。\n"
+            f"{interaction.user.mention} ❌ **搶匪餘額為 0**，無法搶回；你的機會已消耗。\n"
             f"（本次成功機率約 {pct}%；反制專用基礎成功率公式：基礎 {int(round(COUNTER_ROB_BASE_SUCCESS_RATE * 100))}%，每級差 ±1%。）",
             ephemeral=False,
             allowed_mentions=_am_shout,
         )
     return await interaction.response.send_message(
-        f"{interaction.user.mention} ❌ **【全頻公告】加倍搶回失敗**（本次成功機率約 {pct}%；反制專用基礎成功率公式：基礎 {int(round(COUNTER_ROB_BASE_SUCCESS_RATE * 100))}%，每級差 ±1%）。"
+        f"{interaction.user.mention} ❌ **加倍搶回失敗**（本次成功機率約 {pct}%；反制專用基礎成功率公式：基礎 {int(round(COUNTER_ROB_BASE_SUCCESS_RATE * 100))}%，每級差 ±1%）。"
         f"你的**唯一機會**已用盡。",
         ephemeral=False,
         allowed_mentions=_am_shout,
