@@ -610,6 +610,17 @@ def ensure_user_exists(user_id, startup_balance=50000):
     conn.commit()
     conn.close()
 
+
+def _user_role_value(raw) -> str:
+    """將 users.role 轉成與程式一致的鍵（cop/criminal/civilian），避免大小寫／空白／bytes 造成比對失敗。"""
+    if raw is None:
+        return "civilian"
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8", "replace")
+    s = str(raw).strip().lower()
+    return s if s else "civilian"
+
+
 def get_inflation_multiplier():
     """依全服流通量計算通膨倍率，回傳 (multiplier, circulation, avg_balance)。"""
     conn = get_db_connection()
@@ -2101,7 +2112,7 @@ async def help_slash(interaction: discord.Interaction):
             "`/daily` — 每日簽到領幣\n"
             "`/hourly` — 每小時簽到（依等級累積）\n"
             "`/beg` — 乞討\n"
-            "`/rob` — 搶劫（**僅搶匪**；高風險；成功會累積通緝）\n"
+            "`/rob` — 搶劫（**僅搶匪**；約 **60%** 基礎成功率、每級差 ±1%；成功累積通緝）\n"
             "`/rescue` — 破產救濟（餘額 0 時）\n"
             "`/transfer` — 轉帳給其他玩家\n"
             "`/redpacket` — 發紅包\n"
@@ -2128,7 +2139,7 @@ async def help_slash(interaction: discord.Interaction):
             "`/wanted_status` — 自己的通緝、監獄、搶劫紀錄\n"
             "`/wanted_list` — 目前通緝名單（不含 0 星）與可否追捕\n"
             "`/cop_hunt` — 警察追捕通緝犯（僅警察）\n"
-            "`/counter_rob` — 平民被搶成功後，限一次加倍搶回\n"
+            "`/counter_rob` — 平民被搶**成功**後限一次加倍搶回（約 **30%** 基礎、級差 ±1%；結果於**頻道公告**）\n"
             f"`/bail` — 入獄時繳假釋金 `{BAIL_COST:,}` 出獄"
         ),
         inline=False,
@@ -2279,9 +2290,9 @@ async def rob(
         conn.close()
         return await interaction.response.send_message("🔒 你在監獄裡無法搶劫。", ephemeral=True)
 
-    c.execute("SELECT COALESCE(role,'civilian') FROM users WHERE user_id=%s", (str(interaction.user.id),))
+    c.execute("SELECT role FROM users WHERE user_id=%s", (str(interaction.user.id),))
     _role_row = c.fetchone()
-    robber_role = (_role_row[0] or "civilian") if _role_row else "civilian"
+    robber_role = _user_role_value(_role_row[0] if _role_row else None)
     if robber_role != "criminal":
         conn.close()
         return await interaction.response.send_message(
@@ -2344,41 +2355,40 @@ async def rob(
         append_rob_history_on_cursor(c, interaction.user.id, steal_amount)
 
         wanted_info = ""
+        # 進入搶劫成功者必為搶匪（見上方角色檢查）；不再依第二次 SELECT role 判斷（避免 DB 回傳格式導致略過通緝）
         c.execute(
-            "SELECT COALESCE(role,'civilian'), COALESCE(wanted_stars,0) FROM users WHERE user_id=%s",
+            "SELECT COALESCE(wanted_stars,0) FROM users WHERE user_id=%s",
             (str(interaction.user.id),),
         )
-        role_row = c.fetchone()
-        role = (role_row[0] or "civilian") if role_row else "civilian"
-        current_wanted = int(role_row[1] or 0) if role_row else 0
+        _ws = c.fetchone()
+        current_wanted = int(_ws[0] or 0) if _ws else 0
 
-        if role == "criminal":
-            if current_wanted < 5:
-                c.execute(
-                    "UPDATE users SET wanted_stars=LEAST(5, COALESCE(wanted_stars,0)+1), wanted_hunted_count=0 WHERE user_id=%s",
-                    (str(interaction.user.id),),
+        if current_wanted < 5:
+            c.execute(
+                "UPDATE users SET wanted_stars=LEAST(5, COALESCE(wanted_stars,0)+1), wanted_hunted_count=0 WHERE user_id=%s",
+                (str(interaction.user.id),),
+            )
+            c.execute("SELECT COALESCE(wanted_stars,0) FROM users WHERE user_id=%s", (str(interaction.user.id),))
+            _nw = c.fetchone()
+            new_wanted = int(_nw[0] or 0) if _nw else 0
+            stars_display = "⭐" * new_wanted + "☆" * (5 - new_wanted)
+            if new_wanted == 5:
+                wanted_info = (
+                    f"\n🔴 **達到最高通緝！** {stars_display}\n"
+                    f"⚠️ 每次搶劫成功後警察可追捕一次。"
                 )
-                c.execute("SELECT COALESCE(wanted_stars,0) FROM users WHERE user_id=%s", (str(interaction.user.id),))
-                _nw = c.fetchone()
-                new_wanted = int(_nw[0] or 0) if _nw else 0
-                stars_display = "⭐" * new_wanted + "☆" * (5 - new_wanted)
-                if new_wanted == 5:
-                    wanted_info = (
-                        f"\n🔴 **達到最高通緝！** {stars_display}\n"
-                        f"⚠️ 每次搶劫成功後警察可追捕一次。"
-                    )
-                else:
-                    cap = min(95, 20 + new_wanted * 10)
-                    wanted_info = (
-                        f"\n⚠️ **通緝等級提升** → {stars_display}（{new_wanted}/5）\n"
-                        f"🚔 若遭追捕，成功率約：**{cap}%**"
-                    )
             else:
-                c.execute(
-                    "UPDATE users SET wanted_hunted_count=0 WHERE user_id=%s",
-                    (str(interaction.user.id),),
+                cap = min(95, 20 + new_wanted * 10)
+                wanted_info = (
+                    f"\n⚠️ **通緝等級提升** → {stars_display}（{new_wanted}/5）\n"
+                    f"🚔 若遭追捕，成功率約：**{cap}%**"
                 )
-                wanted_info = "\n🔴 **滿星通緝中** ⭐⭐⭐⭐⭐\n🚔 每次搶劫成功後警察可追捕一次（成功率約 **70%**）。"
+        else:
+            c.execute(
+                "UPDATE users SET wanted_hunted_count=0 WHERE user_id=%s",
+                (str(interaction.user.id),),
+            )
+            wanted_info = "\n🔴 **滿星通緝中** ⭐⭐⭐⭐⭐\n🚔 每次搶劫成功後警察可追捕一次（成功率約 **70%**）。"
 
         revenge_hint = ""
         c.execute(
@@ -2386,7 +2396,7 @@ async def rob(
             (str(member.id),),
         )
         vrole_row = c.fetchone()
-        victim_role = (vrole_row[0] or "civilian") if vrole_row else "civilian"
+        victim_role = _user_role_value(vrole_row[0] if vrole_row else None)
         if victim_role == "civilian":
             c.execute(
                 "UPDATE users SET revenge_pending=1, revenge_robber_id=%s, revenge_amount=%s WHERE user_id=%s",
@@ -2394,7 +2404,7 @@ async def rob(
             )
             revenge_hint = (
                 f"\n\n💢 {member.mention} 身為**平民**被搶成功，獲得 **一次**機會：使用 `/counter_rob` "
-                f"可依與搶劫相同的機率公式，嘗試從搶匪處**加倍搶回**（至多 `{(steal_amount * 2):,}` 幣，實際以搶匪餘額為準）。"
+                f"可依每級差距 ±1% 公式（與搶劫相同結構，基礎成功率較低），嘗試從搶匪處**加倍搶回**（至多 `{(steal_amount * 2):,}` 幣，實際以搶匪餘額為準）。"
             )
 
         conn.commit()
@@ -2819,7 +2829,7 @@ async def wanted_list_slash(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="counter_rob",
-    description="平民被搶成功後限一次：與搶劫相同成功率公式，向原搶匪加倍搶回（實拿以搶匪餘額為上限）",
+    description="平民被搶成功後限一次：反制專用基礎成功率（30%）與級差 ±1%，向原搶匪加倍搶回（實拿以搶匪餘額為上限）",
 )
 async def counter_rob_slash(interaction: discord.Interaction):
     if not interaction.guild:
@@ -2908,19 +2918,32 @@ async def counter_rob_slash(interaction: discord.Interaction):
         log_transaction(robber_id, -transferred, f"被平民加倍搶回（受害者:{victim_id}）")
         robber_mem = interaction.guild.get_member(int(robber_id))
         rn = robber_mem.display_name if robber_mem else robber_id
-        return await interaction.response.send_message(
-            f"✅ **加倍搶回成功！**（本次成功率約 {pct}%）\n"
-            f"你從 `{discord.utils.escape_markdown(rn)}` 搶回 **`{transferred:,}`** 東雲幣"
-            f"（目標加倍 `{doubled:,}`，以搶匪當時餘額為上限）。"
+        _am_success = discord.AllowedMentions(
+            users=[
+                discord.Object(id=interaction.user.id),
+                discord.Object(id=int(robber_id)),
+            ]
         )
+        return await interaction.response.send_message(
+            f"{interaction.user.mention} **【全頻公告】加倍搶回成功！**（本次成功率約 {pct}%）\n"
+            f"<@{robber_id}>（`{discord.utils.escape_markdown(rn)}`）被反制：搶回 **`{transferred:,}`** 東雲幣"
+            f"（目標加倍 `{doubled:,}`，以搶匪當時餘額為上限）。",
+            ephemeral=False,
+            allowed_mentions=_am_success,
+        )
+    _am_shout = discord.AllowedMentions(users=[discord.Object(id=interaction.user.id)])
     if pay <= 0:
         return await interaction.response.send_message(
-            f"❌ 搶匪餘額為 0，無法搶回。你的機會已消耗。\n（本次成功機率約 {pct}%，與一般搶劫相同公式。）",
-            ephemeral=True,
+            f"{interaction.user.mention} ❌ **【全頻公告】搶匪餘額為 0**，無法搶回；你的機會已消耗。\n"
+            f"（本次成功機率約 {pct}%；反制專用基礎成功率公式：基礎 {int(round(COUNTER_ROB_BASE_SUCCESS_RATE * 100))}%，每級差 ±1%。）",
+            ephemeral=False,
+            allowed_mentions=_am_shout,
         )
     return await interaction.response.send_message(
-        f"❌ **加倍搶回失敗**（本次成功機率約 {pct}%，與一般搶劫相同公式）。你的**唯一機會**已用盡。",
-        ephemeral=True,
+        f"{interaction.user.mention} ❌ **【全頻公告】加倍搶回失敗**（本次成功機率約 {pct}%；反制專用基礎成功率公式：基礎 {int(round(COUNTER_ROB_BASE_SUCCESS_RATE * 100))}%，每級差 ±1%）。"
+        f"你的**唯一機會**已用盡。",
+        ephemeral=False,
+        allowed_mentions=_am_shout,
     )
 
 
