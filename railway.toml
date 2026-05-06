@@ -1,5 +1,4 @@
-# Discord bot 不監聽 HTTP PORT；預設健康檢查會失敗 → 顯示 Crashed、部署流程也像卡住。
-# 不在此強制 builder（你可繼續用 Railpack）；僅覆寫部署與健康檢查。
+# Discord bot：關閉 HTTP 健康檢查；長連線啟動指令
 # https://docs.railway.app/deploy/config-as-code
 
 [deploy]

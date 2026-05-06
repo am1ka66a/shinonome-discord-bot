@@ -1,3 +1,0 @@
-# 使用 Nixpacks 建置，避免 Docker Hub 拉取 python:*-slim-bookworm 過慢或卡住
-[variables]
-NIXPACKS_PYTHON_VERSION = "3.11"
