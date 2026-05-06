@@ -2370,6 +2370,41 @@ async def _send_delete_log_image_overflow(ch: discord.TextChannel, urls: typing.
         await ch.send(embeds=[_delete_log_image_embed(u) for u in part])
 
 
+async def _is_message_deleted_by_bot(guild: discord.Guild, message: discord.Message) -> bool:
+    """若可判定此刪除由機器人執行，回傳 True（用於刪除紀錄忽略機器人刪除）。"""
+    if guild is None:
+        return False
+    try:
+        me = guild.me
+        if me and not me.guild_permissions.view_audit_log:
+            return False
+    except Exception:
+        return False
+    try:
+        async for entry in guild.audit_logs(limit=8, action=discord.AuditLogAction.message_delete):
+            target = entry.target
+            if not isinstance(target, (discord.Member, discord.User)):
+                continue
+            if message.author and target.id != message.author.id:
+                continue
+            if entry.extra and getattr(entry.extra, "channel", None):
+                if entry.extra.channel.id != message.channel.id:
+                    continue
+            try:
+                age = (datetime.datetime.now(datetime.timezone.utc) - entry.created_at).total_seconds()
+                if age > 10:
+                    continue
+            except Exception:
+                pass
+            actor = entry.user
+            if actor is not None and getattr(actor, "bot", False):
+                return True
+            return False
+    except Exception:
+        return False
+    return False
+
+
 @bot.event
 async def on_message_delete(message: discord.Message):
     """追蹤伺服器訊息刪除，在紀錄頻道備份原文與附件連結。"""
@@ -2377,6 +2412,8 @@ async def on_message_delete(message: discord.Message):
         if DELETE_LOG_CHANNEL_ID <= 0:
             return
         if message.guild is None:
+            return
+        if await _is_message_deleted_by_bot(message.guild, message):
             return
         author = message.author
         if author is not None and author.bot:
@@ -2740,6 +2777,7 @@ async def rob(
     level_gap = robber_level - target_level
     success_rate = ROB_BASE_SUCCESS_RATE + (level_gap * 0.01)
     success_rate = max(0.05, min(0.95, success_rate))
+    success_rate_pct = int(round(success_rate * 100))
     success = random.random() < success_rate
     c.execute("UPDATE users SET last_rob=%s WHERE user_id=%s", (now, str(interaction.user.id)))
     robber_name = interaction.user.display_name
@@ -2827,7 +2865,7 @@ async def rob(
         log_transaction(interaction.user.id, steal_amount, f"搶劫成功（目標:{member.id}）")
         log_transaction(member.id, -steal_amount, f"被搶劫（搶匪:{interaction.user.id}）")
         return await interaction.response.send_message(
-            f"{robber_name}搶了{victim_name}`{steal_amount:,}`東雲幣!!{wanted_info}{revenge_hint}"
+            f"{robber_name}搶了{victim_name}`{steal_amount:,}`東雲幣!!（本次成功率約 {success_rate_pct}%）{wanted_info}{revenge_hint}"
         )
 
     fail_penalty = int(max(1, min(robber_balance * random.uniform(0.15, 0.45), 1_000_000)))
@@ -2847,10 +2885,10 @@ async def rob(
         log_transaction(interaction.user.id, -fail_penalty, f"搶劫失敗反噬（目標:{member.id}）")
         log_transaction(member.id, fail_penalty, f"反制搶劫獲賠（搶匪:{interaction.user.id}）")
         return await interaction.response.send_message(
-            f"{robber_name}失手了! 反而被{victim_name}搶了`{fail_penalty:,}`東雲幣!"
+            f"{robber_name}失手了! 反而被{victim_name}搶了`{fail_penalty:,}`東雲幣!（本次成功率約 {success_rate_pct}%）"
         )
     return await interaction.response.send_message(
-        f"{robber_name}失手了! 反而被{victim_name}搶了`{fail_penalty:,}`東雲幣!"
+        f"{robber_name}失手了! 反而被{victim_name}搶了`{fail_penalty:,}`東雲幣!（本次成功率約 {success_rate_pct}%）"
     )
 
 
