@@ -585,42 +585,52 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS logs (id INT AUTO_INCREMENT PRIMARY KEY, user_id VARCHAR(255), amount BIGINT, reason VARCHAR(255), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
     try: c.execute("CREATE INDEX idx_logs_user_created ON logs (user_id, created_at)")
     except: pass
-    # 賭場總帳（獨立於一般 logs；不受 logs_retention_task 清理）
+    # 經濟總帳鏡像（對應 logs 每一筆；不受 logs_retention_task 清理）
     c.execute(
         '''CREATE TABLE IF NOT EXISTS casino_logs (
             id INT AUTO_INCREMENT PRIMARY KEY,
             user_id VARCHAR(255),
             amount BIGINT,
             reason VARCHAR(255),
+            source_log_id INT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )'''
     )
-    try: c.execute("CREATE INDEX idx_casino_logs_user_created ON casino_logs (user_id, created_at)")
-    except: pass
-    # 一次性回填：若 casino_logs 為空，將目前 logs 的總發幣／總回收寫入初始化紀錄，
-    # 讓 /casino_stats 在切換到獨立總帳後不會突然歸零。
     try:
-        c.execute("SELECT COUNT(*) FROM casino_logs")
-        _cl_cnt_row = c.fetchone()
-        _cl_cnt = int((_cl_cnt_row[0] if _cl_cnt_row else 0) or 0)
-        if _cl_cnt == 0:
-            c.execute("SELECT COALESCE(SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END), 0) FROM logs")
-            _issued_row = c.fetchone()
-            _issued_total = int((_issued_row[0] if _issued_row else 0) or 0)
-            c.execute("SELECT COALESCE(SUM(CASE WHEN amount < 0 THEN -amount ELSE 0 END), 0) FROM logs")
-            _recovered_row = c.fetchone()
-            _recovered_total = int((_recovered_row[0] if _recovered_row else 0) or 0)
-
-            if _issued_total > 0:
-                c.execute(
-                    "INSERT INTO casino_logs (user_id, amount, reason) VALUES (%s, %s, %s)",
-                    ("system", _issued_total, "總帳初始化（由舊 logs 匯入：總發幣量）"),
-                )
-            if _recovered_total > 0:
-                c.execute(
-                    "INSERT INTO casino_logs (user_id, amount, reason) VALUES (%s, %s, %s)",
-                    ("system", -_recovered_total, "總帳初始化（由舊 logs 匯入：總回收量）"),
-                )
+        c.execute("ALTER TABLE casino_logs ADD COLUMN source_log_id INT NULL")
+    except Exception:
+        pass
+    try: c.execute("CREATE UNIQUE INDEX uq_casino_logs_source_log_id ON casino_logs (source_log_id)")
+    except Exception:
+        pass
+    try: c.execute("CREATE INDEX idx_casino_logs_user_created ON casino_logs (user_id, created_at)")
+    except Exception:
+        pass
+    # 一次性／增量對齊：以 logs.id 去重，將既有流水完整鏡像到 casino_logs（全期總金流）
+    try:
+        c.execute("SELECT COUNT(*) FROM casino_logs WHERE source_log_id IS NOT NULL")
+        _mapped_row = c.fetchone()
+        _mapped_cnt = int((_mapped_row[0] if _mapped_row else 0) or 0)
+        if _mapped_cnt == 0:
+            c.execute("SELECT COUNT(*) FROM casino_logs")
+            _cl_any_row = c.fetchone()
+            _cl_any_cnt = int((_cl_any_row[0] if _cl_any_row else 0) or 0)
+            if _cl_any_cnt > 0:
+                try:
+                    c.execute("TRUNCATE TABLE casino_logs")
+                except Exception:
+                    c.execute("DELETE FROM casino_logs")
+            c.execute(
+                "INSERT INTO casino_logs (user_id, amount, reason, source_log_id, created_at) "
+                "SELECT user_id, amount, reason, id, created_at FROM logs"
+            )
+        else:
+            c.execute(
+                "INSERT INTO casino_logs (user_id, amount, reason, source_log_id, created_at) "
+                "SELECT l.user_id, l.amount, l.reason, l.id, l.created_at FROM logs l "
+                "LEFT JOIN casino_logs c ON c.source_log_id = l.id "
+                "WHERE c.source_log_id IS NULL"
+            )
     except Exception:
         pass
     try: c.execute("CREATE INDEX idx_users_level_exp ON users (level, exp)")
@@ -686,20 +696,28 @@ def log_transaction(user_id, amount, reason):
     conn = get_db_connection()
     c = conn.cursor()
     c.execute("INSERT INTO logs (user_id, amount, reason) VALUES (%s, %s, %s)", (str(user_id), amount, reason))
+    _new_log_id = c.lastrowid
     conn.commit()
     conn.close()
+    log_casino_transaction(user_id, amount, reason, source_log_id=_new_log_id)
 
 
-def log_casino_transaction(user_id, amount, reason):
-    """賭場專用流水（給 /casino_stats 全期總帳使用，不受一般 logs 清理影響）。"""
+def log_casino_transaction(user_id, amount, reason, source_log_id=None, created_at=None):
+    """logs 鏡像列（給 /casino_stats 全期總金流；不受一般 logs 清理影響）。"""
     if amount == 0:
         return
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute(
-        "INSERT INTO casino_logs (user_id, amount, reason) VALUES (%s, %s, %s)",
-        (str(user_id), amount, reason),
-    )
+    if created_at is not None:
+        c.execute(
+            "INSERT INTO casino_logs (user_id, amount, reason, source_log_id, created_at) VALUES (%s, %s, %s, %s, %s)",
+            (str(user_id), amount, reason, source_log_id, created_at),
+        )
+    else:
+        c.execute(
+            "INSERT INTO casino_logs (user_id, amount, reason, source_log_id) VALUES (%s, %s, %s, %s)",
+            (str(user_id), amount, reason, source_log_id),
+        )
     conn.commit()
     conn.close()
 
@@ -863,7 +881,6 @@ def update_game_result(user_id, balance_delta, profit_delta, is_win, is_push=Fal
     conn.close()
     if balance_delta != 0:
         log_transaction(user_id, balance_delta, "21點遊戲結算")
-        log_casino_transaction(user_id, balance_delta, "21點遊戲結算")
 
 def exp_for_next_level(level):
     lv = max(1, min(MAX_LEVEL, level))
@@ -2624,7 +2641,7 @@ async def help_slash(interaction: discord.Interaction):
             "`/level` — 等級與 EXP\n"
             "`/leaderboard` — 餘額榜前 10\n"
             "`/lvleaderboard` — 等級榜前 10\n"
-            "`/casino_stats` — 賭場金流統計"
+            "`/casino_stats` — 經濟總金流統計"
         ),
         inline=False,
     )
@@ -4061,7 +4078,7 @@ async def leaderboard(interaction: discord.Interaction):
     else:
         await interaction.response.send_message(embed=emb)
 
-@bot.tree.command(name="casino_stats", description="查看賭場金流統計（回收率/總發幣量/流通量）")
+@bot.tree.command(name="casino_stats", description="查看經濟總金流統計（回收率/總發幣量/流通量）")
 async def casino_stats(interaction: discord.Interaction):
     conn = get_db_connection()
     c = conn.cursor()
@@ -4080,13 +4097,13 @@ async def casino_stats(interaction: discord.Interaction):
 
     recovery_rate = (total_recovered / total_issued * 100) if total_issued > 0 else 0.0
     net_issued = total_issued - total_recovered
-    embed = discord.Embed(title="🏦 賭場金流統計", color=0x2b2d31)
+    embed = discord.Embed(title="🏦 經濟總金流統計", color=0x2b2d31)
     embed.add_field(name="金錢回收率", value=f"`{recovery_rate:.2f}%`", inline=False)
     embed.add_field(name="總發幣量", value=f"`{total_issued:,}` 東雲幣", inline=False)
     embed.add_field(name="總回收量", value=f"`{total_recovered:,}` 東雲幣", inline=False)
     embed.add_field(name="淨發行量", value=f"`{net_issued:,}` 東雲幣", inline=False)
     embed.add_field(name="目前流通量", value=f"`{circulation:,}` 東雲幣", inline=False)
-    embed.set_footer(text="計算基準：casino_logs（全期總帳）與 users.balance")
+    embed.set_footer(text="計算基準：casino_logs（logs 全期鏡像總帳）與 users.balance")
     await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="lvleaderboard", description="等級排行榜前 10 名")
