@@ -129,10 +129,9 @@ LOG_PURGE_INTERVAL_SECONDS = int(os.getenv("LOG_PURGE_INTERVAL_SECONDS", str(24 
 # 台灣時間 (UTC+8)；與 get_db_connection 的 MySQL session time_zone 一致
 TW_TZ = datetime.timezone(datetime.timedelta(hours=8))
 
-# 新用戶預設起始金（ensure_user_exists 預設）；舊帳一次性補帳亦同額
+# 新用戶預設起始金（ensure_user_exists 預設）
 DEFAULT_STARTUP_BALANCE = 50_000
 REASON_USER_INITIAL_BALANCE = "帳號建立初始資金"
-REASON_USER_INITIAL_BALANCE_BACKFILL = "帳號建立初始資金（補帳）"
 
 
 def now_tw_naive() -> datetime.datetime:
@@ -477,97 +476,6 @@ def get_db_connection():
     return _get_mysql_pool().connection()
 
 
-def _is_zero_start_placeholder_ledger_row(r) -> bool:
-    """僅供一次性補帳：略過以 ensure(...,0) 建立、經濟上仍為「空壳」的 user 列。"""
-    if int(r[1]) != 0:
-        return False
-    if int(r[2]) != 0:
-        return False
-    if int(r[3]) != 1:
-        return False
-    for i in range(4, 12):
-        if int(r[i]) != 0:
-            return False
-    for i in range(12, 20):
-        if r[i] is not None:
-            return False
-    return True
-
-
-def _run_initial_balance_ledger_backfill(c) -> None:
-    """舊版開局禮未入流水時，補登 DEFAULT_STARTUP_BALANCE（一次性；只加流水，不改餘額）。"""
-    c.execute(
-        """CREATE TABLE IF NOT EXISTS ledger_migrations (
-            name VARCHAR(64) PRIMARY KEY,
-            applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )"""
-    )
-    # v1 曾可能在「0 筆補帳」時就寫入遷移列，導致永不重跑；改以 v2 修正並再執行一次
-    c.execute(
-        "SELECT 1 FROM ledger_migrations WHERE name=%s",
-        ("initial_balance_backfill_v2",),
-    )
-    if c.fetchone():
-        return
-
-    reasons = (REASON_USER_INITIAL_BALANCE, REASON_USER_INITIAL_BALANCE_BACKFILL)
-    c.execute(
-        """
-        SELECT u.user_id,
-               COALESCE(u.balance, 0), COALESCE(u.exp, 0), COALESCE(u.level, 1),
-               COALESCE(u.total_games, 0), COALESCE(u.wins, 0), COALESCE(u.total_profit, 0),
-               COALESCE(u.rescue_count, 0),
-               COALESCE(u.hourly_bank, 0), COALESCE(u.wanted_stars, 0), COALESCE(u.in_prison, 0), COALESCE(u.revenge_pending, 0),
-               u.last_work, u.last_beg, u.last_rescue, u.last_rob, u.last_robbed, u.last_hourly_claim, u.last_wanted_buyout, u.last_role_change
-        FROM users u
-        WHERE NOT EXISTS (
-            SELECT 1 FROM logs l
-            WHERE l.user_id = u.user_id
-              AND l.reason IN (%s, %s)
-        )
-        AND NOT EXISTS (
-            SELECT 1 FROM casino_logs cl
-            WHERE cl.user_id = u.user_id
-              AND cl.reason IN (%s, %s)
-        )
-        """,
-        reasons + reasons,
-    )
-    rows = c.fetchall()
-    n_done = 0
-    n_skip_shell = 0
-    for row in rows:
-        uid = str(row[0])
-        c.execute("SELECT COUNT(*) FROM logs WHERE user_id=%s", (uid,))
-        n_logs = int((c.fetchone() or (0,))[0] or 0)
-        c.execute("SELECT COUNT(*) FROM casino_logs WHERE user_id=%s", (uid,))
-        n_cl = int((c.fetchone() or (0,))[0] or 0)
-        # 無任何流水且為空壳列 → 視為 ensure(...,0) 占位，不補登（避免帳上憑空多 5 萬「發行」）
-        if n_logs == 0 and n_cl == 0 and _is_zero_start_placeholder_ledger_row(row):
-            n_skip_shell += 1
-            continue
-        c.execute(
-            "INSERT INTO logs (user_id, amount, reason) VALUES (%s, %s, %s)",
-            (uid, DEFAULT_STARTUP_BALANCE, REASON_USER_INITIAL_BALANCE_BACKFILL),
-        )
-        _lid = c.lastrowid
-        c.execute(
-            "INSERT INTO casino_logs (user_id, amount, reason, source_log_id) VALUES (%s, %s, %s, %s)",
-            (uid, DEFAULT_STARTUP_BALANCE, REASON_USER_INITIAL_BALANCE_BACKFILL, _lid),
-        )
-        n_done += 1
-
-    c.execute(
-        "INSERT INTO ledger_migrations (name) VALUES (%s)",
-        ("initial_balance_backfill_v2",),
-    )
-    logger.info(
-        "經濟總帳補帳 v2：補登起始金流水 %s 筆（略過空壳 %s；僅流水，餘額不變）",
-        n_done,
-        n_skip_shell,
-    )
-
-
 def init_db():
     conn = get_db_connection()
     c = conn.cursor()
@@ -730,10 +638,6 @@ def init_db():
             )
     except Exception:
         pass
-    try:
-        _run_initial_balance_ledger_backfill(c)
-    except Exception as e:
-        logger.warning("initial balance ledger backfill 失敗（略過，可下次啟動重試）: %s", e)
     try: c.execute("CREATE INDEX idx_users_level_exp ON users (level, exp)")
     except: pass
     c.execute('''CREATE TABLE IF NOT EXISTS tournament_players (
