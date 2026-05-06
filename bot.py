@@ -713,7 +713,7 @@ WANTED_BUYOUT_COST = 300_000
 WANTED_BUYOUT_COOLDOWN_SECONDS = 86400  # 24 小時內不可再次買斷
 # 警察每次 /cop_hunt 追捕前須支付（成敗皆扣）
 COP_HUNT_FEE = 500_000
-# 追捕成功率：min(95, 基底 + 通緝星 × 每星加成)；1★ = 30%
+# 追捕成功率：clamp(5~95, 基底 + 通緝星 × 每星加成 + 等級差)；1★ 基準 = 30%
 COP_HUNT_CAPTURE_BASE_PCT = 25
 COP_HUNT_CAPTURE_PER_STAR_PCT = 5
 # 陣營轉職冷卻（24 小時）
@@ -2496,7 +2496,7 @@ async def help_slash(interaction: discord.Interaction):
             "`/wanted_status` — 自己的通緝、監獄、搶劫紀錄\n"
             "`/wanted_list` — 目前通緝名單與可否追捕\n"
             f"`/cop_hunt` — 警察追捕（僅警察；每次 **`{COP_HUNT_FEE:,}`** 幣、成敗皆扣）。"
-            f"成功率 **1★ 約 {_cop_hunt_pct_1star}%** 起，通緝每多 **1** 星 **+{COP_HUNT_CAPTURE_PER_STAR_PCT}%**，並受等級差影響（每級 ±1%，上限 **95%**）\n"
+            f"成功率 **1★ 約 {_cop_hunt_pct_1star}%** 起，通緝每多 **1** 星 **+{COP_HUNT_CAPTURE_PER_STAR_PCT}%**，並受等級差影響（每級 ±1%，保底 **5%**、上限 **95%**）\n"
             f"`/wanted_buyout` — [搶匪] 付 `{WANTED_BUYOUT_COST:,}` 消除全部通緝星（**24 小時**冷卻）\n"
             f"`/counter_rob` — 平民被搶**成功**後限一次加倍搶回（約 **{int(round(COUNTER_ROB_BASE_SUCCESS_RATE * 100))}%** 基礎、級差 ±1%；結果於**頻道公告**）\n"
             f"`/bail` — 入獄時繳假釋金 `{BAIL_COST:,}` 出獄"
@@ -2885,7 +2885,7 @@ async def role_choose_slash(interaction: discord.Interaction, role: str):
             value=(
                 "• 使用 `/cop_hunt` 選擇通緝犯並嘗試逮捕\n"
                 f"• 每次追捕會先扣 `{COP_HUNT_FEE:,}`（成敗皆扣）\n"
-                f"• 成功率：通緝星級每星 +{COP_HUNT_CAPTURE_PER_STAR_PCT}%，並受雙方等級差影響（每級 ±1%）\n"
+                f"• 成功率：通緝星級每星 +{COP_HUNT_CAPTURE_PER_STAR_PCT}%，並受雙方等級差影響（每級 ±1%，保底 5%、上限 95%）\n"
                 "• 成功可獲得其「最近五次搶劫成功」總額\n"
                 "• 通緝規則見 `/wanted_status`"
             ),
@@ -3004,10 +3004,12 @@ async def cop_hunt_slash(
             ephemeral=True,
         )
 
-    capture_chance = min(
-        95,
-        COP_HUNT_CAPTURE_BASE_PCT + wanted_stars * COP_HUNT_CAPTURE_PER_STAR_PCT + (cop_level - criminal_level),
+    capture_chance_raw = (
+        COP_HUNT_CAPTURE_BASE_PCT
+        + wanted_stars * COP_HUNT_CAPTURE_PER_STAR_PCT
+        + (cop_level - criminal_level)
     )
+    capture_chance = max(5, min(95, capture_chance_raw))
     is_caught = random.random() * 100.0 < float(capture_chance)
     now = now_tw_naive()
 
