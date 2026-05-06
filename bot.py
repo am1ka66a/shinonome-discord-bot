@@ -1153,9 +1153,6 @@ def get_deck(num_decks=6):
 def card_to_emoji(card, guild_id=None) -> str:
     return f"**[{card['rank']} {card['suit']}]**"
 
-async def sync_guild_emojis(guild: discord.Guild):
-    pass
-
 def card_back_emoji(guild_id=None) -> str:
     return "**[??]**"
 
