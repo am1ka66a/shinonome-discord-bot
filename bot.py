@@ -597,6 +597,32 @@ def init_db():
     )
     try: c.execute("CREATE INDEX idx_casino_logs_user_created ON casino_logs (user_id, created_at)")
     except: pass
+    # 一次性回填：若 casino_logs 為空，將目前 logs 的總發幣／總回收寫入初始化紀錄，
+    # 讓 /casino_stats 在切換到獨立總帳後不會突然歸零。
+    try:
+        c.execute("SELECT COUNT(*) FROM casino_logs")
+        _cl_cnt_row = c.fetchone()
+        _cl_cnt = int((_cl_cnt_row[0] if _cl_cnt_row else 0) or 0)
+        if _cl_cnt == 0:
+            c.execute("SELECT COALESCE(SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END), 0) FROM logs")
+            _issued_row = c.fetchone()
+            _issued_total = int((_issued_row[0] if _issued_row else 0) or 0)
+            c.execute("SELECT COALESCE(SUM(CASE WHEN amount < 0 THEN -amount ELSE 0 END), 0) FROM logs")
+            _recovered_row = c.fetchone()
+            _recovered_total = int((_recovered_row[0] if _recovered_row else 0) or 0)
+
+            if _issued_total > 0:
+                c.execute(
+                    "INSERT INTO casino_logs (user_id, amount, reason) VALUES (%s, %s, %s)",
+                    ("system", _issued_total, "總帳初始化（由舊 logs 匯入：總發幣量）"),
+                )
+            if _recovered_total > 0:
+                c.execute(
+                    "INSERT INTO casino_logs (user_id, amount, reason) VALUES (%s, %s, %s)",
+                    ("system", -_recovered_total, "總帳初始化（由舊 logs 匯入：總回收量）"),
+                )
+    except Exception:
+        pass
     try: c.execute("CREATE INDEX idx_users_level_exp ON users (level, exp)")
     except: pass
     c.execute('''CREATE TABLE IF NOT EXISTS tournament_players (
