@@ -1,0 +1,15 @@
+# 縮小建置／上傳脈絡（Railpack／Docker 類建置會用到）
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+ENV/
+.git/
+.idea/
+.vscode/
+*.log
+logs/
+.env
+.env.*

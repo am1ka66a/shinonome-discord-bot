@@ -1,10 +1,20 @@
 # Discord bot：關閉 HTTP 健康檢查；長連線啟動指令
 # https://docs.railway.app/deploy/config-as-code
 #
-# 若建置似乎卡在「pip install -r requirements.txt」：
-# · pip 下載／解壓時可能長時間不輸出新行，不代表一定壞掉（冷機／PyPI 慢時可到數分鐘）。
-# · Railway → Variables（勾選 Available at Build）：RAILPACK_VERBOSE=1 → 建置日誌較細。
-# · 另可選（同上 Build）：PIP_PREFER_BINARY=1
+# ── 若畫面長時間停在 Building / 像卡住，先分辨是哪一段 ──
+# 1) 「上傳／Fetching repository」很久：多半是 GitHub↔Railway 連線或 repo 很大；
+#    · 到 Railway → 該服務 → Settings → 重新連一次 GitHub，或改分支觸發部署。
+#    · 確認 repo 沒把 .venv、大量資產 commit 進去（本機 venv 應在 .gitignore）。
+# 2) 「pip install -r requirements.txt」無新行很久：常見，冷機或 PyPI 慢時可數分鐘。
+#    · Railway → Variables → 勾選 Available at Build：
+#      RAILPACK_VERBOSE=1   （建置日誌較細）
+#      PIP_PREFER_BINARY=1 （盡量裝 wheel，通常較快）
+#    · 仍超時：Deployments → 該次建置 → 看完整 log 最後一行卡在哪。
+#
+# 本倉已附 .dockerignore，避免本機 venv 等被算進建置脈絡（若用會打包目錄的流程）。
+
+[build]
+builder = "RAILPACK"
 
 [deploy]
 startCommand = "python -u bot.py"
