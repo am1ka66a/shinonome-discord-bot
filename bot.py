@@ -129,6 +129,11 @@ LOG_PURGE_INTERVAL_SECONDS = int(os.getenv("LOG_PURGE_INTERVAL_SECONDS", str(24 
 # 台灣時間 (UTC+8)；與 get_db_connection 的 MySQL session time_zone 一致
 TW_TZ = datetime.timezone(datetime.timedelta(hours=8))
 
+# 新用戶預設起始金（ensure_user_exists 預設）；舊帳一次性補帳亦同額
+DEFAULT_STARTUP_BALANCE = 50_000
+REASON_USER_INITIAL_BALANCE = "帳號建立初始資金"
+REASON_USER_INITIAL_BALANCE_BACKFILL = "帳號建立初始資金（補帳）"
+
 
 def now_tw_naive() -> datetime.datetime:
     """目前台灣本地時間（naive datetime）。"""
@@ -471,6 +476,81 @@ def get_db_connection():
     """從連線池取得連線；用完請 commit／rollback 並 close（會歸還池中）。"""
     return _get_mysql_pool().connection()
 
+
+def _is_zero_start_placeholder_ledger_row(r) -> bool:
+    """僅供一次性補帳：略過以 ensure(...,0) 建立、經濟上仍為「空壳」的 user 列。"""
+    if int(r[1]) != 0:
+        return False
+    if int(r[2]) != 0:
+        return False
+    if int(r[3]) != 1:
+        return False
+    for i in range(4, 12):
+        if int(r[i]) != 0:
+            return False
+    for i in range(12, 20):
+        if r[i] is not None:
+            return False
+    return True
+
+
+def _run_initial_balance_ledger_backfill(c) -> None:
+    """舊版開局禮未入流水時，補登 DEFAULT_STARTUP_BALANCE（一次性）。"""
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS ledger_migrations (
+            name VARCHAR(64) PRIMARY KEY,
+            applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )"""
+    )
+    c.execute(
+        "SELECT 1 FROM ledger_migrations WHERE name=%s",
+        ("initial_balance_backfill_v1",),
+    )
+    if c.fetchone():
+        return
+
+    c.execute(
+        """
+        SELECT u.user_id,
+               COALESCE(u.balance, 0), COALESCE(u.exp, 0), COALESCE(u.level, 1),
+               COALESCE(u.total_games, 0), COALESCE(u.wins, 0), COALESCE(u.total_profit, 0),
+               COALESCE(u.rescue_count, 0),
+               COALESCE(u.hourly_bank, 0), COALESCE(u.wanted_stars, 0), COALESCE(u.in_prison, 0), COALESCE(u.revenge_pending, 0),
+               u.last_work, u.last_beg, u.last_rescue, u.last_rob, u.last_robbed, u.last_hourly_claim, u.last_wanted_buyout, u.last_role_change
+        FROM users u
+        WHERE NOT EXISTS (
+            SELECT 1 FROM logs l
+            WHERE l.user_id = u.user_id
+              AND l.reason IN (%s, %s)
+        )
+        """,
+        (REASON_USER_INITIAL_BALANCE, REASON_USER_INITIAL_BALANCE_BACKFILL),
+    )
+    rows = c.fetchall()
+    n_done = 0
+    for row in rows:
+        if _is_zero_start_placeholder_ledger_row(row):
+            continue
+        uid = str(row[0])
+        c.execute(
+            "INSERT INTO logs (user_id, amount, reason) VALUES (%s, %s, %s)",
+            (uid, DEFAULT_STARTUP_BALANCE, REASON_USER_INITIAL_BALANCE_BACKFILL),
+        )
+        _lid = c.lastrowid
+        c.execute(
+            "INSERT INTO casino_logs (user_id, amount, reason, source_log_id) VALUES (%s, %s, %s, %s)",
+            (uid, DEFAULT_STARTUP_BALANCE, REASON_USER_INITIAL_BALANCE_BACKFILL, _lid),
+        )
+        n_done += 1
+
+    c.execute(
+        "INSERT INTO ledger_migrations (name) VALUES (%s)",
+        ("initial_balance_backfill_v1",),
+    )
+    if n_done:
+        logger.info("經濟總帳補帳：已為 %s 位使用者補登起始金流水（每筆 %s）", n_done, DEFAULT_STARTUP_BALANCE)
+
+
 def init_db():
     conn = get_db_connection()
     c = conn.cursor()
@@ -633,6 +713,10 @@ def init_db():
             )
     except Exception:
         pass
+    try:
+        _run_initial_balance_ledger_backfill(c)
+    except Exception as e:
+        logger.warning("initial balance ledger backfill 失敗（略過，可下次啟動重試）: %s", e)
     try: c.execute("CREATE INDEX idx_users_level_exp ON users (level, exp)")
     except: pass
     c.execute('''CREATE TABLE IF NOT EXISTS tournament_players (
@@ -737,7 +821,7 @@ def get_user_stats(user_id):
     conn.close()
     return res
 
-def ensure_user_exists(user_id, startup_balance=50000):
+def ensure_user_exists(user_id, startup_balance=DEFAULT_STARTUP_BALANCE):
     uid = str(user_id)
     bal = int(startup_balance)
     conn = get_db_connection()
@@ -750,7 +834,7 @@ def ensure_user_exists(user_id, startup_balance=50000):
     conn.commit()
     conn.close()
     if inserted and bal != 0:
-        log_transaction(uid, bal, "帳號建立初始資金")
+        log_transaction(uid, bal, REASON_USER_INITIAL_BALANCE)
 
 
 def _user_role_value(raw) -> str:
