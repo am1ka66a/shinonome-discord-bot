@@ -764,9 +764,9 @@ BAIL_COST = 100_000
 WANTED_BUYOUT_COST = 300_000
 WANTED_BUYOUT_COOLDOWN_SECONDS = 86400  # 24 小時內不可再次買斷
 # 警察每次 /cop_hunt 追捕前須支付（成敗皆扣）
-COP_HUNT_FEE = 500_000
-# 追捕成功率：clamp(5~95, 基底 + 通緝星 × 每星加成 + 等級差)；1★ 基準 = 30%
-COP_HUNT_CAPTURE_BASE_PCT = 25
+COP_HUNT_FEE = 300_000
+# 追捕成功率：clamp(5~95, 基底 + 通緝星 × 每星加成 + 等級差)；1★ 基準 = 40%
+COP_HUNT_CAPTURE_BASE_PCT = 35
 COP_HUNT_CAPTURE_PER_STAR_PCT = 5
 # 陣營轉職冷卻（24 小時）
 ROLE_CHANGE_COOLDOWN_SECONDS = 86400
