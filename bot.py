@@ -2667,7 +2667,7 @@ async def help_slash(interaction: discord.Interaction):
             "`/wanted_list` — 目前通緝名單與可否追捕\n"
             f"`/cop_hunt` — 警察追捕（僅警察；每次 **`{COP_HUNT_FEE:,}`** 幣、成敗皆扣）。"
             f"成功率 **1★ 約 {_cop_hunt_pct_1star}%** 起，通緝每多 **1** 星 **+{COP_HUNT_CAPTURE_PER_STAR_PCT}%**，並受等級差影響（每級 ±1%，保底 **5%**、上限 **95%**）\n"
-            f"`/wanted_buyout` — [搶匪] 付 `{WANTED_BUYOUT_COST:,}` 消除全部通緝星（**24 小時**冷卻）\n"
+            f"`/wanted_buyout` — [搶匪] 付 `{WANTED_BUYOUT_COST:,}` 消除全部通緝星並**清空最近搶劫紀錄**（**24 小時**冷卻）\n"
             f"`/counter_rob` — 平民被搶**成功**後限一次（約 **{int(round(COUNTER_ROB_BASE_SUCCESS_RATE * 100))}%** 基礎、級差 ±1%）；**成功領滿加倍**；搶匪扣款後**餘額 0 入獄**否則不入獄；不足額記假釋債\n"
             f"`/bail` — 入獄繳 **基礎 `{BAIL_COST:,}` + 累計假釋欠款** 出獄"
         ),
@@ -3027,7 +3027,7 @@ async def role_choose_slash(interaction: discord.Interaction, role: str):
         )
     if role in ("cop", "civilian"):
         c.execute(
-            "UPDATE users SET role=%s, wanted_stars=0, wanted_hunted_count=0, last_role_change=%s WHERE user_id=%s",
+            "UPDATE users SET role=%s, wanted_stars=0, wanted_hunted_count=0, last_five_robs=NULL, last_role_change=%s WHERE user_id=%s",
             (role, now, str(interaction.user.id)),
         )
     else:
@@ -3336,7 +3336,7 @@ async def cop_hunt_slash(
 
 @bot.tree.command(
     name="wanted_buyout",
-    description=f"[搶匪] 支付 {WANTED_BUYOUT_COST:,} 東雲幣消除通緝（24 小時僅能一次）",
+    description=f"[搶匪] 支付 {WANTED_BUYOUT_COST:,} 東雲幣消除通緝並清空最近搶劫紀錄（24 小時僅能一次）",
 )
 async def wanted_buyout_slash(interaction: discord.Interaction):
     if not interaction.guild:
@@ -3390,7 +3390,7 @@ async def wanted_buyout_slash(interaction: discord.Interaction):
 
     c.execute(
         """UPDATE users SET balance=balance-%s,
-           wanted_stars=0, wanted_hunted_count=0, last_wanted_buyout=%s
+           wanted_stars=0, wanted_hunted_count=0, last_five_robs=NULL, last_wanted_buyout=%s
            WHERE user_id=%s AND balance >= %s""",
         (cost, now, uid, cost),
     )
@@ -3406,7 +3406,7 @@ async def wanted_buyout_slash(interaction: discord.Interaction):
         title="✅ 通緝買斷成功（頻道公告）",
         description=(
             f"{interaction.user.mention} 支付 **`{cost:,}`** 東雲幣，"
-            f"原通緝 **{stars_was}** 星已消除，追捕計數已歸零。"
+            f"原通緝 **{stars_was}** 星已消除，追捕計數已歸零，**最近搶劫紀錄已清空**。"
         ),
         color=0x57F287,
     )
