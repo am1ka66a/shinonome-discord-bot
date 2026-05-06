@@ -1894,11 +1894,57 @@ async def _resolve_relay_from_staff_reply(
             ref_msg = await channel.fetch_message(ref_id)
         except Exception:
             return None
+        parsed = _relay_meta_from_forward_message(ref_msg)
+        if parsed is not None:
+            _relay_forward_meta[ref_id] = parsed
+            return parsed
         if ref_msg.reference and ref_msg.reference.message_id:
             ref_id = ref_msg.reference.message_id
         else:
             return None
     return None
+
+
+def _relay_meta_from_forward_message(ref_msg: discord.Message) -> typing.Optional[RelayForwardMeta]:
+    """從已發送到轉接頻道的 embed 反解析 relay meta（供重啟後快取遺失時使用）。"""
+    if bot.user is None or ref_msg.author.id != bot.user.id:
+        return None
+    if not ref_msg.embeds:
+        return None
+
+    emb = ref_msg.embeds[0]
+    title = (emb.title or "").strip()
+    if not title:
+        return None
+    allow_private_reply = "私訊轉發" in title
+
+    field_map = {str(f.name): str(f.value) for f in emb.fields}
+    sender_text = field_map.get("發送者", "")
+    if not sender_text:
+        return None
+
+    m_uid = re.search(r"ID\s*`(\d{15,20})`", sender_text)
+    if not m_uid:
+        m_uid = re.search(r"<@!?(\d{15,20})>", sender_text)
+    if not m_uid:
+        return None
+    target_user_id = int(m_uid.group(1))
+
+    guild_id = 0
+    channel_id = 0
+    message_id = 0
+    if not allow_private_reply:
+        loc_text = field_map.get("頻道／原訊", "")
+        m_jump = re.search(r"/channels/(\d{15,20})/(\d{15,20})/(\d{15,20})", loc_text)
+        if m_jump:
+            guild_id = int(m_jump.group(1))
+            channel_id = int(m_jump.group(2))
+            message_id = int(m_jump.group(3))
+        else:
+            # 群組回覆至少要拿到原頻道與原訊息 ID 才能代發。
+            return None
+
+    return (target_user_id, allow_private_reply, guild_id, channel_id, message_id)
 
 
 async def relay_user_message_to_staff_channel(message: discord.Message, *, is_dm: bool) -> None:
