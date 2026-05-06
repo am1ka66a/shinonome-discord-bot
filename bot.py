@@ -738,14 +738,19 @@ def get_user_stats(user_id):
     return res
 
 def ensure_user_exists(user_id, startup_balance=50000):
+    uid = str(user_id)
+    bal = int(startup_balance)
     conn = get_db_connection()
     c = conn.cursor()
     c.execute(
         "INSERT IGNORE INTO users (user_id, balance) VALUES (%s, %s)",
-        (str(user_id), int(startup_balance))
+        (uid, bal),
     )
+    inserted = c.rowcount > 0
     conn.commit()
     conn.close()
+    if inserted and bal != 0:
+        log_transaction(uid, bal, "帳號建立初始資金")
 
 
 def _user_role_value(raw) -> str:
