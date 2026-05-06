@@ -13,6 +13,7 @@ import math
 import os
 import random
 import re
+import sys
 import time
 import typing
 from urllib.parse import urlparse
@@ -26,6 +27,14 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# 容器環境（Railway 等）若未使用 python -u，預設 stdout 會緩衝，部署日誌像「卡住」
+for _stream in (sys.stdout, sys.stderr):
+    if _stream is not None and hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(line_buffering=True)
+        except Exception:
+            pass
 
 # ------------------------------------------------------------------------------
 # bot.py 大區索引（細節仍見各段「【數字】」標題）
