@@ -1693,7 +1693,10 @@ class RedPacketView(discord.ui.View):
             amount = self.left_amount
         else:
             max_pick = self.left_amount - (self.left_count - 1)
-            amount = random.randint(1, max_pick)
+            # 非最後一位：單次最多可拿總金額 40%
+            non_last_cap = max(1, int(self.total_amount * 0.4))
+            capped_max_pick = max(1, min(max_pick, non_last_cap))
+            amount = random.randint(1, capped_max_pick)
         self.left_amount -= amount
         self.left_count -= 1
         self.claimed_users.add(interaction.user.id)
