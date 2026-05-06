@@ -495,20 +495,22 @@ def _is_zero_start_placeholder_ledger_row(r) -> bool:
 
 
 def _run_initial_balance_ledger_backfill(c) -> None:
-    """舊版開局禮未入流水時，補登 DEFAULT_STARTUP_BALANCE（一次性）。"""
+    """舊版開局禮未入流水時，補登 DEFAULT_STARTUP_BALANCE（一次性；只加流水，不改餘額）。"""
     c.execute(
         """CREATE TABLE IF NOT EXISTS ledger_migrations (
             name VARCHAR(64) PRIMARY KEY,
             applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )"""
     )
+    # v1 曾可能在「0 筆補帳」時就寫入遷移列，導致永不重跑；改以 v2 修正並再執行一次
     c.execute(
         "SELECT 1 FROM ledger_migrations WHERE name=%s",
-        ("initial_balance_backfill_v1",),
+        ("initial_balance_backfill_v2",),
     )
     if c.fetchone():
         return
 
+    reasons = (REASON_USER_INITIAL_BALANCE, REASON_USER_INITIAL_BALANCE_BACKFILL)
     c.execute(
         """
         SELECT u.user_id,
@@ -523,15 +525,27 @@ def _run_initial_balance_ledger_backfill(c) -> None:
             WHERE l.user_id = u.user_id
               AND l.reason IN (%s, %s)
         )
+        AND NOT EXISTS (
+            SELECT 1 FROM casino_logs cl
+            WHERE cl.user_id = u.user_id
+              AND cl.reason IN (%s, %s)
+        )
         """,
-        (REASON_USER_INITIAL_BALANCE, REASON_USER_INITIAL_BALANCE_BACKFILL),
+        reasons + reasons,
     )
     rows = c.fetchall()
     n_done = 0
+    n_skip_shell = 0
     for row in rows:
-        if _is_zero_start_placeholder_ledger_row(row):
-            continue
         uid = str(row[0])
+        c.execute("SELECT COUNT(*) FROM logs WHERE user_id=%s", (uid,))
+        n_logs = int((c.fetchone() or (0,))[0] or 0)
+        c.execute("SELECT COUNT(*) FROM casino_logs WHERE user_id=%s", (uid,))
+        n_cl = int((c.fetchone() or (0,))[0] or 0)
+        # 無任何流水且為空壳列 → 視為 ensure(...,0) 占位，不補登（避免帳上憑空多 5 萬「發行」）
+        if n_logs == 0 and n_cl == 0 and _is_zero_start_placeholder_ledger_row(row):
+            n_skip_shell += 1
+            continue
         c.execute(
             "INSERT INTO logs (user_id, amount, reason) VALUES (%s, %s, %s)",
             (uid, DEFAULT_STARTUP_BALANCE, REASON_USER_INITIAL_BALANCE_BACKFILL),
@@ -545,10 +559,13 @@ def _run_initial_balance_ledger_backfill(c) -> None:
 
     c.execute(
         "INSERT INTO ledger_migrations (name) VALUES (%s)",
-        ("initial_balance_backfill_v1",),
+        ("initial_balance_backfill_v2",),
     )
-    if n_done:
-        logger.info("經濟總帳補帳：已為 %s 位使用者補登起始金流水（每筆 %s）", n_done, DEFAULT_STARTUP_BALANCE)
+    logger.info(
+        "經濟總帳補帳 v2：補登起始金流水 %s 筆（略過空壳 %s；僅流水，餘額不變）",
+        n_done,
+        n_skip_shell,
+    )
 
 
 def init_db():
