@@ -1,5 +1,10 @@
 # Discord bot：關閉 HTTP 健康檢查；長連線啟動指令
 # https://docs.railway.app/deploy/config-as-code
+#
+# 若建置似乎卡在「pip install -r requirements.txt」：
+# · pip 下載／解壓時可能長時間不輸出新行，不代表一定壞掉（冷機／PyPI 慢時可到數分鐘）。
+# · Railway → Variables（勾選 Available at Build）：RAILPACK_VERBOSE=1 → 建置日誌較細。
+# · 另可選（同上 Build）：PIP_PREFER_BINARY=1
 
 [deploy]
 startCommand = "python -u bot.py"
