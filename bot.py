@@ -585,6 +585,18 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS logs (id INT AUTO_INCREMENT PRIMARY KEY, user_id VARCHAR(255), amount BIGINT, reason VARCHAR(255), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
     try: c.execute("CREATE INDEX idx_logs_user_created ON logs (user_id, created_at)")
     except: pass
+    # 賭場總帳（獨立於一般 logs；不受 logs_retention_task 清理）
+    c.execute(
+        '''CREATE TABLE IF NOT EXISTS casino_logs (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            user_id VARCHAR(255),
+            amount BIGINT,
+            reason VARCHAR(255),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )'''
+    )
+    try: c.execute("CREATE INDEX idx_casino_logs_user_created ON casino_logs (user_id, created_at)")
+    except: pass
     try: c.execute("CREATE INDEX idx_users_level_exp ON users (level, exp)")
     except: pass
     c.execute('''CREATE TABLE IF NOT EXISTS tournament_players (
@@ -648,6 +660,20 @@ def log_transaction(user_id, amount, reason):
     conn = get_db_connection()
     c = conn.cursor()
     c.execute("INSERT INTO logs (user_id, amount, reason) VALUES (%s, %s, %s)", (str(user_id), amount, reason))
+    conn.commit()
+    conn.close()
+
+
+def log_casino_transaction(user_id, amount, reason):
+    """賭場專用流水（給 /casino_stats 全期總帳使用，不受一般 logs 清理影響）。"""
+    if amount == 0:
+        return
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO casino_logs (user_id, amount, reason) VALUES (%s, %s, %s)",
+        (str(user_id), amount, reason),
+    )
     conn.commit()
     conn.close()
 
@@ -811,6 +837,7 @@ def update_game_result(user_id, balance_delta, profit_delta, is_win, is_push=Fal
     conn.close()
     if balance_delta != 0:
         log_transaction(user_id, balance_delta, "21點遊戲結算")
+        log_casino_transaction(user_id, balance_delta, "21點遊戲結算")
 
 def exp_for_next_level(level):
     lv = max(1, min(MAX_LEVEL, level))
@@ -4012,11 +4039,11 @@ async def leaderboard(interaction: discord.Interaction):
 async def casino_stats(interaction: discord.Interaction):
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT COALESCE(SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END), 0) FROM logs")
+    c.execute("SELECT COALESCE(SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END), 0) FROM casino_logs")
     issued_row = c.fetchone()
     total_issued = int((issued_row[0] if issued_row else 0) or 0)
 
-    c.execute("SELECT COALESCE(SUM(CASE WHEN amount < 0 THEN -amount ELSE 0 END), 0) FROM logs")
+    c.execute("SELECT COALESCE(SUM(CASE WHEN amount < 0 THEN -amount ELSE 0 END), 0) FROM casino_logs")
     recovered_row = c.fetchone()
     total_recovered = int((recovered_row[0] if recovered_row else 0) or 0)
 
@@ -4033,7 +4060,7 @@ async def casino_stats(interaction: discord.Interaction):
     embed.add_field(name="總回收量", value=f"`{total_recovered:,}` 東雲幣", inline=False)
     embed.add_field(name="淨發行量", value=f"`{net_issued:,}` 東雲幣", inline=False)
     embed.add_field(name="目前流通量", value=f"`{circulation:,}` 東雲幣", inline=False)
-    embed.set_footer(text="計算基準：logs 與 users.balance")
+    embed.set_footer(text="計算基準：casino_logs（全期總帳）與 users.balance")
     await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="lvleaderboard", description="等級排行榜前 10 名")
