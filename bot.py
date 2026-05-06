@@ -2668,7 +2668,7 @@ async def help_slash(interaction: discord.Interaction):
             f"`/cop_hunt` — 警察追捕（僅警察；每次 **`{COP_HUNT_FEE:,}`** 幣、成敗皆扣）。"
             f"成功率 **1★ 約 {_cop_hunt_pct_1star}%** 起，通緝每多 **1** 星 **+{COP_HUNT_CAPTURE_PER_STAR_PCT}%**，並受等級差影響（每級 ±1%，保底 **5%**、上限 **95%**）\n"
             f"`/wanted_buyout` — [搶匪] 付 `{WANTED_BUYOUT_COST:,}` 消除全部通緝星（**24 小時**冷卻）\n"
-            f"`/counter_rob` — 平民被搶**成功**後限一次加倍搶回（約 **{int(round(COUNTER_ROB_BASE_SUCCESS_RATE * 100))}%** 基礎、級差 ±1%；**成功則領滿加倍**，搶匪不足記假釋債）\n"
+            f"`/counter_rob` — 平民被搶**成功**後限一次（約 **{int(round(COUNTER_ROB_BASE_SUCCESS_RATE * 100))}%** 基礎、級差 ±1%）；**成功領滿加倍**；搶匪扣款後**餘額 0 入獄**否則不入獄；不足額記假釋債\n"
             f"`/bail` — 入獄繳 **基礎 `{BAIL_COST:,}` + 累計假釋欠款** 出獄"
         ),
         inline=False,
@@ -3450,8 +3450,8 @@ async def wanted_status_slash(interaction: discord.Interaction):
         emb.add_field(
             name="加倍搶回",
             value=(
-                f"可使用 `/counter_rob` 一次；成功可領 **`{(int(rev_amt or 0) * 2):,}`**（加倍），"
-                "搶匪餘額不足之差額記入其假釋債務。"
+                f"可使用 `/counter_rob` 一次；成功可領 **`{(int(rev_amt or 0) * 2):,}`**（加倍）；"
+                "搶匪扣完若**餘額 0** 會**入獄**，否則不入獄；不足額記假釋債務。"
             ),
             inline=False,
         )
@@ -3541,7 +3541,7 @@ async def wanted_list_slash(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="counter_rob",
-    description="平民被搶成功後限一次：反制成功則領滿加倍金額；搶匪餘額不足之差額併入假釋債務",
+    description="平民被搶成功後限一次：反制成功領滿加倍；搶匪付完若餘額為0入獄，否則不入獄；不足額併假釋債",
 )
 async def counter_rob_slash(interaction: discord.Interaction):
     if not interaction.guild:
@@ -3609,11 +3609,32 @@ async def counter_rob_slash(interaction: discord.Interaction):
     roll_ok = random.random() < success_rate
 
     transferred = 0
+    robber_imprisoned = False
     if roll_ok:
+        now_cr = now_tw_naive()
         c.execute(
             "UPDATE users SET balance=GREATEST(0, balance-%s), bail_debt=COALESCE(bail_debt,0)+%s WHERE user_id=%s",
             (pay, debt_from_shortfall, str(robber_id)),
         )
+        c.execute(
+            "SELECT COALESCE(balance,0), COALESCE(in_prison,0) FROM users WHERE user_id=%s",
+            (str(robber_id),),
+        )
+        _rb_after = c.fetchone()
+        bal_after = int((_rb_after[0] if _rb_after else 0) or 0)
+        already_pr = int((_rb_after[1] if _rb_after else 0) or 0)
+        if bal_after == 0 and not already_pr:
+            c.execute(
+                "UPDATE users SET in_prison=1, prison_start=%s WHERE user_id=%s AND COALESCE(in_prison,0)=0",
+                (now_cr, str(robber_id)),
+            )
+            c.execute(
+                """INSERT INTO prison_records
+                   (criminal_id, cop_id, wanted_stars, confiscated_amount, cop_reward, bail_cost, arrested_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                (str(robber_id), victim_id, 0, pay, 0, BAIL_COST, now_cr),
+            )
+            robber_imprisoned = True
         c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (doubled, victim_id))
         transferred = doubled
 
@@ -3640,10 +3661,13 @@ async def counter_rob_slash(interaction: discord.Interaction):
         debt_note = ""
         if debt_from_shortfall > 0:
             debt_note = f"\n（搶匪當場僅能支付 `{pay:,}`，差額 **`{debt_from_shortfall:,}`** 已併入其假釋債務 `/bail`）"
+        prison_note = ""
+        if robber_imprisoned:
+            prison_note = f"\n<@{robber_id}> **餘額歸零**，已**入獄**（`/bail` 假釋：`{BAIL_COST:,}` + 累計欠款）。"
         return await interaction.response.send_message(
             f"{interaction.user.mention} **加倍搶回成功！**（本次成功率約 {pct}%）\n"
             f"你已拿回 **`{transferred:,}`** 東雲幣（加倍目標 **`{doubled:,}`**）。\n"
-            f"<@{robber_id}>（`{discord.utils.escape_markdown(rn)}`）被扣 **`{pay:,}`** 東雲幣。{debt_note}",
+            f"<@{robber_id}>（`{discord.utils.escape_markdown(rn)}`）被扣 **`{pay:,}`** 東雲幣。{debt_note}{prison_note}",
             ephemeral=False,
             allowed_mentions=_am_success,
         )
