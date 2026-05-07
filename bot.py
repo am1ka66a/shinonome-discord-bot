@@ -412,6 +412,74 @@ async def resolve_slash_target(
         return None, f"無法查詢使用者：{e}"
 
 
+async def interaction_defer_if_needed(
+    interaction: discord.Interaction,
+    *,
+    ephemeral: bool = False,
+    thinking: bool = True,
+) -> None:
+    """先 ACK slash interaction，避免同步 DB 或外部 API 慢時觸發 3 秒逾時。"""
+    if interaction.response.is_done():
+        return
+    try:
+        await interaction.response.defer(ephemeral=ephemeral, thinking=thinking)
+    except discord.InteractionResponded:
+        pass
+
+
+async def interaction_send(
+    interaction: discord.Interaction,
+    *args,
+    **kwargs,
+):
+    """已 defer 的互動走 followup；未回應的互動走原本 response。"""
+    if interaction.response.is_done():
+        kwargs.setdefault("wait", True)
+        return await interaction.followup.send(*args, **kwargs)
+    return await interaction.response.send_message(*args, **kwargs)
+
+
+async def db_to_thread(func: typing.Callable[..., typing.Any], *args, **kwargs):
+    """把同步 DB helper 丟到 thread，避免阻塞 discord.py event loop。"""
+    return await asyncio.to_thread(func, *args, **kwargs)
+
+
+async def ensure_user_exists_async(user_id, startup_balance=DEFAULT_STARTUP_BALANCE):
+    return await db_to_thread(ensure_user_exists, user_id, startup_balance)
+
+
+async def get_user_stats_async(user_id):
+    return await db_to_thread(get_user_stats, user_id)
+
+
+async def fetch_record_rows_async(user_id, limit: int = 50):
+    return await db_to_thread(fetch_record_rows, user_id, limit)
+
+
+async def fetch_casino_stats_rows_async():
+    return await db_to_thread(fetch_casino_stats_rows)
+
+
+async def claim_daily_reward_async(user_id, daily_reward: int = 100_000):
+    return await db_to_thread(claim_daily_reward, user_id, daily_reward)
+
+
+async def claim_hourly_reward_async(user_id, reward_per_slot: int = 1000):
+    return await db_to_thread(claim_hourly_reward, user_id, reward_per_slot)
+
+
+async def get_level_stats_async(user_id):
+    return await db_to_thread(get_level_stats, user_id)
+
+
+async def get_claimed_milestones_async(user_id):
+    return await db_to_thread(get_claimed_milestones, user_id)
+
+
+async def try_deduct_balance_async(user_id, amount, reason):
+    return await db_to_thread(try_deduct_balance, user_id, amount, reason)
+
+
 # ··············································································
 # [C · 資料與持久化]
 # ··············································································
@@ -701,14 +769,21 @@ def init_db():
     conn.close()
 
 def log_transaction(user_id, amount, reason):
-    if amount == 0: return
+    if amount == 0:
+        return
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("INSERT INTO logs (user_id, amount, reason) VALUES (%s, %s, %s)", (str(user_id), amount, reason))
-    _new_log_id = c.lastrowid
+    c.execute(
+        "INSERT INTO logs (user_id, amount, reason) VALUES (%s, %s, %s)",
+        (str(user_id), amount, reason),
+    )
+    new_log_id = c.lastrowid
+    c.execute(
+        "INSERT INTO casino_logs (user_id, amount, reason, source_log_id) VALUES (%s, %s, %s, %s)",
+        (str(user_id), amount, reason, new_log_id),
+    )
     conn.commit()
     conn.close()
-    log_casino_transaction(user_id, amount, reason, source_log_id=_new_log_id)
 
 
 def log_casino_transaction(user_id, amount, reason, source_log_id=None, created_at=None):
@@ -745,6 +820,35 @@ def get_user_stats(user_id):
     res = c.fetchone()
     conn.close()
     return res
+
+
+def fetch_record_rows(user_id, limit: int = 50):
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute(
+        "SELECT amount, reason, created_at FROM logs WHERE user_id=%s ORDER BY created_at DESC LIMIT %s",
+        (str(user_id), int(limit)),
+    )
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def fetch_casino_stats_rows():
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT COALESCE(SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END), 0) FROM casino_logs")
+    issued_row = c.fetchone()
+    c.execute("SELECT COALESCE(SUM(CASE WHEN amount < 0 THEN -amount ELSE 0 END), 0) FROM casino_logs")
+    recovered_row = c.fetchone()
+    c.execute("SELECT COALESCE(SUM(balance), 0) FROM users")
+    circulation_row = c.fetchone()
+    conn.close()
+    return (
+        int((issued_row[0] if issued_row else 0) or 0),
+        int((recovered_row[0] if recovered_row else 0) or 0),
+        int((circulation_row[0] if circulation_row else 0) or 0),
+    )
 
 def ensure_user_exists(user_id, startup_balance=DEFAULT_STARTUP_BALANCE):
     uid = str(user_id)
@@ -1078,6 +1182,65 @@ def payout_hourly_bank(user_id, bank, reward_per_slot):
     conn.close()
     log_transaction(user_id, payout, "每小時簽到")
     return payout
+
+
+def claim_daily_reward(user_id, daily_reward: int = 100_000):
+    ensure_user_exists(user_id, 50000)
+    today_tw = now_tw_naive().date()
+    tomorrow_tw = today_tw + datetime.timedelta(days=1)
+    next_claim_dt = datetime.datetime.combine(tomorrow_tw, datetime.time.min, tzinfo=TW_TZ)
+    next_ts = int(next_claim_dt.timestamp())
+
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT last_claim FROM daily_claims WHERE user_id=%s", (str(user_id),))
+    row = c.fetchone()
+    if row and row[0] == today_tw:
+        conn.close()
+        return {"claimed": False, "next_ts": next_ts}
+
+    c.execute(
+        "INSERT INTO daily_claims (user_id, last_claim) VALUES (%s, %s) ON DUPLICATE KEY UPDATE last_claim=%s",
+        (str(user_id), today_tw, today_tw),
+    )
+    c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (daily_reward, str(user_id)))
+    conn.commit()
+    conn.close()
+    log_transaction(user_id, daily_reward, "每日簽到")
+    stats = get_user_stats(user_id)
+    return {
+        "claimed": True,
+        "reward": daily_reward,
+        "balance": int((stats[0] if stats else 0) or 0),
+        "next_ts": next_ts,
+    }
+
+
+def claim_hourly_reward(user_id, reward_per_slot: int = 1000):
+    ensure_user_exists(user_id, 50000)
+    bank_info = refresh_hourly_bank(user_id)
+    if not bank_info:
+        return {"ok": False}
+
+    level_num = int(bank_info["level"])
+    bank = int(bank_info["bank"])
+    if bank <= 0:
+        sec = int(bank_info["next_in_seconds"])
+        mins = max(1, int(sec // 60))
+        return {"ok": True, "claimed": False, "level": level_num, "mins": mins}
+
+    payout = payout_hourly_bank(user_id, bank, reward_per_slot)
+    stats = get_user_stats(user_id)
+    return {
+        "ok": True,
+        "claimed": True,
+        "level": level_num,
+        "bank": bank,
+        "reward_per_slot": reward_per_slot,
+        "payout": int(payout),
+        "balance": int((stats[0] if stats else 0) or 0),
+    }
+
 
 def get_tournament_window():
     conn = get_db_connection()
@@ -2698,69 +2861,52 @@ async def help_slash(interaction: discord.Interaction):
 
 @bot.tree.command(name="daily", description="每日簽到領取 100,000 東雲幣")
 async def daily(interaction: discord.Interaction):
-    ensure_user_exists(interaction.user.id, 50000)
-    daily_reward = 100000
-    today_tw = now_tw_naive().date()
-    
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT last_claim FROM daily_claims WHERE user_id=%s", (str(interaction.user.id),))
-    row = c.fetchone()
-    
-    if row and row[0] == today_tw:
-        tomorrow_tw = today_tw + datetime.timedelta(days=1)
-        next_claim_dt = datetime.datetime.combine(tomorrow_tw, datetime.time.min, tzinfo=TW_TZ)
-        ts = int(next_claim_dt.timestamp())
-        conn.close()
-        return await interaction.response.send_message(f"⚠️ 你今天已經簽到過囉！下次簽到時間：<t:{ts}:F> (<t:{ts}:R>)", ephemeral=True)
-        
-    c.execute(
-        "INSERT INTO daily_claims (user_id, last_claim) VALUES (%s, %s) ON DUPLICATE KEY UPDATE last_claim=%s",
-        (str(interaction.user.id), today_tw, today_tw),
-    )
-    c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (daily_reward, str(interaction.user.id)))
-    conn.commit()
-    conn.close()
-    log_transaction(interaction.user.id, daily_reward, "每日簽到")
-    new_bal = get_user_stats(interaction.user.id)[0]
-    
-    # 計算下一次領取時間
-    tomorrow_tw = today_tw + datetime.timedelta(days=1)
-    next_claim_dt = datetime.datetime.combine(tomorrow_tw, datetime.time.min, tzinfo=TW_TZ)
-    ts = int(next_claim_dt.timestamp())
+    await interaction_defer_if_needed(interaction)
+    result = await claim_daily_reward_async(interaction.user.id)
+    if not result["claimed"]:
+        ts = result["next_ts"]
+        return await interaction_send(
+            interaction,
+            f"⚠️ 你今天已經簽到過囉！下次簽到時間：<t:{ts}:F> (<t:{ts}:R>)",
+            ephemeral=True,
+        )
+
+    daily_reward = result["reward"]
+    new_bal = result["balance"]
+    ts = result["next_ts"]
     embed = discord.Embed(title="✅ 每日簽到成功", color=discord.Color.green())
     embed.add_field(name="獲得", value=f"`{daily_reward:,}` 東雲幣", inline=False)
     embed.add_field(name="目前餘額", value=f"`{new_bal:,}` 東雲幣", inline=False)
     embed.add_field(name="下次可領取", value=f"<t:{ts}:f>（<t:{ts}:R>）", inline=False)
     embed.set_footer(text=f"簽到者：{interaction.user.display_name}")
-    await interaction.response.send_message(embed=embed)
+    await interaction_send(interaction, embed=embed)
 
 @bot.tree.command(name="hourly", description="每小時簽到（可依等級累積）")
 async def hourly(interaction: discord.Interaction):
-    ensure_user_exists(interaction.user.id, 50000)
-    bank_info = refresh_hourly_bank(interaction.user.id)
-    if not bank_info:
-        return await interaction.response.send_message("資料初始化失敗", ephemeral=True)
-    level_num = bank_info["level"]
-    bank = bank_info["bank"]
-    reward_per_slot = 1000
-    if bank <= 0:
-        sec = bank_info["next_in_seconds"]
-        mins = max(1, int(sec // 60))
-        return await interaction.response.send_message(
+    await interaction_defer_if_needed(interaction)
+    result = await claim_hourly_reward_async(interaction.user.id)
+    if not result.get("ok"):
+        return await interaction_send(interaction, "資料初始化失敗", ephemeral=True)
+    level_num = result["level"]
+    if not result["claimed"]:
+        mins = result["mins"]
+        return await interaction_send(
+            interaction,
             f"⏳ 目前尚無可領時段。下次可累積約 `{mins}` 分鐘後。\n"
             f"你目前 Lv.{level_num}，最多可累積 `{level_num}` 小時。",
             ephemeral=True
         )
-    payout = payout_hourly_bank(interaction.user.id, bank, reward_per_slot)
-    new_bal = get_user_stats(interaction.user.id)[0]
+    bank = result["bank"]
+    reward_per_slot = result["reward_per_slot"]
+    payout = result["payout"]
+    new_bal = result["balance"]
     embed = discord.Embed(title="✅ 每小時簽到成功", color=discord.Color.green())
     embed.add_field(name="累積時段", value=f"`{bank}` 小時（上限 `{level_num}`）", inline=False)
     embed.add_field(name="每小時獎勵", value=f"`{reward_per_slot:,}` 東雲幣", inline=False)
     embed.add_field(name="本次獲得", value=f"`{payout:,}` 東雲幣", inline=False)
     embed.add_field(name="目前餘額", value=f"`{new_bal:,}` 東雲幣", inline=False)
     embed.set_footer(text=f"領取者：{interaction.user.display_name}")
-    await interaction.response.send_message(embed=embed)
+    await interaction_send(interaction, embed=embed)
 
 @bot.tree.command(name="beg", description="街頭乞討")
 async def beg(interaction: discord.Interaction):
@@ -2797,17 +2943,18 @@ async def rob(
         interaction, member, user_id, required=True, in_guild_only=True
     )
     if err:
-        return await interaction.response.send_message(err, ephemeral=True)
+        return await interaction_send(interaction, err, ephemeral=True)
     if not isinstance(m_user, discord.Member):
-        return await interaction.response.send_message("搶劫目標必須是此伺服器成員。", ephemeral=True)
+        return await interaction_send(interaction, "搶劫目標必須是此伺服器成員。", ephemeral=True)
     member = m_user
     if member.bot:
-        return await interaction.response.send_message("不能搶劫機器人。", ephemeral=True)
+        return await interaction_send(interaction, "不能搶劫機器人。", ephemeral=True)
     if member.id == interaction.user.id:
-        return await interaction.response.send_message("你不能搶劫自己。", ephemeral=True)
+        return await interaction_send(interaction, "你不能搶劫自己。", ephemeral=True)
 
-    ensure_user_exists(interaction.user.id, 50000)
-    ensure_user_exists(member.id, 0)
+    await interaction_defer_if_needed(interaction)
+    await ensure_user_exists_async(interaction.user.id, 50000)
+    await ensure_user_exists_async(member.id, 0)
 
     conn = get_db_connection()
     c = conn.cursor()
@@ -2818,14 +2965,15 @@ async def rob(
     _pr = c.fetchone()
     if _pr and int(_pr[0] or 0):
         conn.close()
-        return await interaction.response.send_message("🔒 你在監獄裡無法搶劫。", ephemeral=True)
+        return await interaction_send(interaction, "🔒 你在監獄裡無法搶劫。", ephemeral=True)
 
     c.execute("SELECT role FROM users WHERE user_id=%s", (str(interaction.user.id),))
     _role_row = c.fetchone()
     robber_role = _user_role_value(_role_row[0] if _role_row else None)
     if robber_role != "criminal":
         conn.close()
-        return await interaction.response.send_message(
+        return await interaction_send(
+            interaction,
             "❌ 只有**搶匪**可以搶劫。請先用 `/role_choose` 選擇搶匪（criminal）。",
             ephemeral=True,
         )
@@ -2847,19 +2995,19 @@ async def rob(
         remain = ROB_COOLDOWN_SECONDS - int((now - last_rob).total_seconds())
         mins = max(1, remain // 60)
         conn.close()
-        return await interaction.response.send_message(f"⏳ 你剛搶過，請再等 `{mins}` 分鐘。", ephemeral=True)
+        return await interaction_send(interaction, f"⏳ 你剛搶過，請再等 `{mins}` 分鐘。", ephemeral=True)
 
     if target_balance < 50000:
         conn.close()
-        return await interaction.response.send_message("對方太窮了，沒有東西可以搶。", ephemeral=True)
+        return await interaction_send(interaction, "對方太窮了，沒有東西可以搶。", ephemeral=True)
     if robber_balance < 50000:
         conn.close()
-        return await interaction.response.send_message("你的餘額低於 50,000，無法發起搶劫。", ephemeral=True)
+        return await interaction_send(interaction, "你的餘額低於 50,000，無法發起搶劫。", ephemeral=True)
     if target_last_robbed and (now - target_last_robbed).total_seconds() < ROB_VICTIM_PROTECT_SECONDS:
         remain = ROB_VICTIM_PROTECT_SECONDS - int((now - target_last_robbed).total_seconds())
         mins = max(1, remain // 60)
         conn.close()
-        return await interaction.response.send_message(f"對方目前有保護，請 `{mins}` 分鐘後再試。", ephemeral=True)
+        return await interaction_send(interaction, f"對方目前有保護，請 `{mins}` 分鐘後再試。", ephemeral=True)
 
     # /rob 基礎成功率 ROB_BASE_SUCCESS_RATE；每差 1 等調整 1%
     level_gap = robber_level - target_level
@@ -2880,7 +3028,7 @@ async def rob(
         if c.rowcount == 0:
             conn.commit()
             conn.close()
-            return await interaction.response.send_message("對方及時把錢藏好了，這次搶劫失敗。")
+            return await interaction_send(interaction, "對方及時把錢藏好了，這次搶劫失敗。")
         c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (steal_amount, str(interaction.user.id)))
         c.execute("UPDATE users SET last_robbed=%s WHERE user_id=%s", (now, str(member.id)))
         append_rob_history_on_cursor(c, interaction.user.id, steal_amount)
@@ -2950,9 +3098,10 @@ async def rob(
 
         conn.commit()
         conn.close()
-        log_transaction(interaction.user.id, steal_amount, f"搶劫成功（目標:{member.id}）")
-        log_transaction(member.id, -steal_amount, f"被搶劫（搶匪:{interaction.user.id}）")
-        return await interaction.response.send_message(
+        await db_to_thread(log_transaction, interaction.user.id, steal_amount, f"搶劫成功（目標:{member.id}）")
+        await db_to_thread(log_transaction, member.id, -steal_amount, f"被搶劫（搶匪:{interaction.user.id}）")
+        return await interaction_send(
+            interaction,
             f"{robber_name}搶了{victim_name}`{steal_amount:,}`東雲幣!!（本次成功率約 {success_rate_pct}%）{wanted_info}{revenge_hint}"
         )
 
@@ -2970,12 +3119,14 @@ async def rob(
     conn.commit()
     conn.close()
     if deducted:
-        log_transaction(interaction.user.id, -fail_penalty, f"搶劫失敗反噬（目標:{member.id}）")
-        log_transaction(member.id, fail_penalty, f"反制搶劫獲賠（搶匪:{interaction.user.id}）")
-        return await interaction.response.send_message(
+        await db_to_thread(log_transaction, interaction.user.id, -fail_penalty, f"搶劫失敗反噬（目標:{member.id}）")
+        await db_to_thread(log_transaction, member.id, fail_penalty, f"反制搶劫獲賠（搶匪:{interaction.user.id}）")
+        return await interaction_send(
+            interaction,
             f"{robber_name}失手了! 反而被{victim_name}搶了`{fail_penalty:,}`東雲幣!（本次成功率約 {success_rate_pct}%）"
         )
-    return await interaction.response.send_message(
+    return await interaction_send(
+        interaction,
         f"{robber_name}失手了! 反而被{victim_name}搶了`{fail_penalty:,}`東雲幣!（本次成功率約 {success_rate_pct}%）"
     )
 
@@ -3082,7 +3233,7 @@ async def role_choose_slash(interaction: discord.Interaction, role: str):
             ),
             inline=False,
         )
-    await interaction.response.send_message(embed=emb)
+    await interaction_send(interaction, embed=emb)
 
 
 @bot.tree.command(
@@ -3775,10 +3926,14 @@ async def rescue(interaction: discord.Interaction):
 @bot.tree.command(name="bj", description="開始 21 點")
 @app_commands.describe(bet="注額")
 async def bj(interaction: discord.Interaction, bet: int = 1000):
-    if not IS_EVENT_ACTIVE: return await interaction.response.send_message("打烊", ephemeral=True)
-    if bet < 100: return await interaction.response.send_message("低消 100", ephemeral=True)
-    ensure_user_exists(interaction.user.id, 50000)
-    sv = SetupView(interaction.user, bet); await interaction.response.send_message(embed=sv.build_embed(), view=sv)
+    if not IS_EVENT_ACTIVE:
+        return await interaction_send(interaction, "打烊", ephemeral=True)
+    if bet < 100:
+        return await interaction_send(interaction, "低消 100", ephemeral=True)
+    await interaction_defer_if_needed(interaction)
+    await ensure_user_exists_async(interaction.user.id, 50000)
+    sv = SetupView(interaction.user, bet)
+    await interaction_send(interaction, embed=sv.build_embed(), view=sv)
 
 @bot.tree.command(name="balance", description="查詢個人的戰績與餘額")
 @app_commands.describe(member="要查詢的成員（選填）", user_id="或填對方使用者 ID（選填）")
@@ -3791,13 +3946,14 @@ async def balance(
         interaction, member, user_id, required=False, in_guild_only=False
     )
     if err:
-        return await interaction.response.send_message(err, ephemeral=True)
+        return await interaction_send(interaction, err, ephemeral=True)
+    await interaction_defer_if_needed(interaction)
     target: typing.Union[discord.Member, discord.User] = resolved or interaction.user
     if target.id == interaction.user.id:
-        ensure_user_exists(target.id, 50000)
+        await ensure_user_exists_async(target.id, 50000)
     else:
-        ensure_user_exists(target.id, 0)
-    stats = get_user_stats(target.id)
+        await ensure_user_exists_async(target.id, 0)
+    stats = await get_user_stats_async(target.id)
     bal, total, wins, t_prof = stats
     wr = (wins/total*100) if total > 0 else 0
     embed = discord.Embed(title="📊 帳戶統計", color=0x2b2d31)
@@ -3808,7 +3964,7 @@ async def balance(
     embed.add_field(name="勝利場次", value=f"`{wins:,}` 場", inline=False)
     embed.add_field(name="勝率", value=f"`{wr:.1f}%`", inline=False)
     embed.add_field(name="歷史總盈虧", value=f"`{t_prof:,}` 東雲幣", inline=False)
-    await interaction.response.send_message(embed=embed)
+    await interaction_send(interaction, embed=embed)
 
 @bot.tree.command(name="level", description="查詢等級與經驗值")
 @app_commands.describe(member="要查詢的成員（選填）", user_id="或填對方使用者 ID（選填）")
@@ -3821,18 +3977,19 @@ async def level(
         interaction, member, user_id, required=False, in_guild_only=False
     )
     if err:
-        return await interaction.response.send_message(err, ephemeral=True)
+        return await interaction_send(interaction, err, ephemeral=True)
+    await interaction_defer_if_needed(interaction)
     target: typing.Union[discord.Member, discord.User] = resolved or interaction.user
     if target.id == interaction.user.id:
-        ensure_user_exists(target.id, 50000)
+        await ensure_user_exists_async(target.id, 50000)
     else:
-        ensure_user_exists(target.id, 0)
-    lv_row = get_level_stats(target.id)
+        await ensure_user_exists_async(target.id, 0)
+    lv_row = await get_level_stats_async(target.id)
     exp = int(lv_row[0] or 0)
     level_num = int(lv_row[1] or 1)
     calc_lv, cur_progress, next_need = calc_level_from_exp(exp)
     level_num = max(level_num, calc_lv)
-    claimed = get_claimed_milestones(target.id)
+    claimed = await get_claimed_milestones_async(target.id)
     bar = build_exp_progress_bar(cur_progress, next_need) if level_num < MAX_LEVEL else "▓" * 12 + "  100%"
     need_more = (next_need - cur_progress) if level_num < MAX_LEVEL and next_need > 0 else 0
     ms_lines = []
@@ -4532,22 +4689,25 @@ async def duel_slash(
     bet: int,
 ):
     if not interaction.guild:
-        return await interaction.response.send_message("請在伺服器頻道使用。", ephemeral=True)
+        return await interaction_send(interaction, "請在伺服器頻道使用。", ephemeral=True)
     if member.bot:
-        return await interaction.response.send_message("不能對機器人發起決鬥。", ephemeral=True)
+        return await interaction_send(interaction, "不能對機器人發起決鬥。", ephemeral=True)
     if member.id == interaction.user.id:
-        return await interaction.response.send_message("不能對自己發起決鬥。", ephemeral=True)
+        return await interaction_send(interaction, "不能對自己發起決鬥。", ephemeral=True)
     if bet <= 0:
-        return await interaction.response.send_message("注金需大於 0。", ephemeral=True)
-    ensure_user_exists(interaction.user.id, 50000)
-    ensure_user_exists(member.id, 50000)
-    if not try_deduct_balance(interaction.user.id, bet, "E卡決鬥下注"):
-        return await interaction.response.send_message(
+        return await interaction_send(interaction, "注金需大於 0。", ephemeral=True)
+    await interaction_defer_if_needed(interaction)
+    await ensure_user_exists_async(interaction.user.id, 50000)
+    await ensure_user_exists_async(member.id, 50000)
+    if not await try_deduct_balance_async(interaction.user.id, bet, "E卡決鬥下注"):
+        return await interaction_send(
+            interaction,
             f"❌ 你的餘額不足，需要 `{bet:,}` 東雲幣才能發起決鬥。",
             ephemeral=True,
         )
     view = EDuelInviteView(interaction.user, member, bet)
-    await interaction.response.send_message(
+    sent = await interaction_send(
+        interaction,
         content=(
             f"⚔️ {interaction.user.mention} 向 {member.mention} 發起 **E 卡決鬥**！\n"
             f"注額：`{bet:,}` 東雲幣\n"
@@ -4560,7 +4720,7 @@ async def duel_slash(
         view=view,
     )
     try:
-        view.message = await interaction.original_response()
+        view.message = sent or await interaction.original_response()
     except Exception:
         pass
 
@@ -4615,18 +4775,12 @@ async def record_cmd(
         interaction, member, user_id, required=False, in_guild_only=False
     )
     if err:
-        return await interaction.response.send_message(err, ephemeral=True)
+        return await interaction_send(interaction, err, ephemeral=True)
+    await interaction_defer_if_needed(interaction, ephemeral=True)
     target: typing.Union[discord.Member, discord.User] = resolved or interaction.user
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute(
-        "SELECT amount, reason, created_at FROM logs WHERE user_id=%s ORDER BY created_at DESC LIMIT 50",
-        (str(target.id),)
-    )
-    rows = c.fetchall()
-    conn.close()
+    rows = await fetch_record_rows_async(target.id, 50)
     if not rows:
-        return await interaction.response.send_message("無紀錄", ephemeral=True)
+        return await interaction_send(interaction, "無紀錄", ephemeral=True)
 
     page_size = 10
     page = max(1, int(page))
@@ -4642,9 +4796,9 @@ async def record_cmd(
         start_page=page,
         footer_prefix=f"共 {len(rows)} 筆（最多顯示 50）"
     )
-    await interaction.response.send_message(embed=view.build_embed(), view=view)
+    sent = await interaction_send(interaction, embed=view.build_embed(), view=view)
     try:
-        view.message = await interaction.original_response()
+        view.message = sent or await interaction.original_response()
     except:
         pass
 
@@ -4668,7 +4822,8 @@ LEADERBOARD_RANK_SCAN = 800
 
 @bot.tree.command(name="leaderboard", description="前 10 名")
 async def leaderboard(interaction: discord.Interaction):
-    ensure_user_exists(interaction.user.id, 50000)
+    await interaction_defer_if_needed(interaction)
+    await ensure_user_exists_async(interaction.user.id, 50000)
     guild = interaction.guild
     conn = get_db_connection()
     c = conn.cursor()
@@ -4680,7 +4835,6 @@ async def leaderboard(interaction: discord.Interaction):
     my_bal = int((my_row[0] if my_row else 0) or 0)
 
     if guild:
-        await interaction.response.defer()
         c.execute(
             f"SELECT user_id, balance FROM users WHERE user_id NOT IN ({ph}) ORDER BY balance DESC LIMIT %s",
             tuple(admin_ids) + (LEADERBOARD_POOL,),
@@ -4740,24 +4894,12 @@ async def leaderboard(interaction: discord.Interaction):
     if guild:
         await interaction.followup.send(embed=emb)
     else:
-        await interaction.response.send_message(embed=emb)
+        await interaction_send(interaction, embed=emb)
 
 @bot.tree.command(name="casino_stats", description="查看經濟總金流統計（回收率/總發幣量/流通量）")
 async def casino_stats(interaction: discord.Interaction):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT COALESCE(SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END), 0) FROM casino_logs")
-    issued_row = c.fetchone()
-    total_issued = int((issued_row[0] if issued_row else 0) or 0)
-
-    c.execute("SELECT COALESCE(SUM(CASE WHEN amount < 0 THEN -amount ELSE 0 END), 0) FROM casino_logs")
-    recovered_row = c.fetchone()
-    total_recovered = int((recovered_row[0] if recovered_row else 0) or 0)
-
-    c.execute("SELECT COALESCE(SUM(balance), 0) FROM users")
-    circulation_row = c.fetchone()
-    circulation = int((circulation_row[0] if circulation_row else 0) or 0)
-    conn.close()
+    await interaction_defer_if_needed(interaction)
+    total_issued, total_recovered, circulation = await fetch_casino_stats_rows_async()
 
     recovery_rate = (total_recovered / total_issued * 100) if total_issued > 0 else 0.0
     net_issued = total_issued - total_recovered
@@ -4768,11 +4910,12 @@ async def casino_stats(interaction: discord.Interaction):
     embed.add_field(name="淨發行量", value=f"`{net_issued:,}` 東雲幣", inline=False)
     embed.add_field(name="目前流通量", value=f"`{circulation:,}` 東雲幣", inline=False)
     embed.set_footer(text="計算基準：casino_logs（logs 全期鏡像總帳）與 users.balance")
-    await interaction.response.send_message(embed=embed)
+    await interaction_send(interaction, embed=embed)
 
 @bot.tree.command(name="lvleaderboard", description="等級排行榜前 10 名")
 async def lvleaderboard(interaction: discord.Interaction):
-    ensure_user_exists(interaction.user.id, 50000)
+    await interaction_defer_if_needed(interaction)
+    await ensure_user_exists_async(interaction.user.id, 50000)
     guild = interaction.guild
     conn = get_db_connection()
     c = conn.cursor()
@@ -4787,7 +4930,6 @@ async def lvleaderboard(interaction: discord.Interaction):
         my_level, my_exp = 1, 0
 
     if guild:
-        await interaction.response.defer()
         c.execute(
             f"SELECT user_id, level, exp FROM users WHERE user_id NOT IN ({ph}) ORDER BY level DESC, exp DESC LIMIT %s",
             tuple(admin_ids) + (LEADERBOARD_POOL,),
@@ -4843,9 +4985,7 @@ async def lvleaderboard(interaction: discord.Interaction):
         note = "\n\n※ 在伺服器頻道使用時，榜單會改為**僅本伺服器成員**。"
 
     if not data:
-        return await interaction.response.send_message("目前沒有符合條件的等級資料。", ephemeral=True) if not guild else await interaction.followup.send(
-            "目前沒有符合條件的等級資料。", ephemeral=True
-        )
+        return await interaction_send(interaction, "目前沒有符合條件的等級資料。", ephemeral=True)
 
     msg = "\n".join(
         [f"{i+1}. <@{uid}>: Lv.{int(lv)} | EXP {int(exp):,}" for i, (uid, lv, exp) in enumerate(data)]
@@ -4855,7 +4995,7 @@ async def lvleaderboard(interaction: discord.Interaction):
     if guild:
         await interaction.followup.send(embed=emb)
     else:
-        await interaction.response.send_message(embed=emb)
+        await interaction_send(interaction, embed=emb)
 
 # ··············································································
 # （【十四】錦標賽 — 仍屬 [G · 玩家 Slash]）
