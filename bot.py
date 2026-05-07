@@ -2652,7 +2652,7 @@ async def help_slash(interaction: discord.Interaction):
         name="🃏 賭場與等級",
         value=(
             "`/bj` — 二十一點\n"
-            "`/duel` — E 卡決鬥（贏者全拿；王>民、民>奴、奴>王；同牌退款）\n"
+            "`/duel` — E 卡決鬥（贏者全拿；王>民、民>奴、奴>王；同牌平手繼續用剩下的牌）\n"
             "`/level` — 等級與 EXP\n"
             "`/leaderboard` — 餘額榜前 10\n"
             "`/lvleaderboard` — 等級榜前 10\n"
@@ -3986,14 +3986,16 @@ async def redpacket(interaction: discord.Interaction, total_amount: int, count: 
         pass
 
 # ──────────────────────────────────────────────────────────────────────
-# E 卡決鬥（仿《賭博默示錄》）：雙方各持 1王／3民／1奴；單局決勝；贏者全拿。
-# 規則：王>民、民>奴、奴>王；同卡平手退款。
+# E 卡決鬥（仿《賭博默示錄》）：雙方起手 1王／3民／1奴；
+# 同牌平手 → 各自消耗該牌後進入下一局；分出勝負才結算（贏者全拿）。
+# 規則：王>民、民>奴、奴>王。
 # ──────────────────────────────────────────────────────────────────────
 DUEL_CARDS = {
     "king": ("👑", "王"),
     "citizen": ("🧑", "民"),
     "slave": ("🗡️", "奴"),
 }
+DUEL_DEFAULT_HAND = {"king": 1, "citizen": 3, "slave": 1}
 
 
 def _duel_winner(a: str, b: str) -> int:
@@ -4090,9 +4092,13 @@ class EDuelInviteView(discord.ui.View):
 
 
 class _DuelCardButton(discord.ui.Button):
-    def __init__(self, key: str, parent: "EDuelPlayView", picker_id: int):
+    def __init__(self, key: str, parent: "EDuelPlayView", picker_id: int, count: int):
         emoji, label = DUEL_CARDS[key]
-        super().__init__(style=discord.ButtonStyle.primary, label=label, emoji=emoji)
+        super().__init__(
+            style=discord.ButtonStyle.primary,
+            label=f"{label} ×{count}",
+            emoji=emoji,
+        )
         self.key = key
         self.parent_view = parent
         self.picker_id = picker_id
@@ -4102,12 +4108,16 @@ class _DuelCardButton(discord.ui.Button):
 
 
 class EDuelPickerView(discord.ui.View):
-    """每位玩家私下選牌的 ephemeral 視圖。"""
+    """每位玩家私下選牌的 ephemeral 視圖；按鈕依當下剩餘持牌動態產生。"""
 
     def __init__(self, parent: "EDuelPlayView", picker_id: int):
         super().__init__(timeout=120)
+        hand = parent.hands.get(picker_id, {})
         for key in ("king", "citizen", "slave"):
-            self.add_item(_DuelCardButton(key, parent, picker_id))
+            cnt = int(hand.get(key, 0) or 0)
+            if cnt <= 0:
+                continue
+            self.add_item(_DuelCardButton(key, parent, picker_id, cnt))
 
 
 class EDuelPlayView(discord.ui.View):
@@ -4117,59 +4127,113 @@ class EDuelPlayView(discord.ui.View):
         self.opponent = opponent
         self.bet = int(bet)
         self.picks: typing.Dict[int, str] = {}
+        self.hands: typing.Dict[int, typing.Dict[str, int]] = {
+            challenger.id: dict(DUEL_DEFAULT_HAND),
+            opponent.id: dict(DUEL_DEFAULT_HAND),
+        }
+        self.round_no = 1
+        self.history: typing.List[typing.Dict[str, typing.Any]] = []
         self.message: typing.Optional[discord.Message] = None
         self.settled = False
 
     def _player_status_value(self, uid: int) -> str:
         return "✅ 已選牌" if uid in self.picks else "⏳ 等待選牌中…"
 
+    def _format_hand(self, uid: int) -> str:
+        h = self.hands.get(uid, {})
+        return (
+            f"👑 ×{int(h.get('king', 0) or 0)}　"
+            f"🧑 ×{int(h.get('citizen', 0) or 0)}　"
+            f"🗡️ ×{int(h.get('slave', 0) or 0)}"
+        )
+
+    def _format_history(self) -> str:
+        if not self.history:
+            return "（尚無紀錄）"
+        lines = []
+        for entry in self.history:
+            c_e, c_l = DUEL_CARDS[entry["c"]]
+            o_e, o_l = DUEL_CARDS[entry["o"]]
+            if entry["draw"]:
+                tag = "🤝 平手（雙方各消耗該牌）"
+            else:
+                res = _duel_winner(entry["c"], entry["o"])
+                winner = self.challenger if res == 1 else self.opponent
+                tag = f"🏆 {winner.display_name}"
+            lines.append(
+                f"第 {entry['round']} 局：{c_e} {c_l}　vs　{o_e} {o_l}　— {tag}"
+            )
+        return "\n".join(lines)
+
     def build_play_embed(self) -> discord.Embed:
         emb = discord.Embed(
-            title="⚔️ E 卡決鬥｜選牌中",
+            title=f"⚔️ E 卡決鬥｜第 {self.round_no} 局選牌中",
             description=(
                 f"{self.challenger.mention}　**VS**　{self.opponent.mention}\n"
-                f"注額：`{self.bet:,}`　｜　彩池：`{self.bet * 2:,}` 東雲幣"
+                f"注額：`{self.bet:,}`　｜　彩池：`{self.bet * 2:,}` 東雲幣\n"
+                "勝負：👑 王 ＞ 🧑 民　｜　🧑 民 ＞ 🗡️ 奴　｜　🗡️ 奴 ＞ 👑 王\n"
+                "同牌平手 → 雙方各消耗該牌後進入下一局；分出勝負才結算"
             ),
             color=0x5865F2,
         )
-        emb.add_field(name="持牌（雙方相同）", value="👑 王 ×1　🧑 民 ×3　🗡️ 奴 ×1", inline=False)
-        emb.add_field(name="勝負規則", value="👑 王 ＞ 🧑 民　｜　🧑 民 ＞ 🗡️ 奴　｜　🗡️ 奴 ＞ 👑 王\n同牌平手退款", inline=False)
+        emb.add_field(
+            name=f"{self.challenger.display_name} 剩餘持牌",
+            value=self._format_hand(self.challenger.id),
+            inline=True,
+        )
+        emb.add_field(name="\u200b", value="⚔️", inline=True)
+        emb.add_field(
+            name=f"{self.opponent.display_name} 剩餘持牌",
+            value=self._format_hand(self.opponent.id),
+            inline=True,
+        )
+        if self.history:
+            emb.add_field(name="對戰紀錄", value=self._format_history()[:1024], inline=False)
         emb.add_field(
             name=self.challenger.display_name,
             value=self._player_status_value(self.challenger.id),
             inline=True,
         )
-        emb.add_field(name="\u200b", value="⚔️", inline=True)
+        emb.add_field(name="\u200b", value="\u200b", inline=True)
         emb.add_field(
             name=self.opponent.display_name,
             value=self._player_status_value(self.opponent.id),
             inline=True,
         )
-        emb.set_footer(text="請點下方「選牌（私下）」按鈕出牌；120 秒未完成將退款")
+        emb.set_footer(text="請點下方「選牌（私下）」按鈕出牌；120 秒未動作將退回全部注金")
         return emb
 
-    def build_picker_embed(self) -> discord.Embed:
+    def build_picker_embed(self, picker_id: int) -> discord.Embed:
+        h = self.hands.get(picker_id, {})
+        parts = []
+        for key in ("king", "citizen", "slave"):
+            e, l = DUEL_CARDS[key]
+            cnt = int(h.get(key, 0) or 0)
+            if cnt > 0:
+                parts.append(f"{e} {l} ×{cnt}")
+        hand_text = "　".join(parts) if parts else "（已無牌）"
         emb = discord.Embed(
-            title="🎴 選擇你要出的牌",
-            description=(
-                "請從下方選一張牌出招。\n"
-                "👑 王 ＞ 🧑 民　｜　🧑 民 ＞ 🗡️ 奴　｜　🗡️ 奴 ＞ 👑 王"
-            ),
+            title=f"🎴 第 {self.round_no} 局：選擇你要出的牌",
+            description="👑 王 ＞ 🧑 民　｜　🧑 民 ＞ 🗡️ 奴　｜　🗡️ 奴 ＞ 👑 王",
             color=0x5865F2,
         )
-        emb.add_field(name="持牌（雙方相同）", value="👑 王 ×1　🧑 民 ×3　🗡️ 奴 ×1", inline=False)
-        emb.set_footer(text="送出後不可更改｜120 秒內未選牌將退款")
+        emb.add_field(name="你的剩餘持牌", value=hand_text, inline=False)
+        emb.set_footer(text="送出後不可更改｜長時間未動作將退款")
         return emb
 
     async def _record_pick(self, interaction: discord.Interaction, picker_id: int, key: str):
         if interaction.user.id != picker_id:
             return await interaction.response.send_message("這個按鈕不是給你的。", ephemeral=True)
+        if self.settled:
+            return await interaction.response.send_message("此局已結束。", ephemeral=True)
         if picker_id in self.picks:
             return await interaction.response.send_message("你已經選過了。", ephemeral=True)
+        if int(self.hands.get(picker_id, {}).get(key, 0) or 0) <= 0:
+            return await interaction.response.send_message("你已沒有這張牌。", ephemeral=True)
         self.picks[picker_id] = key
         emoji, label = DUEL_CARDS[key]
         confirm_emb = discord.Embed(
-            title="✅ 已送出選擇",
+            title=f"✅ 已送出（第 {self.round_no} 局）",
             description=f"你出的是：{emoji} **{label}**\n等待對手出牌與翻牌結算…",
             color=0x57F287,
         )
@@ -4181,33 +4245,14 @@ class EDuelPlayView(discord.ui.View):
             except Exception:
                 pass
         if len(self.picks) == 2 and not self.settled:
-            self.settled = True
-            await self._reveal()
+            await self._process_round()
 
-    async def _settle_payouts(self, result: int) -> str:
-        c_pick = self.picks[self.challenger.id]
-        o_pick = self.picks[self.opponent.id]
-        c_e, c_l = DUEL_CARDS[c_pick]
-        o_e, o_l = DUEL_CARDS[o_pick]
+    async def _settle_payouts_decisive(self, result: int) -> str:
         pot = self.bet * 2
-        conn = get_db_connection()
-        cur = conn.cursor()
-        if result == 0:
-            cur.execute(
-                "UPDATE users SET balance=balance+%s WHERE user_id=%s",
-                (self.bet, str(self.challenger.id)),
-            )
-            cur.execute(
-                "UPDATE users SET balance=balance+%s WHERE user_id=%s",
-                (self.bet, str(self.opponent.id)),
-            )
-            conn.commit()
-            conn.close()
-            log_transaction(self.challenger.id, self.bet, "E卡決鬥平手退款")
-            log_transaction(self.opponent.id, self.bet, "E卡決鬥平手退款")
-            return f"🤝 平手！雙方皆出 {c_e} **{c_l}**，各自退回 `{self.bet:,}`。"
         winner = self.challenger if result == 1 else self.opponent
         loser = self.opponent if result == 1 else self.challenger
+        conn = get_db_connection()
+        cur = conn.cursor()
         cur.execute(
             "UPDATE users SET balance=balance+%s WHERE user_id=%s",
             (pot, str(winner.id)),
@@ -4215,41 +4260,9 @@ class EDuelPlayView(discord.ui.View):
         conn.commit()
         conn.close()
         log_transaction(winner.id, pot, f"E卡決鬥獲勝（對手:{loser.id}）")
-        return f"🏆 {winner.mention} 獲勝！贏走 **`{pot:,}`** 東雲幣。"
+        return f"🏆 {winner.mention} 獲勝！贏走 **`{pot:,}`** 東雲幣（共 {self.round_no} 局）。"
 
-    async def _reveal(self):
-        c_pick = self.picks[self.challenger.id]
-        o_pick = self.picks[self.opponent.id]
-        c_e, c_l = DUEL_CARDS[c_pick]
-        o_e, o_l = DUEL_CARDS[o_pick]
-        result = _duel_winner(c_pick, o_pick)
-        outcome = await self._settle_payouts(result)
-        color = 0xFFD166 if result == 0 else 0x57F287
-        emb = discord.Embed(title="⚔️ E 卡決鬥｜結算", description=outcome, color=color)
-        emb.add_field(
-            name=self.challenger.display_name,
-            value=f"{c_e} **{c_l}**",
-            inline=True,
-        )
-        emb.add_field(name="VS", value="⚔️", inline=True)
-        emb.add_field(
-            name=self.opponent.display_name,
-            value=f"{o_e} **{o_l}**",
-            inline=True,
-        )
-        emb.set_footer(text="持牌：👑×1、🧑×3、🗡️×1｜勝：王>民、民>奴、奴>王")
-        for child in self.children:
-            child.disabled = True
-        try:
-            if self.message:
-                await self.message.edit(content=None, embed=emb, view=None)
-        except Exception:
-            pass
-
-    async def on_timeout(self):
-        if self.settled:
-            return
-        self.settled = True
+    async def _refund_both(self, reason: str) -> None:
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(
@@ -4262,8 +4275,92 @@ class EDuelPlayView(discord.ui.View):
         )
         conn.commit()
         conn.close()
-        log_transaction(self.challenger.id, self.bet, "E卡決鬥逾時退款")
-        log_transaction(self.opponent.id, self.bet, "E卡決鬥逾時退款")
+        log_transaction(self.challenger.id, self.bet, reason)
+        log_transaction(self.opponent.id, self.bet, reason)
+
+    def _build_final_embed(self, outcome_text: str, result: int) -> discord.Embed:
+        color = 0xFFD166 if result == 0 else 0x57F287
+        emb = discord.Embed(title="⚔️ E 卡決鬥｜結算", description=outcome_text, color=color)
+        emb.add_field(name="對戰過程", value=self._format_history()[:1024], inline=False)
+        emb.add_field(
+            name=f"{self.challenger.display_name} 剩餘",
+            value=self._format_hand(self.challenger.id),
+            inline=True,
+        )
+        emb.add_field(name="\u200b", value="\u200b", inline=True)
+        emb.add_field(
+            name=f"{self.opponent.display_name} 剩餘",
+            value=self._format_hand(self.opponent.id),
+            inline=True,
+        )
+        emb.set_footer(text="起手持牌：👑×1、🧑×3、🗡️×1｜勝：王>民、民>奴、奴>王")
+        return emb
+
+    async def _process_round(self):
+        c_pick = self.picks[self.challenger.id]
+        o_pick = self.picks[self.opponent.id]
+        self.hands[self.challenger.id][c_pick] = max(0, int(self.hands[self.challenger.id].get(c_pick, 0)) - 1)
+        self.hands[self.opponent.id][o_pick] = max(0, int(self.hands[self.opponent.id].get(o_pick, 0)) - 1)
+        result = _duel_winner(c_pick, o_pick)
+        self.history.append({
+            "round": self.round_no,
+            "c": c_pick,
+            "o": o_pick,
+            "draw": result == 0,
+        })
+
+        if result != 0:
+            self.settled = True
+            outcome = await self._settle_payouts_decisive(result)
+            for child in self.children:
+                child.disabled = True
+            try:
+                if self.message:
+                    await self.message.edit(
+                        content=None,
+                        embed=self._build_final_embed(outcome, result),
+                        view=None,
+                    )
+            except Exception:
+                pass
+            return
+
+        # 平手：清掉本局選牌；若雙方都已無牌，全程平手退款
+        self.picks.clear()
+        any_remaining = sum(self.hands[self.challenger.id].values()) > 0 \
+            and sum(self.hands[self.opponent.id].values()) > 0
+        if not any_remaining:
+            self.settled = True
+            await self._refund_both("E卡決鬥全程平手退款")
+            for child in self.children:
+                child.disabled = True
+            try:
+                if self.message:
+                    await self.message.edit(
+                        content=None,
+                        embed=self._build_final_embed(
+                            f"🤝 全程平手，無人勝出，雙方各退回 `{self.bet:,}`。",
+                            0,
+                        ),
+                        view=None,
+                    )
+            except Exception:
+                pass
+            return
+
+        # 進入下一局
+        self.round_no += 1
+        try:
+            if self.message:
+                await self.message.edit(embed=self.build_play_embed(), view=self)
+        except Exception:
+            pass
+
+    async def on_timeout(self):
+        if self.settled:
+            return
+        self.settled = True
+        await self._refund_both("E卡決鬥逾時退款")
         try:
             if self.message:
                 pending = []
@@ -4273,9 +4370,10 @@ class EDuelPlayView(discord.ui.View):
                     pending.append(self.opponent.mention)
                 await self.message.edit(
                     content=(
-                        f"⌛ E 卡決鬥逾時，未完成選牌（未選：{', '.join(pending) or '—'}）。"
+                        f"⌛ E 卡決鬥逾時（第 {self.round_no} 局未完成；未選：{', '.join(pending) or '—'}）。"
                         f"雙方注金 `{self.bet:,}` 已退回。"
                     ),
+                    embed=None,
                     view=None,
                 )
         except Exception:
@@ -4285,11 +4383,13 @@ class EDuelPlayView(discord.ui.View):
     async def pick(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id not in (self.challenger.id, self.opponent.id):
             return await interaction.response.send_message("你不是這場決鬥的玩家。", ephemeral=True)
+        if self.settled:
+            return await interaction.response.send_message("此局已結束。", ephemeral=True)
         if interaction.user.id in self.picks:
-            return await interaction.response.send_message("你已經選過了。", ephemeral=True)
+            return await interaction.response.send_message("你本局已經選過了，等對手出牌。", ephemeral=True)
         view = EDuelPickerView(self, interaction.user.id)
         await interaction.response.send_message(
-            embed=self.build_picker_embed(),
+            embed=self.build_picker_embed(interaction.user.id),
             view=view,
             ephemeral=True,
         )
@@ -4297,7 +4397,7 @@ class EDuelPlayView(discord.ui.View):
 
 @bot.tree.command(
     name="duel",
-    description="E 卡決鬥（賭博默示錄風）：與對手對戰，贏者全拿；同牌平手退款",
+    description="E 卡決鬥（賭博默示錄風）：贏者全拿；同牌平手繼續用剩下的牌（雙方起手 1王/3民/1奴）",
 )
 @app_commands.describe(member="對手", bet="雙方下注金額（兩邊相同）")
 async def duel_slash(
