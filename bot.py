@@ -2652,6 +2652,7 @@ async def help_slash(interaction: discord.Interaction):
         name="🃏 賭場與等級",
         value=(
             "`/bj` — 二十一點\n"
+            "`/duel` — E 卡決鬥（贏者全拿；王>民、民>奴、奴>王；同牌退款）\n"
             "`/level` — 等級與 EXP\n"
             "`/leaderboard` — 餘額榜前 10\n"
             "`/lvleaderboard` — 等級榜前 10\n"
@@ -3983,6 +3984,312 @@ async def redpacket(interaction: discord.Interaction, total_amount: int, count: 
         view.message = await interaction.original_response()
     except:
         pass
+
+# ──────────────────────────────────────────────────────────────────────
+# E 卡決鬥（仿《賭博默示錄》）：雙方各持 1王／3民／1奴；單局決勝；贏者全拿。
+# 規則：王>民、民>奴、奴>王；同卡平手退款。
+# ──────────────────────────────────────────────────────────────────────
+DUEL_CARDS = {
+    "king": ("👑", "王"),
+    "citizen": ("🧑", "民"),
+    "slave": ("🗡️", "奴"),
+}
+
+
+def _duel_winner(a: str, b: str) -> int:
+    """1: a 勝；-1: b 勝；0: 平手。"""
+    if a == b:
+        return 0
+    a_beats = {("king", "citizen"), ("citizen", "slave"), ("slave", "king")}
+    return 1 if (a, b) in a_beats else -1
+
+
+class EDuelInviteView(discord.ui.View):
+    def __init__(self, challenger: discord.Member, opponent: discord.Member, bet: int):
+        super().__init__(timeout=120)
+        self.challenger = challenger
+        self.opponent = opponent
+        self.bet = int(bet)
+        self.message: typing.Optional[discord.Message] = None
+        self.resolved = False
+
+    async def _refund_challenger(self):
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute(
+            "UPDATE users SET balance=balance+%s WHERE user_id=%s",
+            (self.bet, str(self.challenger.id)),
+        )
+        conn.commit()
+        conn.close()
+        log_transaction(self.challenger.id, self.bet, "E卡決鬥取消退款")
+
+    @discord.ui.button(label="接受", style=discord.ButtonStyle.success)
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.opponent.id:
+            return await interaction.response.send_message("這場決鬥不是邀請你的。", ephemeral=True)
+        if self.resolved:
+            return await interaction.response.defer()
+        if not try_deduct_balance(self.opponent.id, self.bet, "E卡決鬥下注"):
+            return await interaction.response.send_message(
+                f"❌ 你的餘額不足，需要 `{self.bet:,}` 東雲幣才能接受此決鬥。",
+                ephemeral=True,
+            )
+        self.resolved = True
+        for child in self.children:
+            child.disabled = True
+        play = EDuelPlayView(self.challenger, self.opponent, self.bet)
+        await interaction.response.edit_message(
+            content=(
+                f"⚔️ **E 卡決鬥開始！** {self.challenger.mention} vs {self.opponent.mention}\n"
+                f"注額：`{self.bet:,}`（彩池 `{self.bet * 2:,}`）\n"
+                f"持牌：👑×1（王）、🧑×3（民）、🗡️×1（奴）｜勝：王>民、民>奴、奴>王\n"
+                f"請雙方點 **選牌（私下）** 出一張牌；雙方都選好後翻牌結算。"
+            ),
+            view=play,
+        )
+        try:
+            play.message = await interaction.original_response()
+        except Exception:
+            pass
+        self.stop()
+
+    @discord.ui.button(label="拒絕", style=discord.ButtonStyle.danger)
+    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.opponent.id:
+            return await interaction.response.send_message("這場決鬥不是邀請你的。", ephemeral=True)
+        if self.resolved:
+            return await interaction.response.defer()
+        self.resolved = True
+        await self._refund_challenger()
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            content=(
+                f"❌ {self.opponent.mention} 拒絕了 {self.challenger.mention} 的 E 卡決鬥。"
+                f"已退回挑戰者注金 `{self.bet:,}`。"
+            ),
+            view=self,
+        )
+        self.stop()
+
+    async def on_timeout(self):
+        if self.resolved:
+            return
+        self.resolved = True
+        await self._refund_challenger()
+        for child in self.children:
+            child.disabled = True
+        try:
+            if self.message:
+                await self.message.edit(
+                    content=(
+                        f"⌛ {self.opponent.mention} 未在時限內回應 {self.challenger.mention} 的 E 卡決鬥邀請，"
+                        f"挑戰者注金 `{self.bet:,}` 已退回。"
+                    ),
+                    view=self,
+                )
+        except Exception:
+            pass
+
+
+class _DuelCardButton(discord.ui.Button):
+    def __init__(self, key: str, parent: "EDuelPlayView", picker_id: int):
+        emoji, label = DUEL_CARDS[key]
+        super().__init__(style=discord.ButtonStyle.primary, label=label, emoji=emoji)
+        self.key = key
+        self.parent_view = parent
+        self.picker_id = picker_id
+
+    async def callback(self, interaction: discord.Interaction):
+        await self.parent_view._record_pick(interaction, self.picker_id, self.key)
+
+
+class EDuelPickerView(discord.ui.View):
+    """每位玩家私下選牌的 ephemeral 視圖。"""
+
+    def __init__(self, parent: "EDuelPlayView", picker_id: int):
+        super().__init__(timeout=120)
+        for key in ("king", "citizen", "slave"):
+            self.add_item(_DuelCardButton(key, parent, picker_id))
+
+
+class EDuelPlayView(discord.ui.View):
+    def __init__(self, challenger: discord.Member, opponent: discord.Member, bet: int):
+        super().__init__(timeout=120)
+        self.challenger = challenger
+        self.opponent = opponent
+        self.bet = int(bet)
+        self.picks: typing.Dict[int, str] = {}
+        self.message: typing.Optional[discord.Message] = None
+        self.settled = False
+
+    async def _record_pick(self, interaction: discord.Interaction, picker_id: int, key: str):
+        if interaction.user.id != picker_id:
+            return await interaction.response.send_message("這個按鈕不是給你的。", ephemeral=True)
+        if picker_id in self.picks:
+            return await interaction.response.send_message("你已經選過了。", ephemeral=True)
+        self.picks[picker_id] = key
+        emoji, label = DUEL_CARDS[key]
+        await interaction.response.edit_message(
+            content=f"✅ 已選擇：{emoji} **{label}**（等待對手 / 翻牌）",
+            view=None,
+        )
+        if len(self.picks) == 2 and not self.settled:
+            self.settled = True
+            await self._reveal()
+
+    async def _settle_payouts(self, result: int) -> str:
+        c_pick = self.picks[self.challenger.id]
+        o_pick = self.picks[self.opponent.id]
+        c_e, c_l = DUEL_CARDS[c_pick]
+        o_e, o_l = DUEL_CARDS[o_pick]
+        pot = self.bet * 2
+        conn = get_db_connection()
+        cur = conn.cursor()
+        if result == 0:
+            cur.execute(
+                "UPDATE users SET balance=balance+%s WHERE user_id=%s",
+                (self.bet, str(self.challenger.id)),
+            )
+            cur.execute(
+                "UPDATE users SET balance=balance+%s WHERE user_id=%s",
+                (self.bet, str(self.opponent.id)),
+            )
+            conn.commit()
+            conn.close()
+            log_transaction(self.challenger.id, self.bet, "E卡決鬥平手退款")
+            log_transaction(self.opponent.id, self.bet, "E卡決鬥平手退款")
+            return f"🤝 平手！雙方皆出 {c_e} **{c_l}**，各自退回 `{self.bet:,}`。"
+        winner = self.challenger if result == 1 else self.opponent
+        loser = self.opponent if result == 1 else self.challenger
+        cur.execute(
+            "UPDATE users SET balance=balance+%s WHERE user_id=%s",
+            (pot, str(winner.id)),
+        )
+        conn.commit()
+        conn.close()
+        log_transaction(winner.id, pot, f"E卡決鬥獲勝（對手:{loser.id}）")
+        return f"🏆 {winner.mention} 獲勝！贏走 **`{pot:,}`** 東雲幣。"
+
+    async def _reveal(self):
+        c_pick = self.picks[self.challenger.id]
+        o_pick = self.picks[self.opponent.id]
+        c_e, c_l = DUEL_CARDS[c_pick]
+        o_e, o_l = DUEL_CARDS[o_pick]
+        result = _duel_winner(c_pick, o_pick)
+        outcome = await self._settle_payouts(result)
+        color = 0xFFD166 if result == 0 else 0x57F287
+        emb = discord.Embed(title="⚔️ E 卡決鬥｜結算", description=outcome, color=color)
+        emb.add_field(
+            name=self.challenger.display_name,
+            value=f"{c_e} **{c_l}**",
+            inline=True,
+        )
+        emb.add_field(name="VS", value="⚔️", inline=True)
+        emb.add_field(
+            name=self.opponent.display_name,
+            value=f"{o_e} **{o_l}**",
+            inline=True,
+        )
+        emb.set_footer(text="持牌：👑×1、🧑×3、🗡️×1｜勝：王>民、民>奴、奴>王")
+        for child in self.children:
+            child.disabled = True
+        try:
+            if self.message:
+                await self.message.edit(content=None, embed=emb, view=None)
+        except Exception:
+            pass
+
+    async def on_timeout(self):
+        if self.settled:
+            return
+        self.settled = True
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE users SET balance=balance+%s WHERE user_id=%s",
+            (self.bet, str(self.challenger.id)),
+        )
+        cur.execute(
+            "UPDATE users SET balance=balance+%s WHERE user_id=%s",
+            (self.bet, str(self.opponent.id)),
+        )
+        conn.commit()
+        conn.close()
+        log_transaction(self.challenger.id, self.bet, "E卡決鬥逾時退款")
+        log_transaction(self.opponent.id, self.bet, "E卡決鬥逾時退款")
+        try:
+            if self.message:
+                pending = []
+                if self.challenger.id not in self.picks:
+                    pending.append(self.challenger.mention)
+                if self.opponent.id not in self.picks:
+                    pending.append(self.opponent.mention)
+                await self.message.edit(
+                    content=(
+                        f"⌛ E 卡決鬥逾時，未完成選牌（未選：{', '.join(pending) or '—'}）。"
+                        f"雙方注金 `{self.bet:,}` 已退回。"
+                    ),
+                    view=None,
+                )
+        except Exception:
+            pass
+
+    @discord.ui.button(label="選牌（私下）", style=discord.ButtonStyle.primary)
+    async def pick(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id not in (self.challenger.id, self.opponent.id):
+            return await interaction.response.send_message("你不是這場決鬥的玩家。", ephemeral=True)
+        if interaction.user.id in self.picks:
+            return await interaction.response.send_message("你已經選過了。", ephemeral=True)
+        view = EDuelPickerView(self, interaction.user.id)
+        await interaction.response.send_message(
+            content="請選擇你要出的牌（持牌：👑×1、🧑×3、🗡️×1）：",
+            view=view,
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(
+    name="duel",
+    description="E 卡決鬥（賭博默示錄風）：與對手對戰，贏者全拿；同牌平手退款",
+)
+@app_commands.describe(member="對手", bet="雙方下注金額（兩邊相同）")
+async def duel_slash(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    bet: int,
+):
+    if not interaction.guild:
+        return await interaction.response.send_message("請在伺服器頻道使用。", ephemeral=True)
+    if member.bot:
+        return await interaction.response.send_message("不能對機器人發起決鬥。", ephemeral=True)
+    if member.id == interaction.user.id:
+        return await interaction.response.send_message("不能對自己發起決鬥。", ephemeral=True)
+    if bet <= 0:
+        return await interaction.response.send_message("注金需大於 0。", ephemeral=True)
+    ensure_user_exists(interaction.user.id, 50000)
+    ensure_user_exists(member.id, 50000)
+    if not try_deduct_balance(interaction.user.id, bet, "E卡決鬥下注"):
+        return await interaction.response.send_message(
+            f"❌ 你的餘額不足，需要 `{bet:,}` 東雲幣才能發起決鬥。",
+            ephemeral=True,
+        )
+    view = EDuelInviteView(interaction.user, member, bet)
+    await interaction.response.send_message(
+        content=(
+            f"⚔️ {interaction.user.mention} 向 {member.mention} 發起 **E 卡決鬥**！\n"
+            f"注額：`{bet:,}` 東雲幣（對手須付相同注金，**贏者全拿**；平手退款）\n"
+            f"持牌：👑×1（王）、🧑×3（民）、🗡️×1（奴）｜勝：王>民、民>奴、奴>王\n"
+            f"{member.mention} 請於 **120 秒** 內點 **接受** 或 **拒絕**。"
+        ),
+        view=view,
+    )
+    try:
+        view.message = await interaction.original_response()
+    except Exception:
+        pass
+
 
 @bot.tree.command(name="kill", description="在目前頻道送出 Minecraft 風格隨機死法")
 @app_commands.describe(target="目標（選人）", user_id="或填使用者 ID／貼提及")
