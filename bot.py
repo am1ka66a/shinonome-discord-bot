@@ -434,6 +434,7 @@ async def interaction_send(
 ):
     """已 defer 的互動走 followup；未回應的互動走原本 response。"""
     if interaction.response.is_done():
+        kwargs.setdefault("wait", True)
         return await interaction.followup.send(*args, **kwargs)
     return await interaction.response.send_message(*args, **kwargs)
 
@@ -459,20 +460,20 @@ async def fetch_casino_stats_rows_async():
     return await db_to_thread(fetch_casino_stats_rows)
 
 
+async def claim_daily_reward_async(user_id, daily_reward: int = 100_000):
+    return await db_to_thread(claim_daily_reward, user_id, daily_reward)
+
+
+async def claim_hourly_reward_async(user_id, reward_per_slot: int = 1000):
+    return await db_to_thread(claim_hourly_reward, user_id, reward_per_slot)
+
+
 async def get_level_stats_async(user_id):
     return await db_to_thread(get_level_stats, user_id)
 
 
 async def get_claimed_milestones_async(user_id):
     return await db_to_thread(get_claimed_milestones, user_id)
-
-
-async def refresh_hourly_bank_async(user_id):
-    return await db_to_thread(refresh_hourly_bank, user_id)
-
-
-async def payout_hourly_bank_async(user_id, bank, reward_per_slot):
-    return await db_to_thread(payout_hourly_bank, user_id, bank, reward_per_slot)
 
 
 async def try_deduct_balance_async(user_id, amount, reason):
@@ -1181,6 +1182,65 @@ def payout_hourly_bank(user_id, bank, reward_per_slot):
     conn.close()
     log_transaction(user_id, payout, "每小時簽到")
     return payout
+
+
+def claim_daily_reward(user_id, daily_reward: int = 100_000):
+    ensure_user_exists(user_id, 50000)
+    today_tw = now_tw_naive().date()
+    tomorrow_tw = today_tw + datetime.timedelta(days=1)
+    next_claim_dt = datetime.datetime.combine(tomorrow_tw, datetime.time.min, tzinfo=TW_TZ)
+    next_ts = int(next_claim_dt.timestamp())
+
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT last_claim FROM daily_claims WHERE user_id=%s", (str(user_id),))
+    row = c.fetchone()
+    if row and row[0] == today_tw:
+        conn.close()
+        return {"claimed": False, "next_ts": next_ts}
+
+    c.execute(
+        "INSERT INTO daily_claims (user_id, last_claim) VALUES (%s, %s) ON DUPLICATE KEY UPDATE last_claim=%s",
+        (str(user_id), today_tw, today_tw),
+    )
+    c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (daily_reward, str(user_id)))
+    conn.commit()
+    conn.close()
+    log_transaction(user_id, daily_reward, "每日簽到")
+    stats = get_user_stats(user_id)
+    return {
+        "claimed": True,
+        "reward": daily_reward,
+        "balance": int((stats[0] if stats else 0) or 0),
+        "next_ts": next_ts,
+    }
+
+
+def claim_hourly_reward(user_id, reward_per_slot: int = 1000):
+    ensure_user_exists(user_id, 50000)
+    bank_info = refresh_hourly_bank(user_id)
+    if not bank_info:
+        return {"ok": False}
+
+    level_num = int(bank_info["level"])
+    bank = int(bank_info["bank"])
+    if bank <= 0:
+        sec = int(bank_info["next_in_seconds"])
+        mins = max(1, int(sec // 60))
+        return {"ok": True, "claimed": False, "level": level_num, "mins": mins}
+
+    payout = payout_hourly_bank(user_id, bank, reward_per_slot)
+    stats = get_user_stats(user_id)
+    return {
+        "ok": True,
+        "claimed": True,
+        "level": level_num,
+        "bank": bank,
+        "reward_per_slot": reward_per_slot,
+        "payout": int(payout),
+        "balance": int((stats[0] if stats else 0) or 0),
+    }
+
 
 def get_tournament_window():
     conn = get_db_connection()
@@ -2802,36 +2862,18 @@ async def help_slash(interaction: discord.Interaction):
 @bot.tree.command(name="daily", description="每日簽到領取 100,000 東雲幣")
 async def daily(interaction: discord.Interaction):
     await interaction_defer_if_needed(interaction)
-    await ensure_user_exists_async(interaction.user.id, 50000)
-    daily_reward = 100000
-    today_tw = now_tw_naive().date()
-    
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT last_claim FROM daily_claims WHERE user_id=%s", (str(interaction.user.id),))
-    row = c.fetchone()
-    
-    if row and row[0] == today_tw:
-        tomorrow_tw = today_tw + datetime.timedelta(days=1)
-        next_claim_dt = datetime.datetime.combine(tomorrow_tw, datetime.time.min, tzinfo=TW_TZ)
-        ts = int(next_claim_dt.timestamp())
-        conn.close()
-        return await interaction_send(interaction, f"⚠️ 你今天已經簽到過囉！下次簽到時間：<t:{ts}:F> (<t:{ts}:R>)", ephemeral=True)
-        
-    c.execute(
-        "INSERT INTO daily_claims (user_id, last_claim) VALUES (%s, %s) ON DUPLICATE KEY UPDATE last_claim=%s",
-        (str(interaction.user.id), today_tw, today_tw),
-    )
-    c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (daily_reward, str(interaction.user.id)))
-    conn.commit()
-    conn.close()
-    await db_to_thread(log_transaction, interaction.user.id, daily_reward, "每日簽到")
-    new_bal = (await get_user_stats_async(interaction.user.id))[0]
-    
-    # 計算下一次領取時間
-    tomorrow_tw = today_tw + datetime.timedelta(days=1)
-    next_claim_dt = datetime.datetime.combine(tomorrow_tw, datetime.time.min, tzinfo=TW_TZ)
-    ts = int(next_claim_dt.timestamp())
+    result = await claim_daily_reward_async(interaction.user.id)
+    if not result["claimed"]:
+        ts = result["next_ts"]
+        return await interaction_send(
+            interaction,
+            f"⚠️ 你今天已經簽到過囉！下次簽到時間：<t:{ts}:F> (<t:{ts}:R>)",
+            ephemeral=True,
+        )
+
+    daily_reward = result["reward"]
+    new_bal = result["balance"]
+    ts = result["next_ts"]
     embed = discord.Embed(title="✅ 每日簽到成功", color=discord.Color.green())
     embed.add_field(name="獲得", value=f"`{daily_reward:,}` 東雲幣", inline=False)
     embed.add_field(name="目前餘額", value=f"`{new_bal:,}` 東雲幣", inline=False)
@@ -2842,24 +2884,22 @@ async def daily(interaction: discord.Interaction):
 @bot.tree.command(name="hourly", description="每小時簽到（可依等級累積）")
 async def hourly(interaction: discord.Interaction):
     await interaction_defer_if_needed(interaction)
-    await ensure_user_exists_async(interaction.user.id, 50000)
-    bank_info = await refresh_hourly_bank_async(interaction.user.id)
-    if not bank_info:
+    result = await claim_hourly_reward_async(interaction.user.id)
+    if not result.get("ok"):
         return await interaction_send(interaction, "資料初始化失敗", ephemeral=True)
-    level_num = bank_info["level"]
-    bank = bank_info["bank"]
-    reward_per_slot = 1000
-    if bank <= 0:
-        sec = bank_info["next_in_seconds"]
-        mins = max(1, int(sec // 60))
+    level_num = result["level"]
+    if not result["claimed"]:
+        mins = result["mins"]
         return await interaction_send(
             interaction,
             f"⏳ 目前尚無可領時段。下次可累積約 `{mins}` 分鐘後。\n"
             f"你目前 Lv.{level_num}，最多可累積 `{level_num}` 小時。",
             ephemeral=True
         )
-    payout = await payout_hourly_bank_async(interaction.user.id, bank, reward_per_slot)
-    new_bal = (await get_user_stats_async(interaction.user.id))[0]
+    bank = result["bank"]
+    reward_per_slot = result["reward_per_slot"]
+    payout = result["payout"]
+    new_bal = result["balance"]
     embed = discord.Embed(title="✅ 每小時簽到成功", color=discord.Color.green())
     embed.add_field(name="累積時段", value=f"`{bank}` 小時（上限 `{level_num}`）", inline=False)
     embed.add_field(name="每小時獎勵", value=f"`{reward_per_slot:,}` 東雲幣", inline=False)
@@ -4666,7 +4706,7 @@ async def duel_slash(
             ephemeral=True,
         )
     view = EDuelInviteView(interaction.user, member, bet)
-    await interaction_send(
+    sent = await interaction_send(
         interaction,
         content=(
             f"⚔️ {interaction.user.mention} 向 {member.mention} 發起 **E 卡決鬥**！\n"
@@ -4680,7 +4720,7 @@ async def duel_slash(
         view=view,
     )
     try:
-        view.message = await interaction.original_response()
+        view.message = sent or await interaction.original_response()
     except Exception:
         pass
 
@@ -4756,9 +4796,9 @@ async def record_cmd(
         start_page=page,
         footer_prefix=f"共 {len(rows)} 筆（最多顯示 50）"
     )
-    await interaction_send(interaction, embed=view.build_embed(), view=view)
+    sent = await interaction_send(interaction, embed=view.build_embed(), view=view)
     try:
-        view.message = await interaction.original_response()
+        view.message = sent or await interaction.original_response()
     except:
         pass
 
