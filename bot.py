@@ -4171,8 +4171,8 @@ class EDuelPlayView(discord.ui.View):
             description=(
                 f"{self.challenger.mention}　**VS**　{self.opponent.mention}\n"
                 f"注額：`{self.bet:,}`　｜　彩池：`{self.bet * 2:,}` 東雲幣\n"
-                "勝負：👑 王 ＞ 🧑 民　｜　🧑 民 ＞ 🗡️ 奴　｜　🗡️ 奴 ＞ 👑 王\n"
-                "同牌平手 → 雙方各消耗該牌後進入下一局；分出勝負才結算"
+                "持牌（起手）：👑×1、🧑×3、🗡️×1\n"
+                "勝：👑 > 🧑、🧑 > 🗡️、🗡️ > 👑（同牌平手繼續用剩下的牌）"
             ),
             color=0x5865F2,
         )
@@ -4214,10 +4214,12 @@ class EDuelPlayView(discord.ui.View):
         hand_text = "　".join(parts) if parts else "（已無牌）"
         emb = discord.Embed(
             title=f"🎴 第 {self.round_no} 局：選擇你要出的牌",
-            description="👑 王 ＞ 🧑 民　｜　🧑 民 ＞ 🗡️ 奴　｜　🗡️ 奴 ＞ 👑 王",
+            description=(
+                f"你的剩餘持牌：{hand_text}\n"
+                "勝：👑 > 🧑、🧑 > 🗡️、🗡️ > 👑"
+            ),
             color=0x5865F2,
         )
-        emb.add_field(name="你的剩餘持牌", value=hand_text, inline=False)
         emb.set_footer(text="送出後不可更改｜長時間未動作將退款")
         return emb
 
@@ -4424,8 +4426,9 @@ async def duel_slash(
     await interaction.response.send_message(
         content=(
             f"⚔️ {interaction.user.mention} 向 {member.mention} 發起 **E 卡決鬥**！\n"
-            f"注額：`{bet:,}` 東雲幣（對手須付相同注金，**贏者全拿**；平手退款）\n"
-            f"持牌：👑×1（王）、🧑×3（民）、🗡️×1（奴）｜勝：王>民、民>奴、奴>王\n"
+            f"注額：`{bet:,}` 東雲幣\n"
+            f"持牌：👑×1（王）、🧑×3（民）、🗡️×1（奴）\n"
+            f"勝：王>民、民>奴、奴>王\n"
             f"{member.mention} 請於 **120 秒** 內點 **接受** 或 **拒絕**。"
         ),
         view=view,
