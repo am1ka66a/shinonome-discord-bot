@@ -4017,7 +4017,7 @@ async def level(
         value="\n".join(ms_lines) or "未設定",
         inline=False,
     )
-    await interaction.response.send_message(embed=emb)
+    await interaction_send(interaction, embed=emb)
 
 @bot.tree.command(name="transfer", description="轉帳給其他玩家")
 @app_commands.describe(
