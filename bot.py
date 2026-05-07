@@ -4047,7 +4047,7 @@ class EDuelInviteView(discord.ui.View):
             child.disabled = True
         match = EDuelMatch(self.challenger, self.opponent, self.bet)
         play = EDuelPlayView(match)
-        match.active_view = play
+        match.view = play
         match.channel = interaction.channel
         await interaction.response.edit_message(
             content=None,
@@ -4055,7 +4055,7 @@ class EDuelInviteView(discord.ui.View):
             view=play,
         )
         try:
-            play.message = await interaction.original_response()
+            match.message = await interaction.original_response()
         except Exception:
             pass
         self.stop()
@@ -4129,7 +4129,7 @@ class EDuelPickerView(discord.ui.View):
 
 
 class EDuelMatch:
-    """兩大局 E 卡決鬥的對局狀態與流程控制；每個小局／大局結果各自開新 embed。"""
+    """兩大局 E 卡決鬥的對局狀態與流程控制；全程於單一訊息原地更新 embed。"""
 
     def __init__(self, challenger: discord.Member, opponent: discord.Member, bet: int):
         self.challenger = challenger
@@ -4145,10 +4145,12 @@ class EDuelMatch:
         self.round_in_game = 1
         self.scores: typing.Dict[int, int] = {challenger.id: 0, opponent.id: 0}
         self.round_history: typing.List[typing.Dict[str, typing.Any]] = []
+        self.last_round: typing.Optional[typing.Dict[str, typing.Any]] = None
         self.picks: typing.Dict[int, str] = {}
         self.hands: typing.Dict[int, typing.Dict[str, int]] = self._make_hands(0)
         self.channel: typing.Optional[discord.abc.Messageable] = None
-        self.active_view: typing.Optional["EDuelPlayView"] = None
+        self.view: typing.Optional["EDuelPlayView"] = None
+        self.message: typing.Optional[discord.Message] = None
         self.settled = False
 
     def _make_hands(self, game_idx: int) -> typing.Dict[int, typing.Dict[str, int]]:
@@ -4185,6 +4187,25 @@ class EDuelMatch:
     def _player_status_value(self, uid: int) -> str:
         return "✅ 已選牌" if uid in self.picks else "⏳ 等待選牌中…"
 
+    def _last_round_outcome_text(self) -> str:
+        entry = self.last_round
+        if not entry:
+            return ""
+        em_member = self._member_for_uid(entry["em_uid"])
+        sl_member = self._member_for_uid(entry["sl_uid"])
+        em_e, em_l = DUEL_CARDS[entry["em_pick"]]
+        sl_e, sl_l = DUEL_CARDS[entry["sl_pick"]]
+        if entry["result"] == "draw":
+            tag = "🤝 平手（民 vs 民），雙方消耗該牌"
+        elif entry["result"] == "emperor":
+            tag = f"🏆 {em_member.display_name}（👑 國王方）+1"
+        else:
+            tag = f"🏆 {sl_member.display_name}（🗡️ 奴隸方）+3"
+        return (
+            f"第 {entry['game']} 大局・第 {entry['round']} 小局　"
+            f"👑 {em_e} {em_l}　vs　🗡️ {sl_e} {sl_l}　— {tag}"
+        )
+
     def build_selection_embed(self) -> discord.Embed:
         em_uid = self._uid_for_role("emperor")
         sl_uid = self._uid_for_role("slave")
@@ -4196,12 +4217,13 @@ class EDuelMatch:
                 f"{self.challenger.mention}　**VS**　{self.opponent.mention}\n"
                 f"注額：`{self.bet:,}`　｜　彩池：`{self.bet * 2:,}` 東雲幣\n"
                 f"本大局陣營：👑 {em_member.mention}　vs　🗡️ {sl_member.mention}\n"
-                "持牌：國王方 👑×1+🧑×4　奴隸方 🗡️×1+🧑×4\n"
                 "勝：👑 > 🧑、🧑 > 🗡️、🗡️ > 👑（民vs民平手繼續）\n"
                 "計分：奴隸贏王 +3｜其餘決勝 +1"
             ),
             color=0x5865F2,
         )
+        if self.last_round:
+            emb.add_field(name="上一小局結果", value=self._last_round_outcome_text(), inline=False)
         emb.add_field(
             name=f"{em_member.display_name}　👑 國王方｜剩餘",
             value=self._format_hand(em_uid),
@@ -4258,122 +4280,11 @@ class EDuelMatch:
         emb.set_footer(text="送出後不可更改｜長時間未動作將退款")
         return emb
 
-    async def start(self, target_message: discord.Message, view: "EDuelPlayView") -> None:
-        self.channel = target_message.channel
-        self.active_view = view
-        view.message = target_message
-        try:
-            await target_message.edit(content=None, embed=self.build_selection_embed(), view=view)
-        except Exception:
-            pass
-
-    async def _post_next_selection(self) -> None:
-        if self.settled or not self.channel:
+    async def _refresh_message(self) -> None:
+        if not self.message or not self.view:
             return
-        view = EDuelPlayView(self)
-        self.active_view = view
         try:
-            msg = await self.channel.send(embed=self.build_selection_embed(), view=view)
-            view.message = msg
-        except Exception:
-            pass
-
-    async def _freeze_active_view(self, entry: typing.Dict[str, typing.Any]) -> None:
-        view = self.active_view
-        if not view or not view.message:
-            return
-        for child in view.children:
-            child.disabled = True
-        view.stop()
-        em_member = self._member_for_uid(entry["em_uid"])
-        sl_member = self._member_for_uid(entry["sl_uid"])
-        em_e, em_l = DUEL_CARDS[entry["em_pick"]]
-        sl_e, sl_l = DUEL_CARDS[entry["sl_pick"]]
-        emb = discord.Embed(
-            title=(
-                f"🎴 第 {entry['game']} 大局・第 {entry['round']} 小局｜雙方已翻牌"
-            ),
-            description=(
-                f"{em_member.mention}（👑 國王方）：{em_e} **{em_l}**\n"
-                f"{sl_member.mention}（🗡️ 奴隸方）：{sl_e} **{sl_l}**"
-            ),
-            color=0x95A5A6,
-        )
-        emb.set_footer(text="判定結果與下一局選牌請見下方訊息")
-        try:
-            await view.message.edit(embed=emb, view=view)
-        except Exception:
-            pass
-
-    async def _post_round_result(self, entry: typing.Dict[str, typing.Any]) -> None:
-        if not self.channel:
-            return
-        em_member = self._member_for_uid(entry["em_uid"])
-        sl_member = self._member_for_uid(entry["sl_uid"])
-        em_e, em_l = DUEL_CARDS[entry["em_pick"]]
-        sl_e, sl_l = DUEL_CARDS[entry["sl_pick"]]
-        if entry["result"] == "draw":
-            outcome = "🤝 **平手**（民 vs 民），雙方各消耗該牌，本大局繼續。"
-            color = 0xFFD166
-        elif entry["result"] == "emperor":
-            outcome = f"🏆 {em_member.mention}（👑 國王方）勝出本小局，**+1 積分**。"
-            color = 0x57F287
-        else:
-            outcome = f"🏆 {sl_member.mention}（🗡️ 奴隸方）擊倒國王，**+3 積分**！"
-            color = 0xED4245
-        emb = discord.Embed(
-            title=f"⚔️ 第 {entry['game']} 大局・第 {entry['round']} 小局｜結果",
-            description=outcome,
-            color=color,
-        )
-        emb.add_field(
-            name=f"{em_member.display_name}（👑 國王方）出牌",
-            value=f"{em_e} **{em_l}**",
-            inline=True,
-        )
-        emb.add_field(name="\u200b", value="⚔️", inline=True)
-        emb.add_field(
-            name=f"{sl_member.display_name}（🗡️ 奴隸方）出牌",
-            value=f"{sl_e} **{sl_l}**",
-            inline=True,
-        )
-        emb.add_field(
-            name="目前積分",
-            value=(
-                f"{self.challenger.display_name}: `{self.scores[self.challenger.id]}`　｜　"
-                f"{self.opponent.display_name}: `{self.scores[self.opponent.id]}`"
-            ),
-            inline=False,
-        )
-        try:
-            await self.channel.send(embed=emb)
-        except Exception:
-            pass
-
-    async def _post_game_finish(self, finished_game_no: int) -> None:
-        if not self.channel:
-            return
-        s_a = self.scores[self.challenger.id]
-        s_b = self.scores[self.opponent.id]
-        next_no = finished_game_no + 1
-        next_em_uid = self._uid_for_role("emperor", game_no=next_no)
-        next_sl_uid = self._uid_for_role("slave", game_no=next_no)
-        next_em = self._member_for_uid(next_em_uid)
-        next_sl = self._member_for_uid(next_sl_uid)
-        emb = discord.Embed(
-            title=f"🏁 第 {finished_game_no} 大局結束｜進入第 {next_no} 大局",
-            description=(
-                f"目前積分：{self.challenger.display_name} `{s_a}`　｜　"
-                f"{self.opponent.display_name} `{s_b}`\n"
-                f"第 {next_no} 大局陣營（已交換）：\n"
-                f"👑 {next_em.mention}　vs　🗡️ {next_sl.mention}\n"
-                "持牌：國王方 👑×1+🧑×4　奴隸方 🗡️×1+🧑×4"
-            ),
-            color=0x5865F2,
-        )
-        emb.set_footer(text="第二大局獨立計分；兩大局結束後依總積分分配彩池")
-        try:
-            await self.channel.send(embed=emb)
+            await self.message.edit(embed=self.build_selection_embed(), view=self.view)
         except Exception:
             pass
 
@@ -4447,9 +4358,7 @@ class EDuelMatch:
             log_transaction(self.opponent.id, b_amt, f"E卡決鬥分配（積分 {s_a}:{s_b}）")
         return {"a": a_amt, "b": b_amt, "s_a": s_a, "s_b": s_b}
 
-    async def _post_final_settlement(self, payouts: typing.Dict[str, int]) -> None:
-        if not self.channel:
-            return
+    def _build_final_embed(self, payouts: typing.Dict[str, int]) -> discord.Embed:
         s_a = payouts["s_a"]
         s_b = payouts["s_b"]
         a_amt = payouts["a"]
@@ -4482,10 +4391,7 @@ class EDuelMatch:
         )
         emb.add_field(name="對戰過程", value=self._format_history()[:1024], inline=False)
         emb.set_footer(text="計分：奴贏王 +3｜其餘決勝 +1｜兩大局制（第二大局交換陣營）")
-        try:
-            await self.channel.send(embed=emb)
-        except Exception:
-            pass
+        return emb
 
     async def record_pick(self, interaction: discord.Interaction, picker_id: int, key: str):
         if interaction.user.id != picker_id:
@@ -4504,13 +4410,8 @@ class EDuelMatch:
             color=0x57F287,
         )
         await interaction.response.edit_message(content=None, embed=confirm_emb, view=None)
-        if not self.settled and self.active_view and self.active_view.message:
-            try:
-                await self.active_view.message.edit(
-                    embed=self.build_selection_embed(), view=self.active_view
-                )
-            except Exception:
-                pass
+        if not self.settled and len(self.picks) < 2:
+            await self._refresh_message()
         if len(self.picks) == 2 and not self.settled:
             await self._process_round()
 
@@ -4519,15 +4420,15 @@ class EDuelMatch:
         sl_uid = self._uid_for_role("slave")
         em_pick = self.picks[em_uid]
         sl_pick = self.picks[sl_uid]
-        self.hands[em_uid][em_pick] = max(0, int(self.hands[em_uid].get(em_pick, 0)) - 1)
-        self.hands[sl_uid][sl_pick] = max(0, int(self.hands[sl_uid].get(sl_pick, 0)) - 1)
+        em_hand = self.hands[em_uid]
+        sl_hand = self.hands[sl_uid]
+        em_hand[em_pick] = max(0, int(em_hand.get(em_pick, 0)) - 1)
+        sl_hand[sl_pick] = max(0, int(sl_hand.get(sl_pick, 0)) - 1)
         result = _duel_resolve_round(em_pick, sl_pick)
-
         if result == "emperor":
             self.scores[em_uid] += 1
         elif result == "slave":
             self.scores[sl_uid] += 3
-
         entry = {
             "game": self.game_no,
             "round": self.round_in_game,
@@ -4538,64 +4439,65 @@ class EDuelMatch:
             "result": result,
         }
         self.round_history.append(entry)
-
-        await self._freeze_active_view(entry)
-        await self._post_round_result(entry)
+        self.last_round = entry
 
         if result == "draw":
             self.picks.clear()
             self.round_in_game += 1
-            await self._post_next_selection()
+            await self._refresh_message()
             return
 
         if self.game_no < 2:
-            finished_game = self.game_no
             self.game_no = 2
             self.round_in_game = 1
             self.hands = self._make_hands(1)
             self.picks.clear()
-            await self._post_game_finish(finished_game)
-            await self._post_next_selection()
+            await self._refresh_message()
             return
 
         self.settled = True
         payouts = await self._settle_match()
-        await self._post_final_settlement(payouts)
-
-    async def handle_timeout(self, view: "EDuelPlayView") -> None:
-        if self.settled or self.active_view is not view:
-            return
-        self.settled = True
-        await self._refund_both("E卡決鬥逾時退款")
-        try:
-            for child in view.children:
+        if self.message and self.view:
+            for child in self.view.children:
                 child.disabled = True
-            if view.message:
-                await view.message.edit(view=view)
-        except Exception:
-            pass
-        if self.channel:
-            pending = []
-            if self.challenger.id not in self.picks:
-                pending.append(self.challenger.mention)
-            if self.opponent.id not in self.picks:
-                pending.append(self.opponent.mention)
+            self.view.stop()
             try:
-                await self.channel.send(
-                    f"⌛ E 卡決鬥逾時（第 {self.game_no} 大局・第 {self.round_in_game} 小局未完成；"
-                    f"未選：{', '.join(pending) or '—'}）。雙方注金 `{self.bet:,}` 已退回。"
-                )
+                await self.message.edit(embed=self._build_final_embed(payouts), view=None)
             except Exception:
                 pass
 
+    async def handle_timeout(self, view: "EDuelPlayView") -> None:
+        if self.settled or self.view is not view:
+            return
+        self.settled = True
+        await self._refund_both("E卡決鬥逾時退款")
+        pending = []
+        if self.challenger.id not in self.picks:
+            pending.append(self.challenger.mention)
+        if self.opponent.id not in self.picks:
+            pending.append(self.opponent.mention)
+        try:
+            for child in view.children:
+                child.disabled = True
+            if self.message:
+                await self.message.edit(
+                    content=(
+                        f"⌛ E 卡決鬥逾時（第 {self.game_no} 大局・第 {self.round_in_game} 小局未完成；"
+                        f"未選：{', '.join(pending) or '—'}）。雙方注金 `{self.bet:,}` 已退回。"
+                    ),
+                    embed=None,
+                    view=view,
+                )
+        except Exception:
+            pass
+
 
 class EDuelPlayView(discord.ui.View):
-    """每個小局獨立一個 view（同一場 match 的選牌訊息）。"""
+    """全場單一訊息使用的選牌 view。"""
 
     def __init__(self, match: EDuelMatch):
         super().__init__(timeout=300)
         self.match = match
-        self.message: typing.Optional[discord.Message] = None
 
     @discord.ui.button(label="選牌（私下）", style=discord.ButtonStyle.primary, emoji="🎴")
     async def pick(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -4604,10 +4506,6 @@ class EDuelPlayView(discord.ui.View):
             return await interaction.response.send_message("你不是這場決鬥的玩家。", ephemeral=True)
         if m.settled:
             return await interaction.response.send_message("此場決鬥已結束。", ephemeral=True)
-        if m.active_view is not self:
-            return await interaction.response.send_message(
-                "這個選牌訊息已過期，請使用最新的選牌訊息。", ephemeral=True
-            )
         if interaction.user.id in m.picks:
             return await interaction.response.send_message(
                 "你本小局已經選過了，等對手出牌。", ephemeral=True
