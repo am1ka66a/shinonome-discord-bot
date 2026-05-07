@@ -4040,12 +4040,8 @@ class EDuelInviteView(discord.ui.View):
             child.disabled = True
         play = EDuelPlayView(self.challenger, self.opponent, self.bet)
         await interaction.response.edit_message(
-            content=(
-                f"⚔️ **E 卡決鬥開始！** {self.challenger.mention} vs {self.opponent.mention}\n"
-                f"注額：`{self.bet:,}`（彩池 `{self.bet * 2:,}`）\n"
-                f"持牌：👑×1（王）、🧑×3（民）、🗡️×1（奴）｜勝：王>民、民>奴、奴>王\n"
-                f"請雙方點 **選牌（私下）** 出一張牌；雙方都選好後翻牌結算。"
-            ),
+            content=None,
+            embed=play.build_play_embed(),
             view=play,
         )
         try:
@@ -4124,6 +4120,47 @@ class EDuelPlayView(discord.ui.View):
         self.message: typing.Optional[discord.Message] = None
         self.settled = False
 
+    def _player_status_value(self, uid: int) -> str:
+        return "✅ 已選牌" if uid in self.picks else "⏳ 等待選牌中…"
+
+    def build_play_embed(self) -> discord.Embed:
+        emb = discord.Embed(
+            title="⚔️ E 卡決鬥｜選牌中",
+            description=(
+                f"{self.challenger.mention}　**VS**　{self.opponent.mention}\n"
+                f"注額：`{self.bet:,}`　｜　彩池：`{self.bet * 2:,}` 東雲幣"
+            ),
+            color=0x5865F2,
+        )
+        emb.add_field(name="持牌（雙方相同）", value="👑 王 ×1　🧑 民 ×3　🗡️ 奴 ×1", inline=False)
+        emb.add_field(name="勝負規則", value="👑 王 ＞ 🧑 民　｜　🧑 民 ＞ 🗡️ 奴　｜　🗡️ 奴 ＞ 👑 王\n同牌平手退款", inline=False)
+        emb.add_field(
+            name=self.challenger.display_name,
+            value=self._player_status_value(self.challenger.id),
+            inline=True,
+        )
+        emb.add_field(name="\u200b", value="⚔️", inline=True)
+        emb.add_field(
+            name=self.opponent.display_name,
+            value=self._player_status_value(self.opponent.id),
+            inline=True,
+        )
+        emb.set_footer(text="請點下方「選牌（私下）」按鈕出牌；120 秒未完成將退款")
+        return emb
+
+    def build_picker_embed(self) -> discord.Embed:
+        emb = discord.Embed(
+            title="🎴 選擇你要出的牌",
+            description=(
+                "請從下方選一張牌出招。\n"
+                "👑 王 ＞ 🧑 民　｜　🧑 民 ＞ 🗡️ 奴　｜　🗡️ 奴 ＞ 👑 王"
+            ),
+            color=0x5865F2,
+        )
+        emb.add_field(name="持牌（雙方相同）", value="👑 王 ×1　🧑 民 ×3　🗡️ 奴 ×1", inline=False)
+        emb.set_footer(text="送出後不可更改｜120 秒內未選牌將退款")
+        return emb
+
     async def _record_pick(self, interaction: discord.Interaction, picker_id: int, key: str):
         if interaction.user.id != picker_id:
             return await interaction.response.send_message("這個按鈕不是給你的。", ephemeral=True)
@@ -4131,10 +4168,18 @@ class EDuelPlayView(discord.ui.View):
             return await interaction.response.send_message("你已經選過了。", ephemeral=True)
         self.picks[picker_id] = key
         emoji, label = DUEL_CARDS[key]
-        await interaction.response.edit_message(
-            content=f"✅ 已選擇：{emoji} **{label}**（等待對手 / 翻牌）",
-            view=None,
+        confirm_emb = discord.Embed(
+            title="✅ 已送出選擇",
+            description=f"你出的是：{emoji} **{label}**\n等待對手出牌與翻牌結算…",
+            color=0x57F287,
         )
+        await interaction.response.edit_message(content=None, embed=confirm_emb, view=None)
+        if not self.settled:
+            try:
+                if self.message:
+                    await self.message.edit(embed=self.build_play_embed(), view=self)
+            except Exception:
+                pass
         if len(self.picks) == 2 and not self.settled:
             self.settled = True
             await self._reveal()
@@ -4236,7 +4281,7 @@ class EDuelPlayView(discord.ui.View):
         except Exception:
             pass
 
-    @discord.ui.button(label="選牌（私下）", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="選牌（私下）", style=discord.ButtonStyle.primary, emoji="🎴")
     async def pick(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id not in (self.challenger.id, self.opponent.id):
             return await interaction.response.send_message("你不是這場決鬥的玩家。", ephemeral=True)
@@ -4244,7 +4289,7 @@ class EDuelPlayView(discord.ui.View):
             return await interaction.response.send_message("你已經選過了。", ephemeral=True)
         view = EDuelPickerView(self, interaction.user.id)
         await interaction.response.send_message(
-            content="請選擇你要出的牌（持牌：👑×1、🧑×3、🗡️×1）：",
+            embed=self.build_picker_embed(),
             view=view,
             ephemeral=True,
         )
