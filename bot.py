@@ -3190,14 +3190,23 @@ async def role_choose_slash(interaction: discord.Interaction, role: str):
     conn = get_db_connection()
     c = conn.cursor()
     c.execute(
-        "SELECT COALESCE(role,'civilian'), COALESCE(wanted_stars,0), last_role_change FROM users WHERE user_id=%s",
+        """SELECT COALESCE(role,'civilian'), COALESCE(wanted_stars,0), last_role_change,
+                  COALESCE(good_citizen_cert_active,0)
+           FROM users WHERE user_id=%s""",
         (str(interaction.user.id),),
     )
     row = c.fetchone()
     old_role = (row[0] or "civilian") if row else "civilian"
     wanted_now = int(row[1] or 0) if row else 0
     last_role_change = row[2] if row else None
+    cert_active = int(row[3] or 0) if row else 0
     now = now_tw_naive()
+    if role != old_role and cert_active:
+        conn.close()
+        return await interaction.response.send_message(
+            "❌ 你目前已啟用良民證，無法切換身分。請先使用 `/good_citizen` 解除後再轉職。",
+            ephemeral=True,
+        )
     if role != old_role and last_role_change is not None:
         elapsed = (now - last_role_change).total_seconds()
         if elapsed < ROLE_CHANGE_COOLDOWN_SECONDS:
