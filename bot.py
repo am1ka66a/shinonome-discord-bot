@@ -4959,9 +4959,6 @@ async def leaderboard(interaction: discord.Interaction):
     my_bal = int((my_row[0] if my_row else 0) or 0)
 
     if guild:
-        member_id_set = {m.id for m in guild.members}
-        if not member_id_set:
-            member_id_set = {interaction.user.id}
         c.execute(
             f"SELECT user_id, balance FROM users WHERE user_id NOT IN ({ph}) ORDER BY balance DESC LIMIT %s",
             tuple(admin_ids) + (LEADERBOARD_POOL,),
@@ -4972,7 +4969,7 @@ async def leaderboard(interaction: discord.Interaction):
             if len(data) >= 10:
                 break
             uid = int(row[0])
-            if uid in member_id_set:
+            if await _is_user_in_guild(guild, uid):
                 data.append(row)
 
         richer: typing.List[typing.Tuple] = []
@@ -4986,7 +4983,7 @@ async def leaderboard(interaction: discord.Interaction):
             richer = c.fetchall()
             ahead = 0
             for (uid_str,) in richer:
-                if int(uid_str) in member_id_set:
+                if await _is_user_in_guild(guild, int(uid_str)):
                     ahead += 1
             my_rank = ahead + 1
 
@@ -5057,9 +5054,6 @@ async def lvleaderboard(interaction: discord.Interaction):
         my_level, my_exp = 1, 0
 
     if guild:
-        member_id_set = {m.id for m in guild.members}
-        if not member_id_set:
-            member_id_set = {interaction.user.id}
         c.execute(
             f"SELECT user_id, level, exp FROM users WHERE user_id NOT IN ({ph}) ORDER BY level DESC, exp DESC LIMIT %s",
             tuple(admin_ids) + (LEADERBOARD_POOL,),
@@ -5070,7 +5064,7 @@ async def lvleaderboard(interaction: discord.Interaction):
             if len(data) >= 10:
                 break
             uid = int(row[0])
-            if uid in member_id_set:
+            if await _is_user_in_guild(guild, uid):
                 data.append(row)
 
         richer_lv: typing.List[typing.Tuple] = []
@@ -5086,7 +5080,7 @@ async def lvleaderboard(interaction: discord.Interaction):
             richer_lv = c.fetchall()
             ahead = 0
             for (uid_str,) in richer_lv:
-                if int(uid_str) in member_id_set:
+                if await _is_user_in_guild(guild, int(uid_str)):
                     ahead += 1
             my_rank = ahead + 1
 
