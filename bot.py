@@ -3797,6 +3797,11 @@ async def wanted_list_slash(interaction: discord.Interaction):
         except (TypeError, ValueError):
             continue
         mem = guild.get_member(mid)
+        if mem is None:
+            try:
+                mem = await guild.fetch_member(mid)
+            except Exception:
+                mem = None
         disp = mem.display_name if mem else "未知成員"
         disp_safe = discord.utils.escape_markdown(disp)
         star_s = "⭐" * min(stars_i, 5)
@@ -3808,7 +3813,7 @@ async def wanted_list_slash(interaction: discord.Interaction):
             hunt_txt = "本輪已追捕（待升星或搶匪再搶成功後才可再追）"
         else:
             hunt_txt = "**可追捕**"
-        lines.append(f"• {disp_safe}｜{star_s}｜可獲獎金 {bounty_txt}｜{hunt_txt}")
+        lines.append(f"• {disp_safe}（<@{mid}>）｜{star_s}｜可獲獎金 {bounty_txt}｜{hunt_txt}")
     if not lines:
         return await interaction.response.send_message(
             "目前沒有通緝中的玩家（僅顯示通緝星 1～5 星）。",
