@@ -115,7 +115,7 @@ GAMBLE_EXP_MIN = 12
 GAMBLE_EXP_MAX = 38
 RED_PACKET_MIN_SECONDS = 10
 ROB_COOLDOWN_SECONDS = 60
-ROB_VICTIM_PROTECT_SECONDS = 1800
+ROB_VICTIM_PROTECT_SECONDS = 3600
 # /rob 專用：基礎成功率；每 1 級差距 ±1%，再 clamp 至 5%～95%
 ROB_BASE_SUCCESS_RATE = 0.60
 # 平民 `/counter_rob` 加倍搶回專用基礎機率（與 `/rob` 分開）。
@@ -552,7 +552,8 @@ def init_db():
                   total_games INT DEFAULT 0, wins INT DEFAULT 0, total_profit BIGINT DEFAULT 0,
                   last_work TIMESTAMP NULL, last_beg TIMESTAMP NULL, last_rescue TIMESTAMP NULL, last_rob TIMESTAMP NULL, last_robbed TIMESTAMP NULL,
                   exp BIGINT DEFAULT 0, level INT DEFAULT 1,
-                  last_hourly_claim TIMESTAMP NULL, hourly_bank INT DEFAULT 0)''')
+                  last_hourly_claim TIMESTAMP NULL, hourly_bank INT DEFAULT 0,
+                  good_citizen_cert_active TINYINT(1) DEFAULT 0, last_good_citizen_cert_action TIMESTAMP NULL)''')
     # 確保現有表也有新欄位 (Migration)
     try: c.execute("ALTER TABLE users ADD COLUMN last_work TIMESTAMP NULL")
     except: pass
@@ -623,6 +624,14 @@ def init_db():
         pass
     try:
         c.execute("ALTER TABLE users ADD COLUMN bail_debt BIGINT DEFAULT 0")
+    except Exception:
+        pass
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN good_citizen_cert_active TINYINT(1) DEFAULT 0")
+    except Exception:
+        pass
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN last_good_citizen_cert_action TIMESTAMP NULL")
     except Exception:
         pass
 
@@ -906,6 +915,8 @@ COP_HUNT_CAPTURE_BASE_PCT = 35
 COP_HUNT_CAPTURE_PER_STAR_PCT = 5
 # 陣營轉職冷卻（24 小時）
 ROLE_CHANGE_COOLDOWN_SECONDS = 86400
+GOOD_CITIZEN_CERT_COST = 5_000_000
+GOOD_CITIZEN_CERT_COOLDOWN_SECONDS = 86400
 
 
 def append_rob_history_on_cursor(c, user_id: int, steal_amount: int) -> None:
@@ -952,6 +963,19 @@ def get_last_five_robs_total(user_id: typing.Union[int, str]) -> typing.Tuple[in
         return 0, 0, []
     total = sum(int(item.get("amount", 0) or 0) for item in history if isinstance(item, dict))
     return total, len(history), history
+
+
+def rob_history_total_from_raw(raw: typing.Any) -> typing.Tuple[int, int]:
+    if not raw:
+        return 0, 0
+    try:
+        history = json.loads(raw)
+    except Exception:
+        return 0, 0
+    if not isinstance(history, list):
+        return 0, 0
+    total = sum(int(item.get("amount", 0) or 0) for item in history if isinstance(item, dict))
+    return total, len(history)
 
 
 def clear_rob_history(user_id: typing.Union[int, str]) -> None:
@@ -2829,6 +2853,7 @@ async def help_slash(interaction: discord.Interaction):
             "`/role_choose` — 選警察／搶匪／平民\n"
             "`/wanted_status` — 自己的通緝、監獄、搶劫紀錄\n"
             "`/wanted_list` — 目前通緝名單與可否追捕\n"
+            f"`/good_citizen` — [平民] 付 `{GOOD_CITIZEN_CERT_COST:,}` 啟用防搶；再付同額解除（啟用/解除皆 24h 冷卻）\n"
             f"`/cop_hunt` — 警察追捕（僅警察；每次 **`{COP_HUNT_FEE:,}`** 幣、成敗皆扣）。"
             f"成功率 **1★ 約 {_cop_hunt_pct_1star}%** 起，通緝每多 **1** 星 **+{COP_HUNT_CAPTURE_PER_STAR_PCT}%**，並受等級差影響（每級 ±1%，保底 **5%**、上限 **95%**）\n"
             f"`/wanted_buyout` — [搶匪] 付 `{WANTED_BUYOUT_COST:,}` 消除全部通緝星並**清空最近搶劫紀錄**（**24 小時**冷卻）\n"
@@ -2980,7 +3005,10 @@ async def rob(
 
     c.execute("SELECT balance, last_rob, level FROM users WHERE user_id=%s", (str(interaction.user.id),))
     robber_row = c.fetchone()
-    c.execute("SELECT balance, level, last_robbed FROM users WHERE user_id=%s", (str(member.id),))
+    c.execute(
+        "SELECT balance, level, last_robbed, COALESCE(good_citizen_cert_active,0) FROM users WHERE user_id=%s",
+        (str(member.id),),
+    )
     target_row = c.fetchone()
 
     robber_balance = int((robber_row[0] if robber_row else 0) or 0)
@@ -2989,6 +3017,7 @@ async def rob(
     target_balance = int((target_row[0] if target_row else 0) or 0)
     target_level = int((target_row[1] if target_row else 1) or 1)
     target_last_robbed = target_row[2] if target_row else None
+    target_good_cert = int((target_row[3] if target_row else 0) or 0)
     now = now_tw_naive()
 
     if last_rob and (now - last_rob).total_seconds() < ROB_COOLDOWN_SECONDS:
@@ -3003,11 +3032,22 @@ async def rob(
     if robber_balance < 50000:
         conn.close()
         return await interaction_send(interaction, "你的餘額低於 50,000，無法發起搶劫。", ephemeral=True)
+    if target_good_cert:
+        conn.close()
+        return await interaction_send(
+            interaction,
+            "🪪 對方已啟用良民證，無法被搶劫。",
+            ephemeral=True,
+        )
     if target_last_robbed and (now - target_last_robbed).total_seconds() < ROB_VICTIM_PROTECT_SECONDS:
         remain = ROB_VICTIM_PROTECT_SECONDS - int((now - target_last_robbed).total_seconds())
         mins = max(1, remain // 60)
         conn.close()
-        return await interaction_send(interaction, f"對方目前有保護，請 `{mins}` 分鐘後再試。", ephemeral=True)
+        return await interaction_send(
+            interaction,
+            f"對方目前有保護，請 `{mins}` 分鐘後再試。",
+            ephemeral=True,
+        )
 
     # /rob 基礎成功率 ROB_BASE_SUCCESS_RATE；每差 1 等調整 1%
     level_gap = robber_level - target_level
@@ -3131,13 +3171,13 @@ async def rob(
     )
 
 
-@bot.tree.command(name="role_choose", description="選擇警察、搶匪或回到平民（影響通緝與追捕玩法）")
-@app_commands.describe(role="陣營：cop=警察、criminal=搶匪、civilian=平民")
+@bot.tree.command(name="role_choose", description="切換陣營：警察／搶匪／平民（24 小時冷卻）")
+@app_commands.describe(role="要切換的陣營")
 @app_commands.choices(
     role=[
-        app_commands.Choice(name="警察 cop", value="cop"),
-        app_commands.Choice(name="搶匪 criminal", value="criminal"),
-        app_commands.Choice(name="平民 civilian", value="civilian"),
+        app_commands.Choice(name="警察", value="cop"),
+        app_commands.Choice(name="搶匪", value="criminal"),
+        app_commands.Choice(name="平民", value="civilian"),
     ]
 )
 async def role_choose_slash(interaction: discord.Interaction, role: str):
@@ -3209,8 +3249,8 @@ async def role_choose_slash(interaction: discord.Interaction, role: str):
                 "• 使用 `/cop_hunt` 選擇通緝犯並嘗試逮捕\n"
                 f"• 每次追捕會先扣 `{COP_HUNT_FEE:,}`（成敗皆扣）\n"
                 f"• 成功率：通緝星級每星 +{COP_HUNT_CAPTURE_PER_STAR_PCT}%，並受雙方等級差影響（每級 ±1%，保底 5%、上限 95%）\n"
-                "• 成功可獲得其「最近五次搶劫成功」總額\n"
-                "• 通緝規則見 `/wanted_status`"
+                "• 成功可獲得對方最近五次搶劫總額獎金（另依規則沒收）\n"
+                "• 每次切換陣營皆有 24 小時冷卻"
             ),
             inline=False,
         )
@@ -3220,7 +3260,8 @@ async def role_choose_slash(interaction: discord.Interaction, role: str):
             value=(
                 "• `/rob` 搶劫成功會累積通緝星（最高 5）\n"
                 "• 通緝星級越高，且你等級越低於警察時，遭追捕成功率越高\n"
-                "• 入獄後可用 `/bail`：基礎假釋金 + 累計欠款（沒收／反搶不足皆會併入）"
+                "• 入獄後可用 `/bail`：基礎假釋金 + 累計欠款（沒收／反搶不足皆會併入）\n"
+                "• 轉回警察或平民前，通緝必須先歸零"
             ),
             inline=False,
         )
@@ -3229,7 +3270,8 @@ async def role_choose_slash(interaction: discord.Interaction, role: str):
             name="👤 平民",
             value=(
                 "• 不再以警察／搶匪身分參與通緝與追捕\n"
-                "• 可隨時再用 `/role_choose` 重新選擇陣營"
+                "• 可用 `/good_citizen` 啟用／解除良民證（需付費，且有 24 小時冷卻）\n"
+                "• 可隨時再用 `/role_choose` 重新選擇陣營（24 小時冷卻）"
             ),
             inline=False,
         )
@@ -3567,6 +3609,78 @@ async def wanted_buyout_slash(interaction: discord.Interaction):
     await interaction.response.send_message(embed=emb, ephemeral=False, allowed_mentions=_am)
 
 
+@bot.tree.command(name="good_citizen", description="良民證：支付 500 萬啟用防搶；再支付 500 萬解除（兩者皆 24h 冷卻）")
+async def good_citizen_slash(interaction: discord.Interaction):
+    ensure_user_exists(interaction.user.id, 50000)
+    uid = str(interaction.user.id)
+    now = now_tw_naive()
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute(
+        """SELECT COALESCE(role,'civilian'), COALESCE(balance,0),
+                  COALESCE(good_citizen_cert_active,0), last_good_citizen_cert_action
+           FROM users WHERE user_id=%s""",
+        (uid,),
+    )
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return await interaction.response.send_message("找不到帳號資料。", ephemeral=True)
+    role_raw, bal_raw, cert_active_raw, last_action = row
+    role_now = _user_role_value(role_raw)
+    bal = int(bal_raw or 0)
+    cert_active = int(cert_active_raw or 0)
+    if role_now != "civilian":
+        conn.close()
+        return await interaction.response.send_message(
+            "❌ 良民證僅限 **平民** 使用；請先用 `/role_choose` 切換為平民。",
+            ephemeral=True,
+        )
+    if last_action is not None:
+        elapsed = (now - last_action).total_seconds()
+        if elapsed < GOOD_CITIZEN_CERT_COOLDOWN_SECONDS:
+            next_dt = last_action + datetime.timedelta(seconds=GOOD_CITIZEN_CERT_COOLDOWN_SECONDS)
+            ts = tw_naive_to_discord_ts(next_dt)
+            conn.close()
+            return await interaction.response.send_message(
+                f"⏳ 良民證冷卻中，下次可於 <t:{ts}:F>（<t:{ts}:R>）再操作。",
+                ephemeral=True,
+            )
+    if bal < GOOD_CITIZEN_CERT_COST:
+        conn.close()
+        return await interaction.response.send_message(
+            f"❌ 需要 `{GOOD_CITIZEN_CERT_COST:,}` 東雲幣，你的餘額不足（目前 `{bal:,}`）。",
+            ephemeral=True,
+        )
+
+    next_active = 0 if cert_active else 1
+    c.execute(
+        """UPDATE users
+           SET balance=balance-%s,
+               good_citizen_cert_active=%s,
+               last_good_citizen_cert_action=%s
+           WHERE user_id=%s AND balance >= %s""",
+        (GOOD_CITIZEN_CERT_COST, next_active, now, uid, GOOD_CITIZEN_CERT_COST),
+    )
+    if c.rowcount == 0:
+        conn.close()
+        return await interaction.response.send_message("扣款失敗（餘額不足）。", ephemeral=True)
+    conn.commit()
+    conn.close()
+
+    reason = "啟用良民證（防搶）" if next_active else "解除良民證（取消防搶）"
+    log_transaction(interaction.user.id, -GOOD_CITIZEN_CERT_COST, reason)
+    new_bal = get_user_stats(interaction.user.id)[0]
+    title = "✅ 良民證已啟用" if next_active else "✅ 良民證已解除"
+    status_txt = "已啟用（不可被搶劫）" if next_active else "已解除（可被搶劫）"
+    emb = discord.Embed(title=title, color=0x57F287 if next_active else 0xFEE75C)
+    emb.add_field(name="本次花費", value=f"`{GOOD_CITIZEN_CERT_COST:,}` 東雲幣", inline=False)
+    emb.add_field(name="目前狀態", value=status_txt, inline=False)
+    emb.add_field(name="目前餘額", value=f"`{new_bal:,}` 東雲幣", inline=False)
+    emb.set_footer(text="啟用與解除皆有 24 小時冷卻")
+    await interaction.response.send_message(embed=emb, ephemeral=True)
+
+
 @bot.tree.command(name="wanted_status", description="查看自己的陣營、通緝、監獄狀態與最近搶劫紀錄")
 async def wanted_status_slash(interaction: discord.Interaction):
     ensure_user_exists(interaction.user.id, 50000)
@@ -3576,7 +3690,8 @@ async def wanted_status_slash(interaction: discord.Interaction):
     c.execute(
         """SELECT COALESCE(role,'civilian'), COALESCE(wanted_stars,0), COALESCE(wanted_hunted_count,0),
                   COALESCE(in_prison,0), last_five_robs, COALESCE(arrest_count,0),
-                  COALESCE(revenge_pending,0), COALESCE(revenge_amount,0), COALESCE(bail_debt,0)
+                  COALESCE(revenge_pending,0), COALESCE(revenge_amount,0), COALESCE(bail_debt,0),
+                  COALESCE(good_citizen_cert_active,0)
            FROM users WHERE user_id=%s""",
         (uid,),
     )
@@ -3584,7 +3699,7 @@ async def wanted_status_slash(interaction: discord.Interaction):
     conn.close()
     if not row:
         return await interaction.response.send_message("找不到資料。", ephemeral=True)
-    role, stars, hunted, in_pr, raw_hist, arrests, rev_pend, rev_amt, bail_debt_u = row
+    role, stars, hunted, in_pr, raw_hist, arrests, rev_pend, rev_amt, bail_debt_u, cert_active = row
     role_s = role or "civilian"
     stars_i = int(stars or 0)
     hunted_i = int(hunted or 0)
@@ -3598,6 +3713,12 @@ async def wanted_status_slash(interaction: discord.Interaction):
     emb.add_field(name="本輪可追捕", value="否（已嘗試）" if hunted_i else "是", inline=True)
     emb.add_field(name="監獄", value="🔒 在押" if in_pr_i else "否", inline=True)
     emb.add_field(name="累計被捕次數", value=str(arrests_i), inline=True)
+    if role_s == "civilian":
+        emb.add_field(
+            name="良民證",
+            value="🪪 已啟用（不可被搶）" if int(cert_active or 0) else "未啟用（可被搶）",
+            inline=True,
+        )
     if int(rev_pend or 0) and (role or "civilian") == "civilian":
         emb.add_field(
             name="加倍搶回",
@@ -3642,7 +3763,8 @@ async def wanted_list_slash(interaction: discord.Interaction):
     conn = get_db_connection()
     c = conn.cursor()
     c.execute(
-        """SELECT user_id, COALESCE(wanted_stars,0), COALESCE(wanted_hunted_count,0), COALESCE(in_prison,0)
+        """SELECT user_id, COALESCE(wanted_stars,0), COALESCE(wanted_hunted_count,0),
+                  COALESCE(in_prison,0), last_five_robs
            FROM users WHERE wanted_stars > 0
            ORDER BY wanted_stars DESC, user_id ASC LIMIT 50"""
     )
@@ -3655,7 +3777,7 @@ async def wanted_list_slash(interaction: discord.Interaction):
         )
     guild = interaction.guild
     lines: typing.List[str] = []
-    for uid_str, stars, hunted, in_pr in rows:
+    for uid_str, stars, hunted, in_pr, raw_hist in rows:
         stars_i = int(stars or 0)
         if stars_i <= 0:
             continue
@@ -3666,16 +3788,18 @@ async def wanted_list_slash(interaction: discord.Interaction):
         except (TypeError, ValueError):
             continue
         mem = guild.get_member(mid)
-        disp = mem.display_name if mem else f"ID {mid}"
+        disp = mem.display_name if mem else "未知成員"
         disp_safe = discord.utils.escape_markdown(disp)
         star_s = "⭐" * min(stars_i, 5)
+        bounty, bounty_count = rob_history_total_from_raw(raw_hist)
+        bounty_txt = f"`{bounty:,}` 東雲幣（{bounty_count} 筆）"
         if in_pr_i:
             hunt_txt = "在獄中（無法被追捕）"
         elif hunted_i:
             hunt_txt = "本輪已追捕（待升星或搶匪再搶成功後才可再追）"
         else:
             hunt_txt = "**可追捕**"
-        lines.append(f"• {disp_safe}（<@{mid}>）｜{star_s}｜{hunt_txt}")
+        lines.append(f"• {disp_safe}｜{star_s}｜可獲獎金 {bounty_txt}｜{hunt_txt}")
     if not lines:
         return await interaction.response.send_message(
             "目前沒有通緝中的玩家（僅顯示通緝星 1～5 星）。",
@@ -4835,6 +4959,9 @@ async def leaderboard(interaction: discord.Interaction):
     my_bal = int((my_row[0] if my_row else 0) or 0)
 
     if guild:
+        member_id_set = {m.id for m in guild.members}
+        if not member_id_set:
+            member_id_set = {interaction.user.id}
         c.execute(
             f"SELECT user_id, balance FROM users WHERE user_id NOT IN ({ph}) ORDER BY balance DESC LIMIT %s",
             tuple(admin_ids) + (LEADERBOARD_POOL,),
@@ -4845,7 +4972,7 @@ async def leaderboard(interaction: discord.Interaction):
             if len(data) >= 10:
                 break
             uid = int(row[0])
-            if await _is_user_in_guild(guild, uid):
+            if uid in member_id_set:
                 data.append(row)
 
         richer: typing.List[typing.Tuple] = []
@@ -4859,7 +4986,7 @@ async def leaderboard(interaction: discord.Interaction):
             richer = c.fetchall()
             ahead = 0
             for (uid_str,) in richer:
-                if await _is_user_in_guild(guild, int(uid_str)):
+                if int(uid_str) in member_id_set:
                     ahead += 1
             my_rank = ahead + 1
 
@@ -4930,6 +5057,9 @@ async def lvleaderboard(interaction: discord.Interaction):
         my_level, my_exp = 1, 0
 
     if guild:
+        member_id_set = {m.id for m in guild.members}
+        if not member_id_set:
+            member_id_set = {interaction.user.id}
         c.execute(
             f"SELECT user_id, level, exp FROM users WHERE user_id NOT IN ({ph}) ORDER BY level DESC, exp DESC LIMIT %s",
             tuple(admin_ids) + (LEADERBOARD_POOL,),
@@ -4940,7 +5070,7 @@ async def lvleaderboard(interaction: discord.Interaction):
             if len(data) >= 10:
                 break
             uid = int(row[0])
-            if await _is_user_in_guild(guild, uid):
+            if uid in member_id_set:
                 data.append(row)
 
         richer_lv: typing.List[typing.Tuple] = []
@@ -4956,7 +5086,7 @@ async def lvleaderboard(interaction: discord.Interaction):
             richer_lv = c.fetchall()
             ahead = 0
             for (uid_str,) in richer_lv:
-                if await _is_user_in_guild(guild, int(uid_str)):
+                if int(uid_str) in member_id_set:
                     ahead += 1
             my_rank = ahead + 1
 
