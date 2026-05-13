@@ -553,7 +553,8 @@ def init_db():
                   last_work TIMESTAMP NULL, last_beg TIMESTAMP NULL, last_rescue TIMESTAMP NULL, last_rob TIMESTAMP NULL, last_robbed TIMESTAMP NULL,
                   exp BIGINT DEFAULT 0, level INT DEFAULT 1,
                   last_hourly_claim TIMESTAMP NULL, hourly_bank INT DEFAULT 0,
-                  good_citizen_cert_active TINYINT(1) DEFAULT 0, last_good_citizen_cert_action TIMESTAMP NULL)''')
+                  good_citizen_cert_active TINYINT(1) DEFAULT 0, last_good_citizen_cert_action TIMESTAMP NULL,
+                  good_citizen_cert_broken_until TIMESTAMP NULL)''')
     # 確保現有表也有新欄位 (Migration)
     try: c.execute("ALTER TABLE users ADD COLUMN last_work TIMESTAMP NULL")
     except: pass
@@ -632,6 +633,10 @@ def init_db():
         pass
     try:
         c.execute("ALTER TABLE users ADD COLUMN last_good_citizen_cert_action TIMESTAMP NULL")
+    except Exception:
+        pass
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN good_citizen_cert_broken_until TIMESTAMP NULL")
     except Exception:
         pass
 
@@ -917,6 +922,8 @@ COP_HUNT_CAPTURE_PER_STAR_PCT = 5
 ROLE_CHANGE_COOLDOWN_SECONDS = 86400
 GOOD_CITIZEN_CERT_COST = 5_000_000
 GOOD_CITIZEN_CERT_COOLDOWN_SECONDS = 86400
+GOOD_CITIZEN_DESTROY_COST = 50_000_000
+GOOD_CITIZEN_BROKEN_LOCK_DAYS = 10
 
 
 def append_rob_history_on_cursor(c, user_id: int, steal_amount: int) -> None:
@@ -2854,6 +2861,8 @@ async def help_slash(interaction: discord.Interaction):
             "`/wanted_status` — 自己的通緝、監獄、搶劫紀錄\n"
             "`/wanted_list` — 目前通緝名單與可否追捕\n"
             f"`/good_citizen` — [平民] 付 `{GOOD_CITIZEN_CERT_COST:,}` 啟用防搶；再付同額解除（啟用/解除皆 24h 冷卻）\n"
+            "`/good_citizen_list` — 查看目前良民證持有者\n"
+            f"`/break_citizen` — 摧毀目標良民證（花費 `{GOOD_CITIZEN_DESTROY_COST:,}`，目標 10 天禁用）\n"
             f"`/cop_hunt` — 警察追捕（僅警察；每次 **`{COP_HUNT_FEE:,}`** 幣、成敗皆扣）。"
             f"成功率 **1★ 約 {_cop_hunt_pct_1star}%** 起，通緝每多 **1** 星 **+{COP_HUNT_CAPTURE_PER_STAR_PCT}%**，並受等級差影響（每級 ±1%，保底 **5%**、上限 **95%**）\n"
             f"`/wanted_buyout` — [搶匪] 付 `{WANTED_BUYOUT_COST:,}` 消除全部通緝星並**清空最近搶劫紀錄**（**24 小時**冷卻）\n"
@@ -3627,7 +3636,8 @@ async def good_citizen_slash(interaction: discord.Interaction):
     c = conn.cursor()
     c.execute(
         """SELECT COALESCE(role,'civilian'), COALESCE(balance,0),
-                  COALESCE(good_citizen_cert_active,0), last_good_citizen_cert_action
+                  COALESCE(good_citizen_cert_active,0), last_good_citizen_cert_action,
+                  good_citizen_cert_broken_until
            FROM users WHERE user_id=%s""",
         (uid,),
     )
@@ -3635,7 +3645,7 @@ async def good_citizen_slash(interaction: discord.Interaction):
     if not row:
         conn.close()
         return await interaction.response.send_message("找不到帳號資料。", ephemeral=True)
-    role_raw, bal_raw, cert_active_raw, last_action = row
+    role_raw, bal_raw, cert_active_raw, last_action, broken_until = row
     role_now = _user_role_value(role_raw)
     bal = int(bal_raw or 0)
     cert_active = int(cert_active_raw or 0)
@@ -3643,6 +3653,13 @@ async def good_citizen_slash(interaction: discord.Interaction):
         conn.close()
         return await interaction.response.send_message(
             "❌ 良民證僅限 **平民** 使用；請先用 `/role_choose` 切換為平民。",
+            ephemeral=True,
+        )
+    if cert_active == 0 and broken_until is not None and now < broken_until:
+        ts = tw_naive_to_discord_ts(broken_until)
+        conn.close()
+        return await interaction.response.send_message(
+            f"❌ 你的良民證已被摧毀，需等到 <t:{ts}:F>（<t:{ts}:R>）後才能再次啟用。",
             ephemeral=True,
         )
     if last_action is not None:
@@ -3688,6 +3705,141 @@ async def good_citizen_slash(interaction: discord.Interaction):
     emb.add_field(name="目前餘額", value=f"`{new_bal:,}` 東雲幣", inline=False)
     emb.set_footer(text="啟用與解除皆有 24 小時冷卻")
     await interaction.response.send_message(embed=emb, ephemeral=True)
+
+
+@bot.tree.command(name="good_citizen_list", description="查看目前啟用良民證的玩家清單")
+async def good_citizen_list_slash(interaction: discord.Interaction):
+    if not interaction.guild:
+        return await interaction.response.send_message("請在伺服器頻道使用。", ephemeral=True)
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute(
+        """SELECT user_id, COALESCE(balance,0), last_good_citizen_cert_action
+           FROM users
+           WHERE COALESCE(good_citizen_cert_active,0)=1
+           ORDER BY last_good_citizen_cert_action DESC, user_id ASC
+           LIMIT 100"""
+    )
+    rows = c.fetchall()
+    conn.close()
+    if not rows:
+        return await interaction.response.send_message("目前沒有啟用良民證的玩家。", ephemeral=True)
+    guild = interaction.guild
+    lines: typing.List[str] = []
+    for uid_str, bal_raw, _last_action in rows:
+        try:
+            mid = int(uid_str)
+        except (TypeError, ValueError):
+            continue
+        mem = guild.get_member(mid)
+        if mem is None:
+            try:
+                mem = await guild.fetch_member(mid)
+            except Exception:
+                mem = None
+        disp = mem.display_name if mem else "未知成員"
+        disp_safe = discord.utils.escape_markdown(disp)
+        bal = int(bal_raw or 0)
+        lines.append(f"• {disp_safe}（<@{mid}>）｜餘額 `{bal:,}`")
+    if not lines:
+        return await interaction.response.send_message("目前沒有啟用良民證的玩家。", ephemeral=True)
+    emb = discord.Embed(
+        title="🪪 良民證持有者名單",
+        description="\n".join(lines)[:3900],
+        color=0x57F287,
+    )
+    emb.set_footer(text=f"共 {len(lines)} 人")
+    await interaction.response.send_message(embed=emb, ephemeral=False)
+
+
+@bot.tree.command(name="break_citizen", description="摧毀目標良民證（花費 5,000 萬；目標 10 天內無法再取得）")
+@app_commands.describe(member="目標玩家（選人）", user_id="或填使用者 ID／貼提及")
+async def break_citizen_slash(
+    interaction: discord.Interaction,
+    member: typing.Optional[discord.Member] = None,
+    user_id: typing.Optional[str] = None,
+):
+    target_user, err = await resolve_slash_target(
+        interaction, member, user_id, required=True, in_guild_only=False
+    )
+    if err:
+        return await interaction.response.send_message(err, ephemeral=True)
+    if target_user.id == interaction.user.id:
+        return await interaction.response.send_message("❌ 不能對自己使用。", ephemeral=True)
+    ensure_user_exists(interaction.user.id, 50000)
+    ensure_user_exists(target_user.id, 0)
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute(
+        "SELECT COALESCE(balance,0) FROM users WHERE user_id=%s",
+        (str(interaction.user.id),),
+    )
+    atk_row = c.fetchone()
+    attacker_bal = int((atk_row[0] if atk_row else 0) or 0)
+    if attacker_bal < GOOD_CITIZEN_DESTROY_COST:
+        conn.close()
+        return await interaction.response.send_message(
+            f"❌ 需要 `{GOOD_CITIZEN_DESTROY_COST:,}` 東雲幣，你的餘額不足（目前 `{attacker_bal:,}`）。",
+            ephemeral=True,
+        )
+
+    c.execute(
+        """SELECT COALESCE(good_citizen_cert_active,0), good_citizen_cert_broken_until
+           FROM users WHERE user_id=%s""",
+        (str(target_user.id),),
+    )
+    t_row = c.fetchone()
+    if not t_row:
+        conn.close()
+        return await interaction.response.send_message("找不到目標資料。", ephemeral=True)
+    target_active = int(t_row[0] or 0)
+    target_broken_until = t_row[1]
+    now = now_tw_naive()
+    if target_active != 1:
+        conn.close()
+        if target_broken_until and now < target_broken_until:
+            ts = tw_naive_to_discord_ts(target_broken_until)
+            return await interaction.response.send_message(
+                f"ℹ️ 目標目前未啟用良民證，且已被封鎖至 <t:{ts}:F>（<t:{ts}:R>）。",
+                ephemeral=True,
+            )
+        return await interaction.response.send_message("ℹ️ 目標目前沒有啟用良民證。", ephemeral=True)
+
+    broken_until = now + datetime.timedelta(days=GOOD_CITIZEN_BROKEN_LOCK_DAYS)
+    c.execute(
+        "UPDATE users SET balance=balance-%s WHERE user_id=%s AND balance >= %s",
+        (GOOD_CITIZEN_DESTROY_COST, str(interaction.user.id), GOOD_CITIZEN_DESTROY_COST),
+    )
+    if c.rowcount == 0:
+        conn.close()
+        return await interaction.response.send_message("扣款失敗（餘額不足）。", ephemeral=True)
+    c.execute(
+        """UPDATE users
+           SET good_citizen_cert_active=0,
+               good_citizen_cert_broken_until=%s,
+               last_good_citizen_cert_action=%s
+           WHERE user_id=%s""",
+        (broken_until, now, str(target_user.id)),
+    )
+    conn.commit()
+    conn.close()
+    log_transaction(interaction.user.id, -GOOD_CITIZEN_DESTROY_COST, f"摧毀良民證（目標:{target_user.id}）")
+    ts = tw_naive_to_discord_ts(broken_until)
+    emb = discord.Embed(
+        title="💥 良民證已摧毀",
+        description=(
+            f"{interaction.user.mention} 花費 **`{GOOD_CITIZEN_DESTROY_COST:,}`** 東雲幣，"
+            f"摧毀了 {target_user.mention} 的良民證。"
+        ),
+        color=0xED4245,
+    )
+    emb.add_field(
+        name="封鎖時間",
+        value=f"目標於 <t:{ts}:F>（<t:{ts}:R>）前無法再啟用良民證",
+        inline=False,
+    )
+    _am = discord.AllowedMentions(users=[discord.Object(id=interaction.user.id), discord.Object(id=target_user.id)])
+    await interaction.response.send_message(embed=emb, ephemeral=False, allowed_mentions=_am)
 
 
 @bot.tree.command(name="wanted_status", description="查看自己的陣營、通緝、監獄狀態與最近搶劫紀錄")
