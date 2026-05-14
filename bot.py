@@ -1624,17 +1624,15 @@ class BlackjackGame(discord.ui.View):
         values = {'2':2,'3':3,'4':4,'5':5,'6':6,'7':7,'8':8,'9':9,'10':10,'J':10,'Q':10,'K':10,'A':11}
         can_split = len(self.hands) == 1 and len(self.p_hand) == 2 and values[self.p_hand[0]['rank']] == values[self.p_hand[1]['rank']]
         can_double = len(self.p_hand) == 2
-        to_remove = []
         for c in self.children:
             if c.label == "分牌":
-                if not can_split: to_remove.append(c)
+                c.disabled = not can_split
             elif c.label == "雙倍":
-                if not can_double: to_remove.append(c)
+                c.disabled = not can_double
             elif c.label == "投降":
                 c.disabled = len(self.p_hand) > 2 or len(self.hands) > 1
             elif c.label == "要牌":
                 c.disabled = calculate_score(self.p_hand) > 21
-        for c in to_remove: self.remove_item(c)
 
     def build_embed(self, done=False, res="", profit=0, animating=False, extra_msg="", guild_id=None):
         stats = get_user_stats(self.user.id)
@@ -3077,7 +3075,7 @@ async def rob(
         if c.rowcount == 0:
             conn.commit()
             conn.close()
-            return await interaction_send(interaction, "對方及時把錢藏好了，這次搶劫失敗。")
+            return await interaction_send(interaction, "對方及時把錢藏好了，這次搶劫失敗。", ephemeral=True)
         c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (steal_amount, str(interaction.user.id)))
         c.execute("UPDATE users SET last_robbed=%s WHERE user_id=%s", (now, str(member.id)))
         append_rob_history_on_cursor(c, interaction.user.id, steal_amount)
