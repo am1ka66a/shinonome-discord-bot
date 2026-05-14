@@ -2975,16 +2975,15 @@ async def rob(
         interaction, member, user_id, required=True, in_guild_only=True
     )
     if err:
-        return await interaction_send(interaction, err, ephemeral=True)
+        return await interaction.response.send_message(err, ephemeral=True)
     if not isinstance(m_user, discord.Member):
-        return await interaction_send(interaction, "搶劫目標必須是此伺服器成員。", ephemeral=True)
+        return await interaction.response.send_message("搶劫目標必須是此伺服器成員。", ephemeral=True)
     member = m_user
     if member.bot:
-        return await interaction_send(interaction, "不能搶劫機器人。", ephemeral=True)
+        return await interaction.response.send_message("不能搶劫機器人。", ephemeral=True)
     if member.id == interaction.user.id:
-        return await interaction_send(interaction, "你不能搶劫自己。", ephemeral=True)
+        return await interaction.response.send_message("你不能搶劫自己。", ephemeral=True)
 
-    await interaction_defer_if_needed(interaction)
     await ensure_user_exists_async(interaction.user.id, 50000)
     await ensure_user_exists_async(member.id, 0)
 
@@ -2997,15 +2996,14 @@ async def rob(
     _pr = c.fetchone()
     if _pr and int(_pr[0] or 0):
         conn.close()
-        return await interaction_send(interaction, "🔒 你在監獄裡無法搶劫。", ephemeral=True)
+        return await interaction.response.send_message("🔒 你在監獄裡無法搶劫。", ephemeral=True)
 
     c.execute("SELECT role FROM users WHERE user_id=%s", (str(interaction.user.id),))
     _role_row = c.fetchone()
     robber_role = _user_role_value(_role_row[0] if _role_row else None)
     if robber_role != "criminal":
         conn.close()
-        return await interaction_send(
-            interaction,
+        return await interaction.response.send_message(
             "❌ 只有**搶匪**可以搶劫。請先用 `/role_choose` 選擇搶匪（criminal）。",
             ephemeral=True,
         )
@@ -3031,18 +3029,17 @@ async def rob(
         remain = ROB_COOLDOWN_SECONDS - int((now - last_rob).total_seconds())
         mins = max(1, remain // 60)
         conn.close()
-        return await interaction_send(interaction, f"⏳ 你剛搶過，請再等 `{mins}` 分鐘。", ephemeral=True)
+        return await interaction.response.send_message(f"⏳ 你剛搶過，請再等 `{mins}` 分鐘。", ephemeral=True)
 
     if target_balance < 50000:
         conn.close()
-        return await interaction_send(interaction, "對方太窮了，沒有東西可以搶。", ephemeral=True)
+        return await interaction.response.send_message("對方太窮了，沒有東西可以搶。", ephemeral=True)
     if robber_balance < 50000:
         conn.close()
-        return await interaction_send(interaction, "你的餘額低於 50,000，無法發起搶劫。", ephemeral=True)
+        return await interaction.response.send_message("你的餘額低於 50,000，無法發起搶劫。", ephemeral=True)
     if target_good_cert:
         conn.close()
-        return await interaction_send(
-            interaction,
+        return await interaction.response.send_message(
             "🪪 對方已啟用良民證，無法被搶劫。",
             ephemeral=True,
         )
@@ -3050,11 +3047,12 @@ async def rob(
         remain = ROB_VICTIM_PROTECT_SECONDS - int((now - target_last_robbed).total_seconds())
         mins = max(1, remain // 60)
         conn.close()
-        return await interaction_send(
-            interaction,
+        return await interaction.response.send_message(
             f"對方目前有保護，請 `{mins}` 分鐘後再試。",
             ephemeral=True,
         )
+
+    await interaction_defer_if_needed(interaction)
 
     # /rob 基礎成功率 ROB_BASE_SUCCESS_RATE；每差 1 等調整 1%
     level_gap = robber_level - target_level
