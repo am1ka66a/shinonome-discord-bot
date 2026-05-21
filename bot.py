@@ -920,7 +920,7 @@ COP_HUNT_CAPTURE_BASE_PCT = 35
 COP_HUNT_CAPTURE_PER_STAR_PCT = 5
 # 陣營轉職冷卻（24 小時）
 ROLE_CHANGE_COOLDOWN_SECONDS = 86400
-GOOD_CITIZEN_CERT_COST = 5_000_000
+GOOD_CITIZEN_CERT_COST = 50_000_000
 GOOD_CITIZEN_CERT_COOLDOWN_SECONDS = 86400
 GOOD_CITIZEN_DESTROY_COST = 500_000_000
 GOOD_CITIZEN_BROKEN_LOCK_DAYS = 10
@@ -3637,7 +3637,7 @@ async def wanted_buyout_slash(interaction: discord.Interaction):
     await interaction.response.send_message(embed=emb, ephemeral=False, allowed_mentions=_am)
 
 
-@bot.tree.command(name="good_citizen", description="良民證：支付 500 萬啟用防搶；再支付 500 萬解除（兩者皆 24h 冷卻）")
+@bot.tree.command(name="good_citizen", description="良民證：支付 5,000 萬啟用防搶；再支付 5,000 萬解除（兩者皆 24h 冷卻）")
 async def good_citizen_slash(interaction: discord.Interaction):
     ensure_user_exists(interaction.user.id, 50000)
     uid = str(interaction.user.id)
