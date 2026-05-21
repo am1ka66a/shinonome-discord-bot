@@ -922,7 +922,7 @@ COP_HUNT_CAPTURE_PER_STAR_PCT = 5
 ROLE_CHANGE_COOLDOWN_SECONDS = 86400
 GOOD_CITIZEN_CERT_COST = 5_000_000
 GOOD_CITIZEN_CERT_COOLDOWN_SECONDS = 86400
-GOOD_CITIZEN_DESTROY_COST = 50_000_000
+GOOD_CITIZEN_DESTROY_COST = 500_000_000
 GOOD_CITIZEN_BROKEN_LOCK_DAYS = 10
 
 
@@ -1441,9 +1441,13 @@ async def _send_game(channel, gv: 'BlackjackGame', interaction: discord.Interact
 
     if interaction:
         if interaction.response.is_done():
+            if interaction.message is not None:
+                return await interaction.message.edit(embed=embed, view=current_view, attachments=[])
             return await interaction.edit_original_response(embed=embed, view=current_view, attachments=[])
         else:
             await interaction.response.edit_message(embed=embed, view=current_view, attachments=[])
+            if interaction.message is not None:
+                return interaction.message
             return await interaction.original_response()
     elif message_obj:
         return await message_obj.edit(embed=embed, view=current_view, attachments=[])
@@ -1595,12 +1599,16 @@ class BlackjackGame(discord.ui.View):
         self.d_hand = [self.deck.pop(), self.deck.pop()]
         self.current_hand = 0
         self.hand_results = [None]
+        self._action_lock = asyncio.Lock()
         self.side_p, self.side_m = check_sidebets(self.hands[0], self.d_hand[0], p_bet, s_bet)
         self.update_buttons()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.user.id:
             await interaction.response.send_message("這不是你的牌局！", ephemeral=True)
+            return False
+        if self._action_lock.locked():
+            await interaction.response.send_message("⏳ 上一個操作仍在處理中，請稍候。", ephemeral=True)
             return False
         now = asyncio.get_running_loop().time()
         if hasattr(self, "last_action") and now - self.last_action < 1.0:
@@ -1615,7 +1623,8 @@ class BlackjackGame(discord.ui.View):
                 await _send_game(interaction.channel, self, interaction=interaction, done=done, res=res, profit=profit, animating=animating, extra_msg=extra_msg)
             elif message:
                 await _send_game(message.channel, self, message_obj=message, done=done, res=res, profit=profit, animating=animating, extra_msg=extra_msg)
-        except Exception as e: print(f"❌ 渲染錯誤: {e}")
+        except Exception:
+            logger.exception("21點渲染錯誤 user=%s", self.user.id)
 
     @property
     def p_hand(self): return self.hands[self.current_hand]
@@ -1804,50 +1813,55 @@ class BlackjackGame(discord.ui.View):
     @discord.ui.button(label="要牌", style=discord.ButtonStyle.success)
     async def hit(self, inter, btn):
         if inter.user.id != self.user.id: return
-        await inter.response.defer()
-        self.p_hand.append(self.deck.pop())
-        self.update_buttons() 
-        ps = calculate_score(self.p_hand)
-        if ps > 21 or len(self.p_hand) == 5:
-            if ps > 21: self.hand_results[self.current_hand] = ("爆牌輸了", -self.hand_bets[self.current_hand], False)
-            await self.advance_hand(interaction=inter, message_obj=inter.message)
-        else: await self._edit(interaction=inter)
+        async with self._action_lock:
+            await inter.response.defer()
+            self.p_hand.append(self.deck.pop())
+            self.update_buttons() 
+            ps = calculate_score(self.p_hand)
+            if ps > 21 or len(self.p_hand) == 5:
+                if ps > 21: self.hand_results[self.current_hand] = ("爆牌輸了", -self.hand_bets[self.current_hand], False)
+                await self.advance_hand(interaction=inter, message_obj=inter.message)
+            else: await self._edit(interaction=inter)
 
     @discord.ui.button(label="停牌", style=discord.ButtonStyle.danger)
     async def stand(self, inter, btn):
         if inter.user.id != self.user.id: return
-        await inter.response.defer(); await self.advance_hand(interaction=inter, message_obj=inter.message)
+        async with self._action_lock:
+            await inter.response.defer(); await self.advance_hand(interaction=inter, message_obj=inter.message)
 
     @discord.ui.button(label="投降", style=discord.ButtonStyle.secondary)
     async def surrender(self, inter, btn):
         if inter.user.id != self.user.id: return
-        await inter.response.defer(); self.hand_results[self.current_hand] = ("這樣就投降了嗎，雜魚～", -(self.hand_bets[self.current_hand]//2), False)
-        await self.advance_hand(interaction=inter, message_obj=inter.message)
+        async with self._action_lock:
+            await inter.response.defer(); self.hand_results[self.current_hand] = ("這樣就投降了嗎，雜魚～", -(self.hand_bets[self.current_hand]//2), False)
+            await self.advance_hand(interaction=inter, message_obj=inter.message)
 
     @discord.ui.button(label="雙倍", style=discord.ButtonStyle.primary)
     async def double_down(self, inter, btn):
         if inter.user.id != self.user.id: return
-        await inter.response.defer()
-        extra_cost = self.hand_bets[self.current_hand]
-        if not try_deduct_balance(self.user.id, extra_cost, "21點雙倍加注"):
-            return await inter.followup.send("餘額不足", ephemeral=True)
-        self.total_deducted += extra_cost
-        self.hand_bets[self.current_hand] *= 2
-        self.p_hand.append(self.deck.pop())
-        if calculate_score(self.p_hand) > 21: self.hand_results[self.current_hand] = ("你爆牌囉～小丑～", -self.hand_bets[self.current_hand], False)
-        await self.advance_hand(interaction=inter, message_obj=inter.message)
+        async with self._action_lock:
+            await inter.response.defer()
+            extra_cost = self.hand_bets[self.current_hand]
+            if not try_deduct_balance(self.user.id, extra_cost, "21點雙倍加注"):
+                return await inter.followup.send("餘額不足", ephemeral=True)
+            self.total_deducted += extra_cost
+            self.hand_bets[self.current_hand] *= 2
+            self.p_hand.append(self.deck.pop())
+            if calculate_score(self.p_hand) > 21: self.hand_results[self.current_hand] = ("你爆牌囉～小丑～", -self.hand_bets[self.current_hand], False)
+            await self.advance_hand(interaction=inter, message_obj=inter.message)
 
     @discord.ui.button(label="分牌", style=discord.ButtonStyle.primary)
     async def split(self, inter, btn):
         if inter.user.id != self.user.id: return
-        await inter.response.defer()
-        if not try_deduct_balance(self.user.id, self.bet, "21點分牌加注"):
-            return await inter.followup.send("餘額不足", ephemeral=True)
-        self.total_deducted += self.bet
-        self.is_split, c1, c2 = True, self.hands[0][0], self.hands[0][1]
-        self.hands, self.hand_results, self.hand_bets = [[c1, self.deck.pop()], [c2, self.deck.pop()]], [None, None], [self.bet, self.bet]
-        self.update_buttons(); await self._edit(interaction=inter, extra_msg="✌️ 你選擇了分牌！")
-        if calculate_score(self.p_hand) == 21: await asyncio.sleep(1.5); await self.advance_hand(interaction=None, message_obj=inter.message)
+        async with self._action_lock:
+            await inter.response.defer()
+            if not try_deduct_balance(self.user.id, self.bet, "21點分牌加注"):
+                return await inter.followup.send("餘額不足", ephemeral=True)
+            self.total_deducted += self.bet
+            self.is_split, c1, c2 = True, self.hands[0][0], self.hands[0][1]
+            self.hands, self.hand_results, self.hand_bets = [[c1, self.deck.pop()], [c2, self.deck.pop()]], [None, None], [self.bet, self.bet]
+            self.update_buttons(); await self._edit(interaction=inter, extra_msg="✌️ 你選擇了分牌！")
+            if calculate_score(self.p_hand) == 21: await asyncio.sleep(1.5); await self.advance_hand(interaction=None, message_obj=inter.message)
 
 class ConfirmAllInView(discord.ui.View):
     def __init__(self, user, parent_msg):
@@ -3748,7 +3762,7 @@ async def good_citizen_list_slash(interaction: discord.Interaction):
     await interaction.response.send_message(embed=emb, ephemeral=False)
 
 
-@bot.tree.command(name="break_citizen", description="摧毀目標良民證（花費 5,000 萬；目標 10 天內無法再取得）")
+@bot.tree.command(name="break_citizen", description="摧毀目標良民證（花費 5 億；目標 10 天內無法再取得）")
 @app_commands.describe(member="目標玩家（選人）", user_id="或填使用者 ID／貼提及")
 async def break_citizen_slash(
     interaction: discord.Interaction,
