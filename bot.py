@@ -1951,6 +1951,103 @@ def claim_hourly_reward(user_id, reward_per_slot: int = 1000):
     }
 
 
+def purge_old_logs_sync(retention_days: int) -> int:
+    """刪除 logs 超過 retention_days 的資料，回傳刪除筆數。"""
+    if retention_days <= 0:
+        return 0
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute(
+        "DELETE FROM logs WHERE created_at < DATE_SUB(NOW(), INTERVAL %s DAY)",
+        (retention_days,),
+    )
+    removed = int(c.rowcount or 0)
+    conn.commit()
+    conn.close()
+    return removed
+
+
+def award_vc_rewards_sync(user_ids: typing.Sequence[str], now: datetime.datetime) -> int:
+    """依輸入 user_ids 發放語音獎勵（每 30 分鐘一次），回傳本輪發放人數。"""
+    if not user_ids:
+        return 0
+    conn = get_db_connection()
+    c = conn.cursor()
+    awarded: typing.List[str] = []
+    for user_id in user_ids:
+        c.execute("SELECT last_vc_reward FROM activity_stats WHERE user_id=%s", (user_id,))
+        row = c.fetchone()
+        if row and row[0] is not None and (now - row[0]).total_seconds() < 1800:
+            continue
+        c.execute(
+            "INSERT INTO users (user_id, balance) VALUES (%s, 500) ON DUPLICATE KEY UPDATE balance=balance+500",
+            (user_id,),
+        )
+        c.execute(
+            "INSERT INTO activity_stats (user_id, last_vc_reward) VALUES (%s, %s) ON DUPLICATE KEY UPDATE last_vc_reward=%s",
+            (user_id, now, now),
+        )
+        awarded.append(user_id)
+    conn.commit()
+    conn.close()
+    for user_id in awarded:
+        log_transaction(user_id, 500, "語音通話獎勵 (10min)")
+    return len(awarded)
+
+
+def process_on_message_activity_sync(
+    user_id: str,
+    pending_count: int,
+    now: datetime.datetime,
+    exp_due: bool,
+    exp_gain: int,
+) -> typing.Dict[str, typing.Any]:
+    """處理聊天訊息累積、EXP 發放與聊天活躍獎勵。"""
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO activity_stats (user_id, msg_count) VALUES (%s, %s) ON DUPLICATE KEY UPDATE msg_count=msg_count+%s",
+        (user_id, pending_count, pending_count),
+    )
+    c.execute("SELECT msg_count, last_msg_reward FROM activity_stats WHERE user_id=%s", (user_id,))
+    row = c.fetchone()
+
+    exp_awarded = False
+    old_level = None
+    new_level = None
+    if exp_due:
+        ensure_user_exists(user_id, 50000)
+        exp_result = add_user_exp(user_id, exp_gain)
+        if exp_result:
+            old_level, new_level = int(exp_result[0] or 1), int(exp_result[1] or 1)
+        c.execute("UPDATE activity_stats SET last_exp_reward=%s WHERE user_id=%s", (now, user_id))
+        exp_awarded = True
+
+    msg_rewarded = False
+    if row and int(row[0] or 0) >= 10:
+        if row[1] is None or (now - row[1]).total_seconds() >= 1800:
+            c.execute(
+                "INSERT INTO users (user_id, balance) VALUES (%s, 500) ON DUPLICATE KEY UPDATE balance=balance+500",
+                (user_id,),
+            )
+            c.execute(
+                "UPDATE activity_stats SET msg_count=0, last_msg_reward=%s WHERE user_id=%s",
+                (now, user_id),
+            )
+            msg_rewarded = True
+    conn.commit()
+    conn.close()
+
+    if msg_rewarded:
+        log_transaction(user_id, 500, "聊天活躍獎勵 (10句)")
+    return {
+        "exp_awarded": exp_awarded,
+        "old_level": old_level,
+        "new_level": new_level,
+        "msg_rewarded": msg_rewarded,
+    }
+
+
 def parse_tw_datetime(text):
     # 接受格式: YYYY-MM-DD HH:MM (台灣時間 UTC+8)
     dt = datetime.datetime.strptime(text.strip(), "%Y-%m-%d %H:%M")
@@ -3097,15 +3194,7 @@ async def logs_retention_task():
             if LOG_RETENTION_DAYS <= 0:
                 await asyncio.sleep(LOG_PURGE_INTERVAL_SECONDS)
                 continue
-            conn = get_db_connection()
-            c = conn.cursor()
-            c.execute(
-                "DELETE FROM logs WHERE created_at < DATE_SUB(NOW(), INTERVAL %s DAY)",
-                (LOG_RETENTION_DAYS,),
-            )
-            removed = c.rowcount if c.rowcount is not None else 0
-            conn.commit()
-            conn.close()
+            removed = await db_to_thread(purge_old_logs_sync, LOG_RETENTION_DAYS)
             if removed:
                 logger.info(
                     "logs 保留最近 %s 天：已刪除 %s 筆過期紀錄",
@@ -3122,32 +3211,18 @@ async def vc_reward_task():
     while not bot.is_closed():
         await asyncio.sleep(600)
         now = now_tw_naive()
-        conn = get_db_connection()
-        c = conn.cursor()
-        awarded_users: typing.Set[str] = set()
+        candidate_user_ids: typing.Set[str] = set()
         for guild in bot.guilds:
             for vc in guild.voice_channels:
                 for member in vc.members:
                     if member.bot or member.voice.self_deaf or member.voice.deaf:
                         continue
                     user_id = str(member.id)
-                    if user_id in awarded_users:
-                        continue
-                    c.execute("SELECT last_vc_reward FROM activity_stats WHERE user_id=%s", (user_id,))
-                    row = c.fetchone()
-                    if not row or row[0] is None or (now - row[0]).total_seconds() >= 1800:
-                        c.execute(
-                            "INSERT INTO users (user_id, balance) VALUES (%s, 500) ON DUPLICATE KEY UPDATE balance=balance+500",
-                            (user_id,),
-                        )
-                        c.execute(
-                            "INSERT INTO activity_stats (user_id, last_vc_reward) VALUES (%s, %s) ON DUPLICATE KEY UPDATE last_vc_reward=%s",
-                            (user_id, now, now),
-                        )
-                        log_transaction(user_id, 500, "語音通話獎勵 (10min)")
-                        awarded_users.add(user_id)
-        conn.commit()
-        conn.close()
+                    candidate_user_ids.add(user_id)
+        try:
+            await db_to_thread(award_vc_rewards_sync, list(candidate_user_ids), now)
+        except Exception as e:
+            logger.exception("語音獎勵發放失敗: %s", e)
 
 @bot.event
 async def on_message(message):
@@ -3187,37 +3262,23 @@ async def on_message(message):
         if not should_flush and not exp_due:
             return
 
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO activity_stats (user_id, msg_count) VALUES (%s, %s) ON DUPLICATE KEY UPDATE msg_count=msg_count+%s",
-            (user_id, pending, pending)
+        exp_gain = random.randint(12, 20) * CHAT_EXP_MULTIPLIER if exp_due else 0
+        result = await db_to_thread(
+            process_on_message_activity_sync,
+            user_id,
+            pending,
+            now,
+            exp_due,
+            exp_gain,
         )
         _pending_msg_counts[user_id] = 0
         _last_msg_flush_ts[user_id] = now_ts
-
-        c.execute("SELECT msg_count, last_msg_reward FROM activity_stats WHERE user_id=%s", (user_id,))
-        row = c.fetchone()
-
-        if exp_due:
-            exp_gain = random.randint(12, 20) * CHAT_EXP_MULTIPLIER
-            ensure_user_exists(message.author.id, 50000)
-            exp_result = add_user_exp(user_id, exp_gain)
-            if exp_result and exp_result[1] > exp_result[0]:
-                o, n = exp_result[0], exp_result[1]
-                if any(o < m <= n for m in LEVEL_MILE_TIERS):
-                    asyncio.create_task(process_level_ups(message.author, o, n))
-            c.execute("UPDATE activity_stats SET last_exp_reward=%s WHERE user_id=%s", (now, user_id))
+        if result.get("exp_awarded"):
             _last_exp_award_ts[user_id] = now_ts
-
-        if row and row[0] >= 10:
-            if row[1] is None or (now - row[1]).total_seconds() >= 1800:
-                c.execute("INSERT INTO users (user_id, balance) VALUES (%s, 500) ON DUPLICATE KEY UPDATE balance=balance+500", (user_id,))
-                c.execute("UPDATE activity_stats SET msg_count=0, last_msg_reward=%s WHERE user_id=%s", (now, user_id))
-                log_transaction(user_id, 500, "聊天活躍獎勵 (10句)")
-
-        conn.commit()
-        conn.close()
+            o = int(result.get("old_level") or 1)
+            n = int(result.get("new_level") or 1)
+            if n > o and any(o < m <= n for m in LEVEL_MILE_TIERS):
+                asyncio.create_task(process_level_ups(message.author, o, n))
     except Exception as e:
         logger.exception("on_message 錯誤: %s", e)
     finally:
@@ -3787,9 +3848,10 @@ async def cop_hunt_slash(
     )
     if err:
         return await interaction.response.send_message(err, ephemeral=True)
+    await interaction_defer_if_needed(interaction)
 
-    ensure_user_exists(interaction.user.id, 50000)
-    ensure_user_exists(criminal_user.id, 0)
+    await ensure_user_exists_async(interaction.user.id, 50000)
+    await ensure_user_exists_async(criminal_user.id, 0)
     criminal_id = str(criminal_user.id)
     cop_id = str(interaction.user.id)
 
@@ -3799,7 +3861,8 @@ async def cop_hunt_slash(
     cop_row = c.fetchone()
     if not cop_row or cop_row[0] != "cop":
         conn.close()
-        return await interaction.response.send_message(
+        return await interaction_send(
+            interaction,
             "❌ 只有**警察**可以追捕。請先用 `/role_choose` 選擇警察。",
             ephemeral=True,
         )
@@ -3812,7 +3875,7 @@ async def cop_hunt_slash(
     criminal_row = c.fetchone()
     if not criminal_row:
         conn.close()
-        return await interaction.response.send_message("❌ 找不到該玩家資料。", ephemeral=True)
+        return await interaction_send(interaction, "❌ 找不到該玩家資料。", ephemeral=True)
 
     wanted_stars = int(criminal_row[0] or 0)
     hunted_count = int(criminal_row[1] or 0)
@@ -3822,19 +3885,21 @@ async def cop_hunt_slash(
 
     if in_prison:
         conn.close()
-        return await interaction.response.send_message(
+        return await interaction_send(
+            interaction,
             f"ℹ️ {criminal_user.mention} 已在監獄中，無法追捕。",
             ephemeral=True,
         )
     if wanted_stars <= 0:
         conn.close()
-        return await interaction.response.send_message(
+        return await interaction_send(
+            interaction,
             f"ℹ️ {criminal_user.mention} 目前沒有通緝度。",
             ephemeral=True,
         )
     if criminal_id == cop_id:
         conn.close()
-        return await interaction.response.send_message("❌ 不能追捕自己。", ephemeral=True)
+        return await interaction_send(interaction, "❌ 不能追捕自己。", ephemeral=True)
 
     can_hunt = hunted_count == 0
     if wanted_stars <= 4:
@@ -3844,7 +3909,8 @@ async def cop_hunt_slash(
 
     if not can_hunt:
         conn.close()
-        return await interaction.response.send_message(
+        return await interaction_send(
+            interaction,
             f"❌ 目前無法追捕。\n{hunt_rule}",
             ephemeral=True,
         )
@@ -3855,7 +3921,8 @@ async def cop_hunt_slash(
     )
     if c.rowcount == 0:
         conn.close()
-        return await interaction.response.send_message(
+        return await interaction_send(
+            interaction,
             f"❌ 每次追捕須支付 **`{COP_HUNT_FEE:,}`** 東雲幣，你的餘額不足。",
             ephemeral=True,
         )
@@ -3972,7 +4039,7 @@ async def cop_hunt_slash(
             value="通緝歸零、搶劫紀錄清空。\n" + _debt_txt + _out_txt,
             inline=False,
         )
-        await interaction.response.send_message(embed=emb)
+        await interaction_send(interaction, embed=emb)
         return
 
     c.execute(
@@ -4016,7 +4083,7 @@ async def cop_hunt_slash(
         emb.set_footer(text="對方若再次搶劫成功，你可再追捕一次。")
     else:
         emb.set_footer(text="對方通緝升星後，你可再嘗試追捕。")
-    await interaction.response.send_message(embed=emb)
+    await interaction_send(interaction, embed=emb)
 
 
 @bot.tree.command(
@@ -4328,7 +4395,8 @@ async def counter_rob_slash(interaction: discord.Interaction):
     if not interaction.guild:
         return await interaction.response.send_message("請在伺服器頻道使用。", ephemeral=True)
     victim_id = str(interaction.user.id)
-    ensure_user_exists(interaction.user.id, 0)
+    await interaction_defer_if_needed(interaction)
+    await ensure_user_exists_async(interaction.user.id, 0)
 
     conn = get_db_connection()
     c = conn.cursor()
@@ -4339,7 +4407,7 @@ async def counter_rob_slash(interaction: discord.Interaction):
     row = c.fetchone()
     if not row:
         conn.close()
-        return await interaction.response.send_message("找不到帳號資料。", ephemeral=True)
+        return await interaction_send(interaction, "找不到帳號資料。", ephemeral=True)
     vrole = (row[0] or "civilian")
     pending = int(row[1] or 0)
     robber_id = row[2]
@@ -4352,14 +4420,16 @@ async def counter_rob_slash(interaction: discord.Interaction):
         )
         conn.commit()
         conn.close()
-        return await interaction.response.send_message(
+        return await interaction_send(
+            interaction,
             "你已非**平民**身分，先前的「加倍搶回」機會已作廢。",
             ephemeral=True,
         )
 
     if not pending or not robber_id or base_amt <= 0:
         conn.close()
-        return await interaction.response.send_message(
+        return await interaction_send(
+            interaction,
             "你沒有可用的加倍搶回機會（僅**平民**被搶劫**成功**後會獲得一次）。",
             ephemeral=True,
         )
@@ -4376,7 +4446,7 @@ async def counter_rob_slash(interaction: discord.Interaction):
         )
         conn.commit()
         conn.close()
-        return await interaction.response.send_message("找不到搶匪帳號，機會已清除。", ephemeral=True)
+        return await interaction_send(interaction, "找不到搶匪帳號，機會已清除。", ephemeral=True)
     robber_level = int((rrow[0] if rrow else 1) or 1)
     robber_balance = int((rrow[1] if rrow else 0) or 0)
 
@@ -4445,7 +4515,8 @@ async def counter_rob_slash(interaction: discord.Interaction):
         prison_note = ""
         if robber_imprisoned:
             prison_note = f"\n<@{robber_id}> **餘額歸零**，已**入獄**（`/bail` 假釋：`{BAIL_COST:,}` + 累計欠款）。"
-        return await interaction.response.send_message(
+        return await interaction_send(
+            interaction,
             f"{interaction.user.mention} **加倍搶回成功！**（本次成功率約 {pct}%）\n"
             f"你已拿回 **`{transferred:,}`** 東雲幣（加倍目標 **`{doubled:,}`**）。\n"
             f"<@{robber_id}>（`{discord.utils.escape_markdown(rn)}`）被扣 **`{pay:,}`** 東雲幣。{debt_note}{prison_note}",
@@ -4453,7 +4524,8 @@ async def counter_rob_slash(interaction: discord.Interaction):
             allowed_mentions=_am_success,
         )
     _am_shout = discord.AllowedMentions(users=[discord.Object(id=interaction.user.id)])
-    return await interaction.response.send_message(
+    return await interaction_send(
+        interaction,
         f"{interaction.user.mention} ❌ **加倍搶回失敗**（本次成功機率約 {pct}%；反制專用基礎成功率公式：基礎 {int(round(COUNTER_ROB_BASE_SUCCESS_RATE * 100))}%，每級差 ±1%）。"
         f"你的**唯一機會**已用盡。",
         ephemeral=False,
