@@ -120,15 +120,19 @@ ROB_VICTIM_PROTECT_SECONDS = 3600
 ROB_BASE_SUCCESS_RATE = 0.60
 # 平民 `/counter_rob` 加倍搶回專用基礎機率（與 `/rob` 分開）。
 COUNTER_ROB_BASE_SUCCESS_RATE = 0.30
-# 賭場回收分潤：系統回收款項的 10% 自動撥給指定帳號（僅賭場扣款原因）
-CASINO_RECOVERY_SHARE_TARGET_ID = "531308526262550528"
-CASINO_RECOVERY_SHARE_RATE = 0.10
-CASINO_RECOVERY_REASONS = {
-    "21點開局扣款",
-    "21點雙倍加注",
-    "21點分牌加注",
-    "E卡決鬥下注",
+# 賭場回收分潤：僅在「實際回收」時切割，不在下注當下抽成
+CASINO_RECOVERY_SHARE_ENABLED = str(os.getenv("CASINO_RECOVERY_SHARE_ENABLED", "true")).strip().lower() in {
+    "1", "true", "yes", "on"
 }
+CASINO_RECOVERY_SHARE_TARGET_ID = str(
+    os.getenv("CASINO_RECOVERY_SHARE_TARGET_ID", "531308526262550528")
+).strip()
+try:
+    CASINO_RECOVERY_SHARE_RATE = float(os.getenv("CASINO_RECOVERY_SHARE_RATE", "0.10"))
+except Exception:
+    CASINO_RECOVERY_SHARE_RATE = 0.10
+CASINO_RECOVERY_SHARE_RATE = max(0.0, min(1.0, CASINO_RECOVERY_SHARE_RATE))
+CASINO_RECOVERY_SHARE_REASON_PREFIX = "賭場回收分潤"
 red_packet_seq = 0
 MSG_DB_FLUSH_EVERY_SECONDS = 8
 MSG_DB_FLUSH_COUNT = 3
@@ -467,6 +471,10 @@ async def fetch_record_rows_async(user_id, limit: int = 50):
 
 async def fetch_casino_stats_rows_async():
     return await db_to_thread(fetch_casino_stats_rows)
+
+
+async def fetch_casino_share_stats_rows_async(days: int = 7):
+    return await db_to_thread(fetch_casino_share_stats_rows, days)
 
 
 async def claim_daily_reward_async(user_id, daily_reward: int = 100_000):
@@ -931,6 +939,61 @@ def fetch_casino_stats_rows():
         int((recovered_row[0] if recovered_row else 0) or 0),
         int((circulation_row[0] if circulation_row else 0) or 0),
     )
+
+
+def fetch_casino_share_stats_rows(days: int = 7):
+    days = max(1, int(days))
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute(
+        "SELECT COALESCE(SUM(amount), 0) FROM logs "
+        "WHERE user_id=%s AND amount > 0 AND reason LIKE %s",
+        (CASINO_RECOVERY_SHARE_TARGET_ID, f"{CASINO_RECOVERY_SHARE_REASON_PREFIX}%"),
+    )
+    total_row = c.fetchone()
+    c.execute(
+        "SELECT COALESCE(SUM(amount), 0) FROM logs "
+        "WHERE user_id=%s AND amount > 0 AND reason LIKE %s "
+        "AND created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)",
+        (CASINO_RECOVERY_SHARE_TARGET_ID, f"{CASINO_RECOVERY_SHARE_REASON_PREFIX}%", days),
+    )
+    recent_row = c.fetchone()
+    c.execute(
+        "SELECT reason, COALESCE(SUM(amount), 0) AS s FROM logs "
+        "WHERE user_id=%s AND amount > 0 AND reason LIKE %s "
+        "GROUP BY reason ORDER BY s DESC LIMIT 10",
+        (CASINO_RECOVERY_SHARE_TARGET_ID, f"{CASINO_RECOVERY_SHARE_REASON_PREFIX}%"),
+    )
+    by_reason_rows = c.fetchall()
+    conn.close()
+    total = int((total_row[0] if total_row else 0) or 0)
+    recent = int((recent_row[0] if recent_row else 0) or 0)
+    return total, recent, by_reason_rows
+
+
+def apply_casino_recovery_share(recovered_amount: int, source: str) -> int:
+    """
+    將「實際回收金額」按比例切給分潤帳號，回傳實際分潤額。
+    recovered_amount 需為正整數；本函式不更動玩家結算邏輯。
+    """
+    if not CASINO_RECOVERY_SHARE_ENABLED:
+        return 0
+    if not CASINO_RECOVERY_SHARE_TARGET_ID:
+        return 0
+    if CASINO_RECOVERY_SHARE_RATE <= 0:
+        return 0
+    recovered_amount = int(recovered_amount or 0)
+    if recovered_amount <= 0:
+        return 0
+    share_amount = int(recovered_amount * CASINO_RECOVERY_SHARE_RATE)
+    if share_amount <= 0:
+        return 0
+    credit_balance_with_log(
+        CASINO_RECOVERY_SHARE_TARGET_ID,
+        share_amount,
+        f"{CASINO_RECOVERY_SHARE_REASON_PREFIX}｜{source}",
+    )
+    return share_amount
 
 def ensure_user_exists(user_id, startup_balance=DEFAULT_STARTUP_BALANCE):
     uid = str(user_id)
@@ -1640,14 +1703,6 @@ def try_deduct_balance(user_id, amount, reason):
     conn.close()
     if ok:
         log_transaction(user_id, -amount, reason)
-        if reason in CASINO_RECOVERY_REASONS:
-            share_amount = int(amount * CASINO_RECOVERY_SHARE_RATE)
-            if share_amount > 0:
-                credit_balance_with_log(
-                    CASINO_RECOVERY_SHARE_TARGET_ID,
-                    share_amount,
-                    "賭場回收 10% 分潤",
-                )
     return ok
 
 
@@ -1708,6 +1763,15 @@ def update_game_result(user_id, balance_delta, profit_delta, is_win, is_push=Fal
     conn.close()
     if balance_delta != 0:
         log_transaction(user_id, balance_delta, "21點遊戲結算")
+    # 分潤切割：只在 21點整局實際「淨回收」時切 10%（不額外增發玩家成本）
+    if (
+        CASINO_RECOVERY_SHARE_ENABLED
+        and CASINO_RECOVERY_SHARE_RATE > 0
+        and profit_delta < 0
+        and CASINO_RECOVERY_SHARE_TARGET_ID
+    ):
+        recovered_amount = int(-profit_delta)
+        apply_casino_recovery_share(recovered_amount, "21點回收切割")
 
 def exp_for_next_level(level):
     lv = max(1, min(MAX_LEVEL, level))
@@ -5482,6 +5546,29 @@ async def casino_stats(interaction: discord.Interaction):
     embed.add_field(name="目前流通量", value=f"`{circulation:,}` 東雲幣", inline=False)
     embed.set_footer(text="計算基準：casino_logs（logs 全期鏡像總帳）與 users.balance")
     await interaction_send(interaction, embed=embed)
+
+
+@bot.tree.command(name="share_stats", description="查看賭場回收分潤統計（管理）")
+@app_commands.describe(days="近幾天統計（預設 7 天）")
+async def share_stats(interaction: discord.Interaction, days: int = 7):
+    if interaction.user.id not in ALLOWED_HOST_IDS:
+        return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
+    await interaction_defer_if_needed(interaction, ephemeral=True)
+    total, recent, by_reason = await fetch_casino_share_stats_rows_async(days)
+    embed = discord.Embed(title="📊 賭場回收分潤統計", color=0x5865F2)
+    embed.add_field(name="分潤功能", value="啟用" if CASINO_RECOVERY_SHARE_ENABLED else "停用", inline=True)
+    embed.add_field(name="分潤比例", value=f"`{CASINO_RECOVERY_SHARE_RATE * 100:.2f}%`", inline=True)
+    embed.add_field(name="分潤目標", value=f"<@{CASINO_RECOVERY_SHARE_TARGET_ID}>", inline=True)
+    embed.add_field(name="累計分潤總額", value=f"`{total:,}` 東雲幣", inline=False)
+    embed.add_field(name=f"近 {max(1, int(days))} 天分潤", value=f"`{recent:,}` 東雲幣", inline=False)
+    if by_reason:
+        lines: typing.List[str] = []
+        for reason, amt in by_reason:
+            amt_i = int(amt or 0)
+            rs = str(reason or "未知來源")
+            lines.append(f"• {rs}：`{amt_i:,}`")
+        embed.add_field(name="來源明細（累計）", value="\n".join(lines)[:1024], inline=False)
+    await interaction_send(interaction, embed=embed, ephemeral=True)
 
 @bot.tree.command(name="lvleaderboard", description="等級排行榜前 10 名")
 async def lvleaderboard(interaction: discord.Interaction):
