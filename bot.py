@@ -120,6 +120,15 @@ ROB_VICTIM_PROTECT_SECONDS = 3600
 ROB_BASE_SUCCESS_RATE = 0.60
 # 平民 `/counter_rob` 加倍搶回專用基礎機率（與 `/rob` 分開）。
 COUNTER_ROB_BASE_SUCCESS_RATE = 0.30
+# 賭場回收分潤：系統回收款項的 10% 自動撥給指定帳號（僅賭場扣款原因）
+CASINO_RECOVERY_SHARE_TARGET_ID = "531308526262550528"
+CASINO_RECOVERY_SHARE_RATE = 0.10
+CASINO_RECOVERY_REASONS = {
+    "21點開局扣款",
+    "21點雙倍加注",
+    "21點分牌加注",
+    "E卡決鬥下注",
+}
 red_packet_seq = 0
 MSG_DB_FLUSH_EVERY_SECONDS = 8
 MSG_DB_FLUSH_COUNT = 3
@@ -1631,6 +1640,14 @@ def try_deduct_balance(user_id, amount, reason):
     conn.close()
     if ok:
         log_transaction(user_id, -amount, reason)
+        if reason in CASINO_RECOVERY_REASONS:
+            share_amount = int(amount * CASINO_RECOVERY_SHARE_RATE)
+            if share_amount > 0:
+                credit_balance_with_log(
+                    CASINO_RECOVERY_SHARE_TARGET_ID,
+                    share_amount,
+                    "賭場回收 10% 分潤",
+                )
     return ok
 
 
