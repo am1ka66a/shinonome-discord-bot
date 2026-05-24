@@ -5476,6 +5476,40 @@ async def kill(
     )
     await interaction.response.send_message(msg)
 
+
+@bot.tree.command(name="bicycle", description="嘗試偷走奈音的腳踏車")
+async def bicycle_slash(interaction: discord.Interaction):
+    thief_id = str(interaction.user.id)
+    target_id = "1027248561177509919"
+    steal_amount = 100
+    await ensure_user_exists_async(interaction.user.id, 50000)
+    await ensure_user_exists_async(int(target_id), 0)
+
+    # 99% 成功
+    success = random.random() < 0.99
+    if not success:
+        return await interaction.response.send_message("小黑龜再練練 連個腳踏車都偷不走")
+
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute(
+        "UPDATE users SET balance=balance-%s WHERE user_id=%s AND balance >= %s",
+        (steal_amount, target_id, steal_amount),
+    )
+    if c.rowcount > 0:
+        c.execute(
+            "UPDATE users SET balance=balance+%s WHERE user_id=%s",
+            (steal_amount, thief_id),
+        )
+        conn.commit()
+        conn.close()
+        log_transaction(target_id, -steal_amount, f"腳踏車被偷（偷車者:{thief_id}）")
+        log_transaction(thief_id, steal_amount, f"偷走奈音腳踏車（目標:{target_id}）")
+        return await interaction.response.send_message("你成功偷走了奈音的腳踏車!")
+
+    conn.close()
+    return await interaction.response.send_message("你成功偷走了奈音的腳踏車!")
+
 @bot.tree.command(name="say", description="[管理員] 指定機器人對特定頻道發送內容")
 @app_commands.describe(text="你要機器人說什麼？", channel="指定發送到哪個頻道？(選填)")
 @app_commands.default_permissions(manage_messages=True)
