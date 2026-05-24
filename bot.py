@@ -133,6 +133,13 @@ except Exception:
     CASINO_RECOVERY_SHARE_RATE = 0.10
 CASINO_RECOVERY_SHARE_RATE = max(0.0, min(1.0, CASINO_RECOVERY_SHARE_RATE))
 CASINO_RECOVERY_SHARE_REASON_PREFIX = "賭場回收分潤"
+# 可線上切換的功能開關（不需重啟）
+FEATURE_TOGGLES: typing.Dict[str, bool] = {
+    "rob": True,
+    "bj": True,
+    "duel": True,
+    "redpacket": True,
+}
 red_packet_seq = 0
 MSG_DB_FLUSH_EVERY_SECONDS = 8
 MSG_DB_FLUSH_COUNT = 3
@@ -3738,6 +3745,8 @@ async def rob(
     member: typing.Optional[discord.Member] = None,
     user_id: typing.Optional[str] = None,
 ):
+    if not FEATURE_TOGGLES.get("rob", True):
+        return await interaction.response.send_message("⛔ `/rob` 目前暫時關閉中。", ephemeral=True)
     m_user, err = await resolve_slash_target(
         interaction, member, user_id, required=True, in_guild_only=True
     )
@@ -4694,6 +4703,8 @@ async def rescue(interaction: discord.Interaction):
 @bot.tree.command(name="bj", description="開始 21 點")
 @app_commands.describe(bet="注額")
 async def bj(interaction: discord.Interaction, bet: int = 1000):
+    if not FEATURE_TOGGLES.get("bj", True):
+        return await interaction_send(interaction, "⛔ `/bj` 目前暫時關閉中。", ephemeral=True)
     if not IS_EVENT_ACTIVE:
         return await interaction_send(interaction, "打烊", ephemeral=True)
     if bet < 100:
@@ -4862,6 +4873,8 @@ async def transfer(
 @bot.tree.command(name="redpacket", description="發送紅包！")
 @app_commands.describe(total_amount="紅包總金額", count="份數", seconds="有效秒數(最少10秒)")
 async def redpacket(interaction: discord.Interaction, total_amount: int, count: int, seconds: int = 60):
+    if not FEATURE_TOGGLES.get("redpacket", True):
+        return await interaction.response.send_message("⛔ `/redpacket` 目前暫時關閉中。", ephemeral=True)
     await ensure_user_exists_async(interaction.user.id, 50000)
     if total_amount < count or total_amount <= 0:
         return await interaction.response.send_message("總金額需大於 0，且至少要能每包 1 元。", ephemeral=True)
@@ -5398,6 +5411,8 @@ async def duel_slash(
     member: discord.Member,
     bet: int,
 ):
+    if not FEATURE_TOGGLES.get("duel", True):
+        return await interaction_send(interaction, "⛔ `/duel` 目前暫時關閉中。", ephemeral=True)
     if not interaction.guild:
         return await interaction_send(interaction, "請在伺服器頻道使用。", ephemeral=True)
     if member.bot:
@@ -5909,18 +5924,282 @@ async def lock_slash(interaction: discord.Interaction):
 async def adminhelp_slash(interaction: discord.Interaction):
     if not is_slash_host(interaction):
         return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
-    help_text = """**👑 管理員 Slash 指令清單**
+    help_text = """**👑 管理員 Slash 指令清單（主機白名單）**
 一般玩家說明請用：`/help`
 
-/give member amount - 發錢
-/take member amount - 扣錢
-/ban member - 黑名單
-/unban member - 解除黑名單
-/lock - 暫停/開放賭場
-/resetall_zero - 全服餘額清零
-/resetall_default - 全服重置為 50,000
-/say text channel - 指定頻道發言
-/redpacket total_amount count seconds - 發紅包"""
+`/setlevel` - 直接設定玩家等級（1~100）
+`/give` - 發放東雲幣給玩家
+`/take` - 扣除玩家東雲幣（最低到 0）
+`/ban` - 將玩家加入黑名單
+`/unban` - 將玩家移出黑名單
+`/lock` - 開關賭場營業狀態
+`/resetall_zero` - 全服餘額清零（含統計重置）
+`/resetall_default` - 全服重置為 50,000（含統計重置）
+`/say` - 指定機器人到頻道發言
+`/share_stats` - 查看賭場回收分潤統計
+`/admin_balance_set` - 直接設定玩家餘額
+`/admin_user_flags` - 查看玩家關鍵狀態（通緝/監獄/良民證/黑名單等）
+`/admin_unjail` - 強制釋放玩家（可選清債/清通緝）
+`/admin_revert_tx` - 依流水 ID 進行反向沖正
+`/admin_feature_toggle` - 線上開關功能（rob/bj/duel/redpacket/share）"""
     await interaction.response.send_message(help_text, ephemeral=True)
+
+
+@bot.tree.command(name="admin_balance_set", description="[管理員] 直接設定玩家餘額")
+@app_commands.describe(
+    amount="要設定成的餘額（不可小於 0）",
+    member="玩家（選人）",
+    user_id="或填使用者 ID／貼提及",
+    note="備註（選填）",
+)
+async def admin_balance_set_slash(
+    interaction: discord.Interaction,
+    amount: int,
+    member: typing.Optional[discord.Member] = None,
+    user_id: typing.Optional[str] = None,
+    note: str = "",
+):
+    if not is_slash_host(interaction):
+        return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
+    if amount < 0:
+        return await interaction.response.send_message("餘額不可小於 0。", ephemeral=True)
+    target_user, err = await resolve_slash_target(
+        interaction, member, user_id, required=True, in_guild_only=False
+    )
+    if err:
+        return await interaction.response.send_message(err, ephemeral=True)
+    await ensure_user_exists_async(target_user.id, 0)
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT COALESCE(balance,0) FROM users WHERE user_id=%s", (str(target_user.id),))
+    row = c.fetchone()
+    before_bal = int((row[0] if row else 0) or 0)
+    c.execute("UPDATE users SET balance=%s WHERE user_id=%s", (int(amount), str(target_user.id)))
+    conn.commit()
+    conn.close()
+
+    delta = int(amount) - before_bal
+    note_text = (note or "").strip()[:100]
+    reason = f"管理員設定餘額（{before_bal:,}→{int(amount):,}）"
+    if note_text:
+        reason += f"（備註: {note_text}）"
+    if delta != 0:
+        log_transaction(target_user.id, delta, reason)
+
+    embed = discord.Embed(title="✅ 餘額已設定", color=discord.Color.green())
+    embed.add_field(name="對象", value=target_user.mention, inline=False)
+    embed.add_field(name="原餘額", value=f"`{before_bal:,}`", inline=True)
+    embed.add_field(name="新餘額", value=f"`{int(amount):,}`", inline=True)
+    embed.add_field(name="變動", value=f"`{delta:+,}`", inline=True)
+    embed.add_field(name="備註", value=note_text if note_text else "（無）", inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="admin_user_flags", description="[管理員] 查看玩家關鍵狀態")
+@app_commands.describe(member="玩家（選人）", user_id="或填使用者 ID／貼提及")
+async def admin_user_flags_slash(
+    interaction: discord.Interaction,
+    member: typing.Optional[discord.Member] = None,
+    user_id: typing.Optional[str] = None,
+):
+    if not is_slash_host(interaction):
+        return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
+    target_user, err = await resolve_slash_target(
+        interaction, member, user_id, required=True, in_guild_only=False
+    )
+    if err:
+        return await interaction.response.send_message(err, ephemeral=True)
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute(
+        "SELECT COALESCE(balance,0), COALESCE(role,'civilian'), COALESCE(wanted_stars,0), COALESCE(wanted_hunted_count,0), "
+        "COALESCE(in_prison,0), prison_start, COALESCE(bail_debt,0), COALESCE(good_citizen_cert_active,0), "
+        "good_citizen_cert_broken_until, last_five_robs "
+        "FROM users WHERE user_id=%s",
+        (str(target_user.id),),
+    )
+    row = c.fetchone()
+    c.execute("SELECT 1 FROM blacklist WHERE user_id=%s", (str(target_user.id),))
+    blacklisted = c.fetchone() is not None
+    conn.close()
+    if not row:
+        return await interaction.response.send_message("找不到玩家資料。", ephemeral=True)
+
+    bal, role, stars, hunted, in_pr, prison_start, bail_debt, cert_active, cert_broken_until, raw_hist = row
+    role_disp = {"cop": "🚔 警察", "criminal": "🔪 搶匪"}.get(str(role or "civilian"), "👤 平民")
+    hist_count = 0
+    hist_total = 0
+    if raw_hist:
+        try:
+            h = json.loads(raw_hist)
+            if isinstance(h, list):
+                hist_count = len(h)
+                hist_total = sum(int((it or {}).get("amount", 0) or 0) for it in h if isinstance(it, dict))
+        except Exception:
+            pass
+
+    emb = discord.Embed(title="🛠️ 玩家狀態總覽", color=0x5865F2)
+    emb.add_field(name="對象", value=f"{target_user.mention} (`{target_user.id}`)", inline=False)
+    emb.add_field(name="餘額", value=f"`{int(bal or 0):,}`", inline=True)
+    emb.add_field(name="身分", value=role_disp, inline=True)
+    emb.add_field(name="黑名單", value="是" if blacklisted else "否", inline=True)
+    emb.add_field(name="通緝", value=f"{int(stars or 0)}★｜本輪已追捕: {'是' if int(hunted or 0) else '否'}", inline=True)
+    emb.add_field(name="監獄", value="在押" if int(in_pr or 0) else "否", inline=True)
+    emb.add_field(name="假釋欠款", value=f"`{int(bail_debt or 0):,}`", inline=True)
+    broken_text = ""
+    if cert_broken_until:
+        try:
+            broken_ts = int(cert_broken_until.replace(tzinfo=TW_TZ).timestamp())
+            broken_text = f"\n禁用至: <t:{broken_ts}:F>"
+        except Exception:
+            broken_text = f"\n禁用至: {cert_broken_until}"
+    emb.add_field(
+        name="良民證",
+        value=("啟用中" if int(cert_active or 0) else "未啟用") + broken_text,
+        inline=False,
+    )
+    emb.add_field(name="最近搶劫紀錄", value=f"{hist_count} 筆｜總額 `{hist_total:,}`", inline=False)
+    if prison_start:
+        emb.set_footer(text=f"prison_start: {prison_start}")
+    await interaction.response.send_message(embed=emb, ephemeral=True)
+
+
+@bot.tree.command(name="admin_unjail", description="[管理員] 強制釋放玩家")
+@app_commands.describe(
+    member="玩家（選人）",
+    user_id="或填使用者 ID／貼提及",
+    clear_debt="是否一併清除假釋欠款",
+    clear_wanted="是否一併清除通緝星",
+)
+async def admin_unjail_slash(
+    interaction: discord.Interaction,
+    member: typing.Optional[discord.Member] = None,
+    user_id: typing.Optional[str] = None,
+    clear_debt: bool = False,
+    clear_wanted: bool = True,
+):
+    if not is_slash_host(interaction):
+        return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
+    target_user, err = await resolve_slash_target(
+        interaction, member, user_id, required=True, in_guild_only=False
+    )
+    if err:
+        return await interaction.response.send_message(err, ephemeral=True)
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT COALESCE(in_prison,0), COALESCE(bail_debt,0), COALESCE(wanted_stars,0) FROM users WHERE user_id=%s", (str(target_user.id),))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return await interaction.response.send_message("找不到玩家資料。", ephemeral=True)
+    was_in_prison, debt_before, stars_before = int(row[0] or 0), int(row[1] or 0), int(row[2] or 0)
+    if not was_in_prison:
+        conn.close()
+        return await interaction.response.send_message("該玩家目前不在監獄。", ephemeral=True)
+    if clear_debt and clear_wanted:
+        c.execute(
+            "UPDATE users SET in_prison=0, prison_start=NULL, bail_debt=0, wanted_stars=0, wanted_hunted_count=0 WHERE user_id=%s",
+            (str(target_user.id),),
+        )
+    elif clear_debt:
+        c.execute(
+            "UPDATE users SET in_prison=0, prison_start=NULL, bail_debt=0 WHERE user_id=%s",
+            (str(target_user.id),),
+        )
+    elif clear_wanted:
+        c.execute(
+            "UPDATE users SET in_prison=0, prison_start=NULL, wanted_stars=0, wanted_hunted_count=0 WHERE user_id=%s",
+            (str(target_user.id),),
+        )
+    else:
+        c.execute(
+            "UPDATE users SET in_prison=0, prison_start=NULL WHERE user_id=%s",
+            (str(target_user.id),),
+        )
+    conn.commit()
+    conn.close()
+    await interaction.response.send_message(
+        f"✅ 已釋放 {target_user.mention}。\n"
+        f"清債: {'是' if clear_debt else '否'}（原 `{debt_before:,}`）｜"
+        f"清通緝: {'是' if clear_wanted else '否'}（原 {stars_before}★）",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="admin_revert_tx", description="[管理員] 依流水 ID 做反向沖正")
+@app_commands.describe(tx_id="logs 的流水 ID", note="備註（選填）")
+async def admin_revert_tx_slash(interaction: discord.Interaction, tx_id: int, note: str = ""):
+    if not is_slash_host(interaction):
+        return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
+    if tx_id <= 0:
+        return await interaction.response.send_message("tx_id 必須大於 0。", ephemeral=True)
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT id, user_id, amount, reason FROM logs WHERE id=%s", (int(tx_id),))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return await interaction.response.send_message("找不到該流水 ID。", ephemeral=True)
+    _id, uid, amt, rs = int(row[0]), str(row[1]), int(row[2] or 0), str(row[3] or "")
+    c.execute(
+        "SELECT 1 FROM logs WHERE user_id=%s AND reason LIKE %s LIMIT 1",
+        (uid, f"管理員沖正 tx#{_id}%"),
+    )
+    already = c.fetchone() is not None
+    conn.close()
+    if already:
+        return await interaction.response.send_message("這筆流水看起來已經沖正過了。", ephemeral=True)
+    reverse = -amt
+    if reverse > 0:
+        await credit_balance_with_log_async(uid, reverse, f"管理員沖正 tx#{_id}（原: {rs}）")
+    else:
+        ok = await try_deduct_balance_async(uid, abs(reverse), f"管理員沖正 tx#{_id}（原: {rs}）")
+        if not ok:
+            return await interaction.response.send_message(
+                "沖正需要扣款，但目標餘額不足，已中止。可先手動調整餘額後再沖正。",
+                ephemeral=True,
+            )
+    note_text = (note or "").strip()
+    await interaction.response.send_message(
+        f"✅ 已沖正 tx#{_id}\n對象：<@{int(uid)}>\n原金額：`{amt:+,}` → 沖正：`{reverse:+,}`"
+        + (f"\n備註：{note_text}" if note_text else ""),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="admin_feature_toggle", description="[管理員] 線上開關功能（免重啟）")
+@app_commands.describe(feature="功能名稱", enabled="是否啟用")
+@app_commands.choices(
+    feature=[
+        app_commands.Choice(name="rob", value="rob"),
+        app_commands.Choice(name="bj", value="bj"),
+        app_commands.Choice(name="duel", value="duel"),
+        app_commands.Choice(name="redpacket", value="redpacket"),
+        app_commands.Choice(name="share", value="share"),
+    ]
+)
+async def admin_feature_toggle_slash(interaction: discord.Interaction, feature: str, enabled: bool):
+    if not is_slash_host(interaction):
+        return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
+    feature = (feature or "").strip().lower()
+    if feature == "share":
+        global CASINO_RECOVERY_SHARE_ENABLED
+        CASINO_RECOVERY_SHARE_ENABLED = bool(enabled)
+    else:
+        if feature not in FEATURE_TOGGLES:
+            return await interaction.response.send_message("不支援的功能名稱。", ephemeral=True)
+        FEATURE_TOGGLES[feature] = bool(enabled)
+    status = "啟用" if enabled else "停用"
+    state_lines = [
+        f"rob: {'on' if FEATURE_TOGGLES.get('rob', True) else 'off'}",
+        f"bj: {'on' if FEATURE_TOGGLES.get('bj', True) else 'off'}",
+        f"duel: {'on' if FEATURE_TOGGLES.get('duel', True) else 'off'}",
+        f"redpacket: {'on' if FEATURE_TOGGLES.get('redpacket', True) else 'off'}",
+        f"share: {'on' if CASINO_RECOVERY_SHARE_ENABLED else 'off'}",
+    ]
+    await interaction.response.send_message(
+        f"✅ 功能 `{feature}` 已設為 **{status}**\n目前狀態：\n" + "\n".join(state_lines),
+        ephemeral=True,
+    )
 
 bot.run(os.getenv('DISCORD_TOKEN'))
