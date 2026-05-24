@@ -2792,15 +2792,14 @@ class RedPacketView(discord.ui.View):
 
     @discord.ui.button(label="搶紅包", style=discord.ButtonStyle.success)
     async def claim(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self._claim_lock.locked():
-            return await interaction.response.send_message("⏳ 紅包正在結算，請稍後再試。", ephemeral=True)
+        await interaction_defer_if_needed(interaction, ephemeral=True, thinking=False)
         async with self._claim_lock:
             if interaction.user.bot:
-                return await interaction.response.send_message("機器人不能搶紅包", ephemeral=True)
+                return await interaction_send(interaction, "機器人不能搶紅包", ephemeral=True)
             if interaction.user.id in self.claimed_users:
-                return await interaction.response.send_message("你已經搶過這包了", ephemeral=True)
+                return await interaction_send(interaction, "你已經搶過這包了", ephemeral=True)
             if self.left_count <= 0 or self.left_amount <= 0:
-                return await interaction.response.send_message("紅包已搶完", ephemeral=True)
+                return await interaction_send(interaction, "紅包已搶完", ephemeral=True)
 
             if self.left_count == 1:
                 amount = self.left_amount
@@ -2815,26 +2814,25 @@ class RedPacketView(discord.ui.View):
             self.claimed_users.add(interaction.user.id)
             self.claim_results.append((interaction.user.id, amount))
 
-            conn = get_db_connection()
-            c = conn.cursor()
-            c.execute(
-                "INSERT INTO users (user_id, balance) VALUES (%s, %s) ON DUPLICATE KEY UPDATE balance=balance+%s",
-                (str(interaction.user.id), amount, amount)
-            )
-            conn.commit()
-            conn.close()
-            log_transaction(interaction.user.id, amount, f"搶紅包 #{self.packet_id}")
+            await credit_balance_with_log_async(interaction.user.id, amount, f"搶紅包 #{self.packet_id}")
 
             if self.left_count <= 0 or self.left_amount <= 0:
                 for child in self.children:
                     child.disabled = True
-                await interaction.response.edit_message(
-                    content=self.summary_text() + "\n✅ 紅包已被搶完！\n" + self.winners_text(),
-                    view=self
-                )
+                try:
+                    await interaction.message.edit(
+                        content=self.summary_text() + "\n✅ 紅包已被搶完！\n" + self.winners_text(),
+                        view=self,
+                    )
+                except Exception:
+                    logger.exception("RedPacketView.claim 結算更新失敗 packet_id=%s", self.packet_id)
+                await interaction_send(interaction, f"🎉 你搶到 `{amount}` 東雲幣！", ephemeral=True)
                 return
-            await interaction.response.edit_message(content=self.summary_text(), view=self)
-            await interaction.followup.send(f"🎉 你搶到 `{amount}` 東雲幣！", ephemeral=True)
+            try:
+                await interaction.message.edit(content=self.summary_text(), view=self)
+            except Exception:
+                logger.exception("RedPacketView.claim 更新摘要失敗 packet_id=%s", self.packet_id)
+            await interaction_send(interaction, f"🎉 你搶到 `{amount}` 東雲幣！", ephemeral=True)
 
     async def on_timeout(self):
         for child in self.children:
