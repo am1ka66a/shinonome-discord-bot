@@ -5997,6 +5997,7 @@ async def adminhelp_slash(interaction: discord.Interaction):
 `/admin_user_flags` - 查看玩家關鍵狀態（通緝/監獄/良民證/黑名單等）
 `/admin_unjail` - 強制釋放玩家（可選清債/清通緝）
 `/admin_revert_tx` - 依流水 ID 進行反向沖正
+`/admin_logs` - 查詢含流水 ID 的最近帳務紀錄
 `/admin_feature_toggle` - 線上開關功能（rob/bj/duel/redpacket/share）"""
     await interaction.response.send_message(help_text, ephemeral=True)
 
@@ -6221,6 +6222,64 @@ async def admin_revert_tx_slash(interaction: discord.Interaction, tx_id: int, no
         + (f"\n備註：{note_text}" if note_text else ""),
         ephemeral=True,
     )
+
+
+@bot.tree.command(name="admin_logs", description="[管理員] 查詢含流水 ID 的最近帳務紀錄")
+@app_commands.describe(
+    member="要篩選的玩家（選填）",
+    user_id="或填使用者 ID／貼提及（選填）",
+    limit="顯示筆數（1~50，預設 20）",
+)
+async def admin_logs_slash(
+    interaction: discord.Interaction,
+    member: typing.Optional[discord.Member] = None,
+    user_id: typing.Optional[str] = None,
+    limit: int = 20,
+):
+    if not is_slash_host(interaction):
+        return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
+    limit = max(1, min(50, int(limit)))
+    target_user, err = await resolve_slash_target(
+        interaction, member, user_id, required=False, in_guild_only=False
+    )
+    if err:
+        return await interaction.response.send_message(err, ephemeral=True)
+
+    conn = get_db_connection()
+    c = conn.cursor()
+    if target_user is not None:
+        c.execute(
+            "SELECT id, user_id, amount, reason, created_at FROM logs WHERE user_id=%s ORDER BY id DESC LIMIT %s",
+            (str(target_user.id), limit),
+        )
+    else:
+        c.execute(
+            "SELECT id, user_id, amount, reason, created_at FROM logs ORDER BY id DESC LIMIT %s",
+            (limit,),
+        )
+    rows = c.fetchall()
+    conn.close()
+    if not rows:
+        return await interaction.response.send_message("查無流水資料。", ephemeral=True)
+
+    lines: typing.List[str] = []
+    for rid, uid, amt, reason, created_at in rows:
+        try:
+            t = created_at.strftime("%m/%d %H:%M:%S") if created_at else "N/A"
+        except Exception:
+            t = "N/A"
+        lines.append(
+            f"`#{int(rid)}` [{t}] <@{int(uid)}> `{int(amt):+,}` | {str(reason or '')[:80]}"
+        )
+
+    header = (
+        f"📒 最近流水（{len(rows)} 筆）"
+        + (f"｜對象：<@{target_user.id}>" if target_user is not None else "")
+    )
+    chunks = _chunk_text_lines([header, ""] + lines, 1900)
+    await interaction.response.send_message(chunks[0], ephemeral=True)
+    for ch in chunks[1:]:
+        await interaction.followup.send(ch, ephemeral=True)
 
 
 @bot.tree.command(name="admin_feature_toggle", description="[管理員] 線上開關功能（免重啟）")
