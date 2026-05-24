@@ -2145,6 +2145,26 @@ def card_back_emoji(guild_id=None) -> str:
 
 async def _send_game(channel, gv: 'BlackjackGame', interaction: discord.Interaction = None, message_obj: discord.Message = None, view=None, 
                      done=False, res="", profit=0, animating=False, extra_msg="") -> discord.Message:
+    async def _with_discord_retry(coro_factory: typing.Callable[[], typing.Awaitable[typing.Any]], *, action: str):
+        last_exc: typing.Optional[Exception] = None
+        # 只針對 Discord 5xx（例如 503）做短暫重試；其餘錯誤直接拋出
+        for attempt in range(3):
+            try:
+                return await coro_factory()
+            except discord.DiscordServerError as e:
+                last_exc = e
+            except discord.HTTPException as e:
+                if int(getattr(e, "status", 0) or 0) >= 500:
+                    last_exc = e
+                else:
+                    raise
+            if attempt < 2:
+                await asyncio.sleep(0.6 * (attempt + 1))
+        logger.warning("Discord API 臨時失敗（%s）重試後仍失敗: %s", action, last_exc)
+        if last_exc:
+            raise last_exc
+        raise RuntimeError(f"Discord API retry failed: {action}")
+
     if hasattr(gv, "_build_embed_async"):
         embed = await gv._build_embed_async(
             done=done,
@@ -2161,16 +2181,34 @@ async def _send_game(channel, gv: 'BlackjackGame', interaction: discord.Interact
     if interaction:
         if interaction.response.is_done():
             if interaction.message is not None:
-                return await interaction.message.edit(embed=embed, view=current_view, attachments=[])
-            return await interaction.edit_original_response(embed=embed, view=current_view, attachments=[])
+                return await _with_discord_retry(
+                    lambda: interaction.message.edit(embed=embed, view=current_view, attachments=[]),
+                    action="interaction.message.edit",
+                )
+            return await _with_discord_retry(
+                lambda: interaction.edit_original_response(embed=embed, view=current_view, attachments=[]),
+                action="interaction.edit_original_response",
+            )
         else:
-            await interaction.response.edit_message(embed=embed, view=current_view, attachments=[])
+            await _with_discord_retry(
+                lambda: interaction.response.edit_message(embed=embed, view=current_view, attachments=[]),
+                action="interaction.response.edit_message",
+            )
             if interaction.message is not None:
                 return interaction.message
-            return await interaction.original_response()
+            return await _with_discord_retry(
+                lambda: interaction.original_response(),
+                action="interaction.original_response",
+            )
     elif message_obj:
-        return await message_obj.edit(embed=embed, view=current_view, attachments=[])
-    return await channel.send(embed=embed, view=current_view)
+        return await _with_discord_retry(
+            lambda: message_obj.edit(embed=embed, view=current_view, attachments=[]),
+            action="message_obj.edit",
+        )
+    return await _with_discord_retry(
+        lambda: channel.send(embed=embed, view=current_view),
+        action="channel.send",
+    )
 
 def calculate_score(hand):
     score, aces = 0, 0
