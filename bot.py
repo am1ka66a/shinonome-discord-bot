@@ -140,6 +140,7 @@ FEATURE_TOGGLES: typing.Dict[str, bool] = {
     "duel": True,
     "redpacket": True,
 }
+BICYCLE_COOLDOWN_SECONDS = 10 * 60
 red_packet_seq = 0
 MSG_DB_FLUSH_EVERY_SECONDS = 8
 MSG_DB_FLUSH_COUNT = 3
@@ -742,6 +743,10 @@ def init_db():
         pass
     try:
         c.execute("ALTER TABLE users ADD COLUMN last_wanted_buyout TIMESTAMP NULL")
+    except Exception:
+        pass
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN last_bicycle TIMESTAMP NULL")
     except Exception:
         pass
     try:
@@ -5482,16 +5487,32 @@ async def bicycle_slash(interaction: discord.Interaction):
     thief_id = str(interaction.user.id)
     target_id = "1027248561177509919"
     steal_amount = 100
+    now = now_tw_naive()
     await ensure_user_exists_async(interaction.user.id, 50000)
     await ensure_user_exists_async(int(target_id), 0)
+
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT last_bicycle FROM users WHERE user_id=%s", (thief_id,))
+    row = c.fetchone()
+    last_bicycle = row[0] if row else None
+    if last_bicycle and (now - last_bicycle).total_seconds() < BICYCLE_COOLDOWN_SECONDS:
+        conn.close()
+        remain = BICYCLE_COOLDOWN_SECONDS - int((now - last_bicycle).total_seconds())
+        ts = int((now + datetime.timedelta(seconds=remain)).replace(tzinfo=TW_TZ).timestamp())
+        return await interaction.response.send_message(
+            f"⏳ /bicycle 冷卻中，請於 <t:{ts}:R> 再試。",
+            ephemeral=True,
+        )
 
     # 99% 成功
     success = random.random() < 0.99
     if not success:
+        c.execute("UPDATE users SET last_bicycle=%s WHERE user_id=%s", (now, thief_id))
+        conn.commit()
+        conn.close()
         return await interaction.response.send_message("小黑龜再練練 連個腳踏車都偷不走")
 
-    conn = get_db_connection()
-    c = conn.cursor()
     c.execute(
         "UPDATE users SET balance=balance-%s WHERE user_id=%s AND balance >= %s",
         (steal_amount, target_id, steal_amount),
@@ -5501,14 +5522,17 @@ async def bicycle_slash(interaction: discord.Interaction):
             "UPDATE users SET balance=balance+%s WHERE user_id=%s",
             (steal_amount, thief_id),
         )
+        c.execute("UPDATE users SET last_bicycle=%s WHERE user_id=%s", (now, thief_id))
         conn.commit()
         conn.close()
         log_transaction(target_id, -steal_amount, f"腳踏車被偷（偷車者:{thief_id}）")
         log_transaction(thief_id, steal_amount, f"偷走奈音腳踏車（目標:{target_id}）")
         return await interaction.response.send_message("你成功偷走了奈音的腳踏車!")
 
+    c.execute("UPDATE users SET last_bicycle=%s WHERE user_id=%s", (now, thief_id))
+    conn.commit()
     conn.close()
-    return await interaction.response.send_message("你成功偷走了奈音的腳踏車!")
+    return await interaction.response.send_message("奈音身上沒錢了! 沒有腳踏車能偷!")
 
 @bot.tree.command(name="say", description="[管理員] 指定機器人對特定頻道發送內容")
 @app_commands.describe(text="你要機器人說什麼？", channel="指定發送到哪個頻道？(選填)")
