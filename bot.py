@@ -497,6 +497,10 @@ async def claim_hourly_reward_async(user_id, reward_per_slot: int = 1000):
     return await db_to_thread(claim_hourly_reward, user_id, reward_per_slot)
 
 
+async def ensure_user_exists_async(user_id, default_balance=50000):
+    return await db_to_thread(ensure_user_exists, user_id, default_balance)
+
+
 async def get_level_stats_async(user_id):
     return await db_to_thread(get_level_stats, user_id)
 
