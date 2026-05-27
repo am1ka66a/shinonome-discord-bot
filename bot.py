@@ -2243,8 +2243,8 @@ def check_sidebets(player_hand, dealer_up, p_bet, s_bet):
             total_p += p_bet * mult
             res_msg += f"🧧 {m}！+{p_bet*mult} "
         else:
-            # 旁注本金已在開局時扣除，未中時不應再扣一次
-            res_msg += "🧧 對子未中（旁注已扣） "
+            total_p -= p_bet
+            res_msg += f"🧧 對子未中 -{p_bet} "
     if s_bet > 0:
         cards = [player_hand[0], player_hand[1], dealer_up]
         suits = [c['suit'] for c in cards]
@@ -2265,8 +2265,8 @@ def check_sidebets(player_hand, dealer_up, p_bet, s_bet):
             total_p += s_bet * mult
             res_msg += f"🎯 21+3 {m}！+{s_bet*mult} "
         else:
-            # 旁注本金已在開局時扣除，未中時不應再扣一次
-            res_msg += "🎯 21+3 未中（旁注已扣） "
+            total_p -= s_bet
+            res_msg += f"🎯 21+3 未中 -{s_bet} "
     return total_p, res_msg
 
 # ==============================================================================
@@ -2352,6 +2352,8 @@ class SetupView(discord.ui.View):
     @discord.ui.button(label="開始遊戲 (再來一局)", style=discord.ButtonStyle.success)
     async def start(self, inter, btn):
         if inter.user.id != self.user.id: return
+        if not FEATURE_TOGGLES.get("bj", True) or not IS_EVENT_ACTIVE:
+            return await inter.response.send_message("打烊", ephemeral=True)
         await inter.response.defer()
         await ensure_user_exists_async(self.user.id, 50000)
         stats = await get_user_stats_async(self.user.id)
@@ -2696,6 +2698,8 @@ class ConfirmAllInView(discord.ui.View):
         return True
     @discord.ui.button(label="確定 All In！", style=discord.ButtonStyle.danger)
     async def confirm(self, inter, btn):
+        if not FEATURE_TOGGLES.get("bj", True) or not IS_EVENT_ACTIVE:
+            return await inter.response.send_message("打烊", ephemeral=True)
         stats = await get_user_stats_async(self.user.id)
         if not stats or stats[0] < 100: return await inter.response.send_message("去乞討吧雜魚", ephemeral=True)
         self.stop(); await inter.response.edit_message(content="🔥 All In 已確認！正在為你開牌...", view=None)
@@ -2716,6 +2720,8 @@ class NewGameView(discord.ui.View):
     @discord.ui.button(label="再來一局", style=discord.ButtonStyle.success)
     async def again(self, inter, btn):
         if inter.user.id != self.user.id: return
+        if not FEATURE_TOGGLES.get("bj", True) or not IS_EVENT_ACTIVE:
+            return await inter.response.send_message("打烊", ephemeral=True)
         await inter.response.defer()
         total_cost = self.last_bet + self.last_p_bet + self.last_s_bet
         if not await try_deduct_balance_async(self.user.id, total_cost, "21點開局扣款"):
@@ -2730,6 +2736,8 @@ class NewGameView(discord.ui.View):
     @discord.ui.button(label="雙倍再局 (Double)", style=discord.ButtonStyle.primary)
     async def double_again(self, inter, btn):
         if inter.user.id != self.user.id: return
+        if not FEATURE_TOGGLES.get("bj", True) or not IS_EVENT_ACTIVE:
+            return await inter.response.send_message("打烊", ephemeral=True)
         await inter.response.defer()
         new_bet = self.last_bet * 2
         total_cost = new_bet + self.last_p_bet + self.last_s_bet
