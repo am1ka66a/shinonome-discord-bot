@@ -152,7 +152,8 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
             f"✅ 已將 {member.mention} 設定為 **Lv.{level}**\n"
             f"原本：Lv.{old_level} / EXP `{old_exp:,}`\n"
             f"現在：Lv.{level} / EXP `{target_exp:,}`"
-            f"{milestone_note}"
+            f"{milestone_note}",
+            ephemeral=True,
         )
 
     @bot.tree.command(name="give", description="[管理員] 發放東雲幣給玩家")
@@ -200,7 +201,7 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
         embed.add_field(name="餘額變化", value=f"`{before_bal:,}` → `{after_bal:,}`", inline=False)
         embed.add_field(name="備註", value=note_text if note_text else "（無）", inline=False)
         embed.set_footer(text=f"操作人：{interaction.user.display_name}")
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @bot.tree.command(name="take", description="[管理員] 扣除玩家東雲幣")
     @app_commands.describe(
@@ -247,7 +248,7 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
         embed.add_field(name="餘額變化", value=f"`{before_bal:,}` → `{after_bal:,}`", inline=False)
         embed.add_field(name="備註", value=note_text if note_text else "（無）", inline=False)
         embed.set_footer(text=f"操作人：{interaction.user.display_name}")
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @bot.tree.command(name="ban", description="[管理員] 將玩家加入黑名單")
     @app_commands.describe(member="玩家（選人）", user_id="或填使用者 ID／貼提及")
@@ -269,7 +270,7 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
         c.execute("INSERT IGNORE INTO blacklist (user_id) VALUES (%s)", (str(member.id),))
         conn.commit()
         conn.close()
-        await interaction.response.send_message(f"{member.mention} 已加入黑名單。")
+        await interaction.response.send_message(f"{member.mention} 已加入黑名單。", ephemeral=True)
 
     @bot.tree.command(name="unban", description="[管理員] 將玩家移出黑名單")
     @app_commands.describe(member="玩家（選人，未必在伺服器）", user_id="或填使用者 ID／貼提及")
@@ -291,7 +292,7 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
         c.execute("DELETE FROM blacklist WHERE user_id=%s", (str(member.id),))
         conn.commit()
         conn.close()
-        await interaction.response.send_message(f"{member.mention} 已解除黑名單。")
+        await interaction.response.send_message(f"{member.mention} 已解除黑名單。", ephemeral=True)
 
     @bot.tree.command(name="resetall_zero", description="[管理員] 全伺服器餘額清零")
     async def resetall_zero_slash(interaction: discord.Interaction):
@@ -302,7 +303,7 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
         c.execute("UPDATE users SET balance=0")
         conn.commit()
         conn.close()
-        await interaction.response.send_message("💥 全伺服器帳戶餘額已清零。")
+        await interaction.response.send_message("💥 全伺服器帳戶餘額已清零。", ephemeral=True)
 
     @bot.tree.command(name="resetall_default", description="[管理員] 全伺服器重置為 50,000")
     async def resetall_default_slash(interaction: discord.Interaction):
@@ -313,14 +314,14 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
         c.execute("UPDATE users SET balance=50000, rescue_count=0, total_games=0, wins=0, total_profit=0")
         conn.commit()
         conn.close()
-        await interaction.response.send_message("🔄 全服已重置為 50,000，並重置統計。")
+        await interaction.response.send_message("🔄 全服已重置為 50,000，並重置統計。", ephemeral=True)
 
     @bot.tree.command(name="lock", description="[管理員] 開關賭場營業狀態")
     async def lock_slash(interaction: discord.Interaction):
         if not is_slash_host(interaction):
             return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
         set_is_event_active(not bool(get_is_event_active()))
-        await interaction.response.send_message(f"賭場狀態已切換：`{get_is_event_active()}`")
+        await interaction.response.send_message(f"賭場狀態已切換：`{get_is_event_active()}`", ephemeral=True)
 
     @bot.tree.command(name="adminhelp", description="[管理員] 查看管理指令清單")
     async def adminhelp_slash(interaction: discord.Interaction):

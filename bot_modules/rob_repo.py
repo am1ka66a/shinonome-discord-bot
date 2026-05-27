@@ -102,6 +102,9 @@ def apply_rob_success_db(
     lock_user_rows,
     now_tw_naive_func,
     user_role_value_func,
+    log_transaction_in_tx,
+    counter_rob_base_success_rate: float,
+    bail_cost: int,
     cop_hunt_capture_base_pct: int,
     cop_hunt_capture_per_star_pct: int,
     robber_id: int,
@@ -162,18 +165,79 @@ def apply_rob_success_db(
             f"🚔 每次搶劫成功後警察可追捕一次（基準約 **`{cap5}%`**，實際另受警匪等級差影響，每級 ±1%）。"
         )
 
-    revenge_hint = ""
+    counter_note = ""
     c.execute("SELECT COALESCE(role,'civilian') FROM users WHERE user_id=%s", (str(target_id),))
     vrole_row = c.fetchone()
     victim_role = user_role_value_func(vrole_row[0] if vrole_row else None)
     if victim_role == "civilian":
         c.execute(
-            "UPDATE users SET revenge_pending=1, revenge_robber_id=%s, revenge_amount=%s WHERE user_id=%s",
-            (str(robber_id), steal_amount, str(target_id)),
+            "SELECT COALESCE(level,1), COALESCE(balance,0) FROM users WHERE user_id=%s FOR UPDATE",
+            (str(target_id),),
         )
-        revenge_hint = (
-            f"\n\n💢 <@{target_id}> 身為**平民**被搶成功，獲得 **一次**機會：使用 `/counter_rob` "
-            f"可依每級差距 ±1% 公式（與搶劫相同結構，基礎成功率較低），嘗試從搶匪處**加倍搶回**（至多 `{(steal_amount * 2):,}` 幣，實際以搶匪餘額為準）。"
+        victim_row = c.fetchone()
+        victim_level = int((victim_row[0] if victim_row else 1) or 1)
+        c.execute(
+            "SELECT COALESCE(level,1), COALESCE(balance,0), COALESCE(in_prison,0) FROM users WHERE user_id=%s FOR UPDATE",
+            (str(robber_id),),
+        )
+        robber_row = c.fetchone()
+        robber_level = int((robber_row[0] if robber_row else 1) or 1)
+        robber_balance = int((robber_row[1] if robber_row else 0) or 0)
+        already_prison = int((robber_row[2] if robber_row else 0) or 0)
+
+        level_gap = victim_level - robber_level
+        counter_rate = counter_rob_base_success_rate + (level_gap * 0.01)
+        counter_rate = max(0.05, min(0.95, counter_rate))
+        counter_pct = int(round(counter_rate * 100))
+        doubled = int(steal_amount * 2)
+
+        if random.random() < counter_rate:
+            pay = min(doubled, robber_balance)
+            debt_from_shortfall = max(0, doubled - pay)
+            c.execute(
+                "UPDATE users SET balance=GREATEST(0, balance-%s), bail_debt=COALESCE(bail_debt,0)+%s WHERE user_id=%s",
+                (pay, debt_from_shortfall, str(robber_id)),
+            )
+            c.execute(
+                "SELECT COALESCE(balance,0), COALESCE(in_prison,0) FROM users WHERE user_id=%s FOR UPDATE",
+                (str(robber_id),),
+            )
+            robber_after = c.fetchone()
+            robber_balance_after = int((robber_after[0] if robber_after else 0) or 0)
+            robber_in_prison_after = int((robber_after[1] if robber_after else 0) or 0)
+            robber_imprisoned = False
+            if robber_balance_after == 0 and not already_prison and not robber_in_prison_after:
+                prison_now = now_tw_naive_func()
+                c.execute(
+                    "UPDATE users SET in_prison=1, prison_start=%s WHERE user_id=%s AND COALESCE(in_prison,0)=0",
+                    (prison_now, str(robber_id)),
+                )
+                c.execute(
+                    """INSERT INTO prison_records
+                       (criminal_id, cop_id, wanted_stars, confiscated_amount, cop_reward, bail_cost, arrested_at)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                    (str(robber_id), str(target_id), 0, pay, 0, int(bail_cost), prison_now),
+                )
+                robber_imprisoned = True
+            c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (doubled, str(target_id)))
+            log_transaction_in_tx(c, target_id, doubled, f"平民自動反制成功（對搶匪:{robber_id}）")
+            if pay > 0:
+                log_transaction_in_tx(c, robber_id, -pay, f"被平民自動反制（受害者:{target_id}）")
+            debt_note = ""
+            if debt_from_shortfall > 0:
+                debt_note = f"；搶匪餘額不足，差額 `{debt_from_shortfall:,}` 已記入假釋債務"
+            prison_note = "；搶匪餘額歸零，已入獄" if robber_imprisoned else ""
+            counter_note = (
+                f"\n💢 平民自動反制**成功**（機率約 {counter_pct}%）："
+                f"當場加倍搶回 `{doubled:,}`，搶匪實扣 `{pay:,}`{debt_note}{prison_note}。"
+            )
+        else:
+            counter_note = (
+                f"\n💢 平民自動反制**失敗**（機率約 {counter_pct}%），本次未追回。"
+            )
+        c.execute(
+            "UPDATE users SET revenge_pending=0, revenge_robber_id=NULL, revenge_amount=0 WHERE user_id=%s",
+            (str(target_id),),
         )
 
     conn.commit()
@@ -182,7 +246,7 @@ def apply_rob_success_db(
         "ok": True,
         "steal_amount": steal_amount,
         "wanted_info": wanted_info,
-        "revenge_hint": revenge_hint,
+        "counter_note": counter_note,
         "success_rate_pct": success_rate_pct,
     }
 

@@ -761,6 +761,9 @@ def apply_rob_success_db(
         lock_user_rows,
         now_tw_naive,
         _user_role_value,
+        log_transaction_in_tx,
+        COUNTER_ROB_BASE_SUCCESS_RATE,
+        BAIL_COST,
         COP_HUNT_CAPTURE_BASE_PCT,
         COP_HUNT_CAPTURE_PER_STAR_PCT,
         robber_id,
@@ -1949,7 +1952,7 @@ async def help_slash(interaction: discord.Interaction):
             f"`/cop_hunt` — 警察追捕（僅警察；每次 **`{COP_HUNT_FEE:,}`** 幣、成敗皆扣）。"
             f"成功率 **1★ 約 {_cop_hunt_pct_1star}%** 起，通緝每多 **1** 星 **+{COP_HUNT_CAPTURE_PER_STAR_PCT}%**，並受等級差影響（每級 ±1%，保底 **5%**、上限 **95%**）\n"
             f"`/wanted_buyout` — [搶匪] 付 `{WANTED_BUYOUT_COST:,}` 消除全部通緝星並**清空最近搶劫紀錄**（**24 小時**冷卻）\n"
-            f"`/counter_rob` — 平民被搶**成功**後限一次（約 **{int(round(COUNTER_ROB_BASE_SUCCESS_RATE * 100))}%** 基礎、級差 ±1%）；**成功領滿加倍**；搶匪扣款後**餘額 0 入獄**否則不入獄；不足額記假釋債\n"
+            f"`/counter_rob` — 已改為平民被搶後**自動反制結算**（約 **{int(round(COUNTER_ROB_BASE_SUCCESS_RATE * 100))}%** 基礎、級差 ±1%）\n"
             f"`/bail` — 入獄繳 **基礎 `{BAIL_COST:,}` + 累計假釋欠款** 出獄"
         ),
         inline=False,
@@ -2108,12 +2111,12 @@ async def rob(
             return await interaction_send(interaction, "對方及時把錢藏好了，這次搶劫失敗。", ephemeral=True)
         steal_amount = int(success_result["steal_amount"])
         wanted_info = success_result["wanted_info"]
-        revenge_hint = success_result["revenge_hint"]
+        counter_note = success_result.get("counter_note", "")
         await db_to_thread(log_transaction, interaction.user.id, steal_amount, f"搶劫成功（目標:{member.id}）")
         await db_to_thread(log_transaction, member.id, -steal_amount, f"被搶劫（搶匪:{interaction.user.id}）")
         return await interaction_send(
             interaction,
-            f"{robber_name}搶了{victim_name}`{steal_amount:,}`東雲幣!!（本次成功率約 {success_rate_pct}%）{wanted_info}{revenge_hint}"
+            f"{robber_name}搶了{victim_name}`{steal_amount:,}`東雲幣!!（本次成功率約 {success_rate_pct}%）{wanted_info}{counter_note}"
         )
 
     fail_result = await apply_rob_fail_db_async(interaction.user.id, member.id, now)
@@ -2497,33 +2500,37 @@ async def cop_hunt_slash(
 async def wanted_buyout_slash(interaction: discord.Interaction):
     if not interaction.guild:
         return await interaction.response.send_message("請在伺服器頻道使用。", ephemeral=True)
+    await interaction_defer_if_needed(interaction)
     now = now_tw_naive()
     result = await wanted_buyout_sync_async(interaction.user.id, now)
     if not result.get("ok"):
         reason = result.get("reason")
         if reason == "not_found":
-            return await interaction.response.send_message("找不到帳號資料。", ephemeral=True)
+            return await interaction_send(interaction, "找不到帳號資料。", ephemeral=True)
         if reason == "not_criminal":
-            return await interaction.response.send_message("❌ 僅**搶匪**可使用此指令。", ephemeral=True)
+            return await interaction_send(interaction, "❌ 僅**搶匪**可使用此指令。", ephemeral=True)
         if reason == "in_prison":
-            return await interaction.response.send_message("❌ 你在監獄中，無法消除通緝。", ephemeral=True)
+            return await interaction_send(interaction, "❌ 你在監獄中，無法消除通緝。", ephemeral=True)
         if reason == "no_stars":
-            return await interaction.response.send_message("ℹ️ 你目前沒有通緝星。", ephemeral=True)
+            return await interaction_send(interaction, "ℹ️ 你目前沒有通緝星。", ephemeral=True)
         if reason == "insufficient":
             bal = int(result.get("balance") or 0)
-            return await interaction.response.send_message(
+            return await interaction_send(
+                interaction,
                 f"❌ 需要 `{WANTED_BUYOUT_COST:,}` 東雲幣，你的餘額不足（目前 `{bal:,}`）。",
                 ephemeral=True,
             )
         if reason == "cooldown":
             ts = tw_naive_to_discord_ts(result["next_dt"])
-            return await interaction.response.send_message(
+            return await interaction_send(
+                interaction,
                 f"⏳ 通緝買斷冷卻中，下次可於 <t:{ts}:F>（<t:{ts}:R>）再使用。",
                 ephemeral=True,
             )
-        return await interaction.response.send_message("扣款失敗（餘額不足）。", ephemeral=True)
+        return await interaction_send(interaction, "扣款失敗（餘額不足）。", ephemeral=True)
     new_bal = int(result["new_balance"])
     stars_was = int(result["stars_was"])
+    cost = int(WANTED_BUYOUT_COST)
     emb = discord.Embed(
         title="✅ 通緝買斷成功（頻道公告）",
         description=(
@@ -2534,7 +2541,7 @@ async def wanted_buyout_slash(interaction: discord.Interaction):
     )
     emb.add_field(name="目前餘額", value=f"`{new_bal:,}` 東雲幣", inline=False)
     _am = discord.AllowedMentions(users=[discord.Object(id=interaction.user.id)])
-    await interaction.response.send_message(embed=emb, ephemeral=False, allowed_mentions=_am)
+    await interaction_send(interaction, embed=emb, ephemeral=False, allowed_mentions=_am)
 
 
 @bot.tree.command(name="good_citizen", description="良民證：支付 5,000 萬啟用防搶；再支付 5,000 萬解除（兩者皆 24h 冷卻）")
@@ -2703,8 +2710,7 @@ async def wanted_status_slash(interaction: discord.Interaction):
         emb.add_field(
             name="加倍搶回",
             value=(
-                f"可使用 `/counter_rob` 一次；成功可領 **`{(int(rev_amt or 0) * 2):,}`**（加倍）；"
-                "搶匪扣完若**餘額 0** 會**入獄**，否則不入獄；不足額記假釋債務。"
+                "已改為**自動反制**：平民被搶成功後會立即自動判定，不需手動輸入指令。"
             ),
             inline=False,
         )
@@ -2793,159 +2799,12 @@ async def wanted_list_slash(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="counter_rob",
-    description="平民被搶成功後限一次：反制成功領滿加倍；搶匪付完若餘額為0入獄，否則不入獄；不足額併假釋債",
+    description="（相容保留）平民反制已改為被搶成功後自動結算",
 )
 async def counter_rob_slash(interaction: discord.Interaction):
-    if not interaction.guild:
-        return await interaction.response.send_message("請在伺服器頻道使用。", ephemeral=True)
-    victim_id = str(interaction.user.id)
-    await interaction_defer_if_needed(interaction)
-    await ensure_user_exists_async(interaction.user.id, 0)
-
-    conn = get_db_connection()
-    c = conn.cursor()
-    # 先鎖自己，再拿到 robber_id 後用共用 helper 進行固定順序上鎖
-    lock_user_rows(c, [victim_id])
-    c.execute(
-        "SELECT COALESCE(role,'civilian'), revenge_pending, revenge_robber_id, revenge_amount FROM users WHERE user_id=%s FOR UPDATE",
-        (victim_id,),
-    )
-    row = c.fetchone()
-    if not row:
-        conn.close()
-        return await interaction_send(interaction, "找不到帳號資料。", ephemeral=True)
-    vrole = (row[0] or "civilian")
-    pending = int(row[1] or 0)
-    robber_id = row[2]
-    base_amt = int(row[3] or 0)
-
-    if vrole != "civilian":
-        c.execute(
-            "UPDATE users SET revenge_pending=0, revenge_robber_id=NULL, revenge_amount=0 WHERE user_id=%s",
-            (victim_id,),
-        )
-        conn.commit()
-        conn.close()
-        return await interaction_send(
-            interaction,
-            "你已非**平民**身分，先前的「加倍搶回」機會已作廢。",
-            ephemeral=True,
-        )
-
-    if not pending or not robber_id or base_amt <= 0:
-        conn.close()
-        return await interaction_send(
-            interaction,
-            "你沒有可用的加倍搶回機會（僅**平民**被搶劫**成功**後會獲得一次）。",
-            ephemeral=True,
-        )
-
-    locked_ids = lock_user_rows(c, [victim_id, robber_id])
-    if str(robber_id) not in locked_ids:
-        c.execute(
-            "UPDATE users SET revenge_pending=0, revenge_robber_id=NULL, revenge_amount=0 WHERE user_id=%s",
-            (victim_id,),
-        )
-        conn.commit()
-        conn.close()
-        return await interaction_send(interaction, "找不到搶匪帳號，機會已清除。", ephemeral=True)
-
-    c.execute("SELECT level, balance FROM users WHERE user_id=%s FOR UPDATE", (victim_id,))
-    vrow = c.fetchone()
-    victim_level = int((vrow[0] if vrow else 1) or 1)
-    c.execute("SELECT level, balance FROM users WHERE user_id=%s FOR UPDATE", (str(robber_id),))
-    rrow = c.fetchone()
-    if not rrow:
-        c.execute(
-            "UPDATE users SET revenge_pending=0, revenge_robber_id=NULL, revenge_amount=0 WHERE user_id=%s",
-            (victim_id,),
-        )
-        conn.commit()
-        conn.close()
-        return await interaction_send(interaction, "找不到搶匪帳號，機會已清除。", ephemeral=True)
-    robber_level = int((rrow[0] if rrow else 1) or 1)
-    robber_balance = int((rrow[1] if rrow else 0) or 0)
-
-    doubled = base_amt * 2
-    pay = min(doubled, robber_balance)
-    debt_from_shortfall = max(0, doubled - pay)
-    level_gap = victim_level - robber_level
-    # /counter_rob 基礎成功率 COUNTER_ROB_BASE_SUCCESS_RATE；每差 1 等調整 1%
-    success_rate = COUNTER_ROB_BASE_SUCCESS_RATE + (level_gap * 0.01)
-    success_rate = max(0.05, min(0.95, success_rate))
-    roll_ok = random.random() < success_rate
-
-    transferred = 0
-    robber_imprisoned = False
-    if roll_ok:
-        now_cr = now_tw_naive()
-        c.execute(
-            "UPDATE users SET balance=GREATEST(0, balance-%s), bail_debt=COALESCE(bail_debt,0)+%s WHERE user_id=%s",
-            (pay, debt_from_shortfall, str(robber_id)),
-        )
-        c.execute(
-            "SELECT COALESCE(balance,0), COALESCE(in_prison,0) FROM users WHERE user_id=%s",
-            (str(robber_id),),
-        )
-        _rb_after = c.fetchone()
-        bal_after = int((_rb_after[0] if _rb_after else 0) or 0)
-        already_pr = int((_rb_after[1] if _rb_after else 0) or 0)
-        if bal_after == 0 and not already_pr:
-            c.execute(
-                "UPDATE users SET in_prison=1, prison_start=%s WHERE user_id=%s AND COALESCE(in_prison,0)=0",
-                (now_cr, str(robber_id)),
-            )
-            c.execute(
-                """INSERT INTO prison_records
-                   (criminal_id, cop_id, wanted_stars, confiscated_amount, cop_reward, bail_cost, arrested_at)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
-                (str(robber_id), victim_id, 0, pay, 0, BAIL_COST, now_cr),
-            )
-            robber_imprisoned = True
-        c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (doubled, victim_id))
-        log_transaction_in_tx(c, victim_id, doubled, f"平民加倍搶回（對搶匪:{robber_id}）")
-        if pay > 0:
-            log_transaction_in_tx(c, robber_id, -pay, f"被平民加倍搶回（受害者:{victim_id}）")
-        transferred = doubled
-
-    c.execute(
-        "UPDATE users SET revenge_pending=0, revenge_robber_id=NULL, revenge_amount=0 WHERE user_id=%s",
-        (victim_id,),
-    )
-    conn.commit()
-    conn.close()
-    pct = int(round(success_rate * 100))
-
-    if transferred > 0:
-        robber_mem = interaction.guild.get_member(int(robber_id))
-        rn = robber_mem.display_name if robber_mem else robber_id
-        _am_success = discord.AllowedMentions(
-            users=[
-                discord.Object(id=interaction.user.id),
-                discord.Object(id=int(robber_id)),
-            ]
-        )
-        debt_note = ""
-        if debt_from_shortfall > 0:
-            debt_note = f"\n（搶匪當場僅能支付 `{pay:,}`，差額 **`{debt_from_shortfall:,}`** 已併入其假釋債務 `/bail`）"
-        prison_note = ""
-        if robber_imprisoned:
-            prison_note = f"\n<@{robber_id}> **餘額歸零**，已**入獄**（`/bail` 假釋：`{BAIL_COST:,}` + 累計欠款）。"
-        return await interaction_send(
-            interaction,
-            f"{interaction.user.mention} **加倍搶回成功！**（本次成功率約 {pct}%）\n"
-            f"你已拿回 **`{transferred:,}`** 東雲幣（加倍目標 **`{doubled:,}`**）。\n"
-            f"<@{robber_id}>（`{discord.utils.escape_markdown(rn)}`）被扣 **`{pay:,}`** 東雲幣。{debt_note}{prison_note}",
-            ephemeral=False,
-            allowed_mentions=_am_success,
-        )
-    _am_shout = discord.AllowedMentions(users=[discord.Object(id=interaction.user.id)])
-    return await interaction_send(
-        interaction,
-        f"{interaction.user.mention} ❌ **加倍搶回失敗**（本次成功機率約 {pct}%；反制專用基礎成功率公式：基礎 {int(round(COUNTER_ROB_BASE_SUCCESS_RATE * 100))}%，每級差 ±1%）。"
-        f"你的**唯一機會**已用盡。",
-        ephemeral=False,
-        allowed_mentions=_am_shout,
+    return await interaction.response.send_message(
+        "ℹ️ 平民反制已改為被搶成功後**自動觸發**，不需手動使用 `/counter_rob`。",
+        ephemeral=True,
     )
 
 
