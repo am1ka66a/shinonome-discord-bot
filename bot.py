@@ -1840,7 +1840,7 @@ _event_tasks = register_events(
         "relay_user_message_to_staff_channel": relay_user_message_to_staff_channel,
         "process_on_message_activity_sync": process_on_message_activity_sync,
         "process_level_ups": process_level_ups,
-        "cleanup_local_caches": cleanup_local_caches,
+        "cleanup_local_caches": (lambda: cleanup_local_caches()),
         "DM_RELAY_CHANNEL_ID": DM_RELAY_CHANNEL_ID,
         "DELETE_LOG_CHANNEL_ID": DELETE_LOG_CHANNEL_ID,
         "MSG_DB_FLUSH_EVERY_SECONDS": MSG_DB_FLUSH_EVERY_SECONDS,
