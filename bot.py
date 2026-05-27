@@ -121,6 +121,9 @@ def setup_bot_logging() -> logging.Logger:
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    # Railway/容器常為 UTC，統一以台灣時間（UTC+8）輸出日誌時間，避免誤判。
+    _log_tz = datetime.timezone(datetime.timedelta(hours=8))
+    fmt.converter = lambda ts: datetime.datetime.fromtimestamp(ts, _log_tz).timetuple()
     ch = logging.StreamHandler()
     ch.setLevel(level)
     ch.setFormatter(fmt)
