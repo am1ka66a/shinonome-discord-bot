@@ -170,6 +170,8 @@ ROB_VICTIM_PROTECT_SECONDS = config.ROB_VICTIM_PROTECT_SECONDS
 ROB_BASE_SUCCESS_RATE = config.ROB_BASE_SUCCESS_RATE
 # 平民 `/counter_rob` 加倍搶回專用基礎機率（與 `/rob` 分開）。
 COUNTER_ROB_BASE_SUCCESS_RATE = config.COUNTER_ROB_BASE_SUCCESS_RATE
+ROB_STEAL_CAP = config.ROB_STEAL_CAP
+ROB_FAIL_PENALTY_CAP = config.ROB_FAIL_PENALTY_CAP
 # 賭場回收分潤：僅在「實際回收」時切割，不在下注當下抽成
 CASINO_RECOVERY_SHARE_ENABLED = config.CASINO_RECOVERY_SHARE_ENABLED
 CASINO_RECOVERY_SHARE_TARGET_ID = config.CASINO_RECOVERY_SHARE_TARGET_ID
@@ -767,6 +769,7 @@ def apply_rob_success_db(
         log_transaction_in_tx,
         COUNTER_ROB_BASE_SUCCESS_RATE,
         BAIL_COST,
+        ROB_STEAL_CAP,
         COP_HUNT_CAPTURE_BASE_PCT,
         COP_HUNT_CAPTURE_PER_STAR_PCT,
         robber_id,
@@ -784,6 +787,7 @@ def apply_rob_fail_db(
     return rob_repo.apply_rob_fail_db(
         get_db_connection,
         lock_user_rows,
+        ROB_FAIL_PENALTY_CAP,
         robber_id,
         target_id,
         now,

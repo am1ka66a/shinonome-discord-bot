@@ -105,6 +105,7 @@ def apply_rob_success_db(
     log_transaction_in_tx,
     counter_rob_base_success_rate: float,
     bail_cost: int,
+    rob_steal_cap: int,
     cop_hunt_capture_base_pct: int,
     cop_hunt_capture_per_star_pct: int,
     robber_id: int,
@@ -119,7 +120,7 @@ def apply_rob_success_db(
     trow = c.fetchone()
     target_balance_snapshot = int((trow[0] if trow else 0) or 0)
     c.execute("UPDATE users SET last_rob=%s WHERE user_id=%s", (now, str(robber_id)))
-    steal_amount = int(max(1, min(target_balance_snapshot * random.uniform(0.10, 0.25), 1_000_000)))
+    steal_amount = int(max(1, min(target_balance_snapshot * random.uniform(0.10, 0.25), int(rob_steal_cap))))
     c.execute(
         "UPDATE users SET balance=balance-%s WHERE user_id=%s AND balance >= %s",
         (steal_amount, str(target_id), steal_amount),
@@ -251,7 +252,14 @@ def apply_rob_success_db(
     }
 
 
-def apply_rob_fail_db(get_db_connection, lock_user_rows, robber_id: int, target_id: int, now) -> typing.Dict[str, typing.Any]:
+def apply_rob_fail_db(
+    get_db_connection,
+    lock_user_rows,
+    rob_fail_penalty_cap: int,
+    robber_id: int,
+    target_id: int,
+    now,
+) -> typing.Dict[str, typing.Any]:
     conn = get_db_connection()
     c = conn.cursor()
     lock_user_rows(c, [robber_id, target_id])
@@ -259,7 +267,7 @@ def apply_rob_fail_db(get_db_connection, lock_user_rows, robber_id: int, target_
     rrow = c.fetchone()
     robber_balance_snapshot = int((rrow[0] if rrow else 0) or 0)
     c.execute("UPDATE users SET last_rob=%s WHERE user_id=%s", (now, str(robber_id)))
-    fail_penalty = int(max(1, min(robber_balance_snapshot * random.uniform(0.15, 0.45), 1_000_000)))
+    fail_penalty = int(max(1, min(robber_balance_snapshot * random.uniform(0.15, 0.45), int(rob_fail_penalty_cap))))
     deducted = False
     if fail_penalty > 0:
         c.execute(
