@@ -16,15 +16,38 @@ import re
 import sys
 import time
 import typing
-from urllib.parse import urlparse
 
 import discord
-import pymysql
-import threading
-from dbutils.pooled_db import PooledDB
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
+from bot_modules import config
+from bot_modules.admin_commands import register_admin_commands
+from bot_modules.db import (
+    get_db_connection,
+    init_db,
+    log_casino_transaction,
+    log_transaction,
+)
+from bot_modules.user_repo import (
+    ensure_user_exists,
+    fetch_casino_share_stats_rows,
+    fetch_casino_stats_rows,
+    fetch_record_rows,
+    get_user_stats,
+    is_blacklisted,
+)
+from bot_modules.tx_ops import (
+    get_locked_user_balance,
+    lock_user_rows,
+    log_transaction_in_tx,
+)
+from bot_modules import rob_repo
+from bot_modules import economy_repo
+from bot_modules import wanted_repo
+from bot_modules import game_repo
+from bot_modules.runtime import register_events
+from bot_modules.commands import register_duel_commands, register_blackjack_commands
 
 load_dotenv()
 
@@ -37,16 +60,45 @@ for _stream in (sys.stdout, sys.stderr):
             pass
 
 # ------------------------------------------------------------------------------
-# bot.py 大區索引（細節仍見各段「【數字】」標題）
+# bot.py 索引（2026-05 重構後）
 #
-#   [A · 基礎]           【一】匯入 【二】日誌 【三】常數／靜態資料／轉接表
-#   [B · Discord 工具]   【四】Logging Handler 【五】等級里程碑 【六】Slash 共用工具
-#   [C · 資料與持久化]   【七】MySQL／連線池／init_db／使用者資料存取
-#   [D · 二十一點與 UI]  【八】牌組與結算 【九】Modal／View／按鈕／翻頁
-#   [E · Bot 與轉接]     【十】Intents／Bot 【十一】私訊與頻道 Relay
-#   [F · 事件迴圈]       【十二】on_ready／語音獎勵／logs 清理／聊天／刪除訊息紀錄
-#   [G · 玩家 Slash]     【十三】經濟與一般
-#   [H · 主機與進入點]   【十五】/give 等與 bot.run
+# 【核心定位】
+# - bot.py 目前是「組裝與註冊入口」：保留全域狀態、共用工具、主要玩家指令與啟動流程
+# - 高複雜度模組已抽離到 bot_modules 子資料夾
+#
+# 【A】基礎與全域
+# - 【一】匯入套件
+# - 【二】日誌系統
+# - 【三】常數／執行期狀態／轉接對照
+#
+# 【B】共用工具與資料操作
+# - 【四】Discord 日誌轉發 Handler
+# - 【五】等級里程碑通知
+# - 【六】Slash 共用解析與互動回覆工具
+# - 【七】Repo 包裝與交易輔助（透過 bot_modules）
+#
+# 【C】Bot 核心與 Relay
+# - 【十】Bot intents / setup_hook / bot 實例
+# - 【十一】私訊與群組 @ 的轉接流程
+#
+# 【D】互動 UI（保留）
+# - 【八】本檔保留的共用互動 View（如紅包、翻頁）
+# - Blackjack / Duel 已抽到：
+#   - bot_modules/commands/blackjack.py
+#   - bot_modules/commands/duel.py
+#
+# 【E】事件模組（抽離）
+# - 【十二】on_message / on_message_delete / vc 獎勵 / logs retention
+# - 實作位置：bot_modules/runtime/events.py
+# - 本檔只做 register 與 task 啟動
+#
+# 【F】玩家指令與管理註冊
+# - 【十三】經濟、警匪、排行榜等玩家 Slash（本檔）
+# - 管理指令註冊：bot_modules/admin_commands.py
+# - 遊戲指令註冊：bot_modules/commands/*
+#
+# 【G】進入點
+# - 【十五】集中註冊（admin/events/blackjack/duel）後 bot.run
 # ------------------------------------------------------------------------------
 
 # ==============================================================================
@@ -96,43 +148,30 @@ logger = setup_bot_logging()
 # 含：管理員 ID、賭場／等級／搶紅包、訊息與 EXP 冷卻、
 # 私訊轉接頻道與「轉發訊息 ID -> 原訊中繼」表格、Minecraft 死法／物品詞庫（JSON）。
 # ==============================================================================
-ALLOWED_HOST_IDS = [
-    531308526262550528,
-    600177596088582185,
-    1027248561177509919,
-    1309551323682701444,
-]  # ⚠️ 填入你的 Discord ID
-SIDE_BET_RATIO = 0.5                     # 側注上限 (主注的 50%)
+ALLOWED_HOST_IDS = config.ALLOWED_HOST_IDS
+SIDE_BET_RATIO = config.SIDE_BET_RATIO
 IS_EVENT_ACTIVE = True                   # 賭場狀態
-MAX_LEVEL = 100
+MAX_LEVEL = config.MAX_LEVEL
 # Discord 單則訊息字元上限（與 API 一致）
-DISCORD_MESSAGE_CAP = 2000
-EXP_COOLDOWN_SECONDS = 45
+DISCORD_MESSAGE_CAP = config.DISCORD_MESSAGE_CAP
+EXP_COOLDOWN_SECONDS = config.EXP_COOLDOWN_SECONDS
 # 發話經驗 = random(12,20) × 此倍數（冷卻不變）
-CHAT_EXP_MULTIPLIER = 3
+CHAT_EXP_MULTIPLIER = config.CHAT_EXP_MULTIPLIER
 # 每完成一局 21 點結算時加發的隨機 EXP（見 roll_gamble_exp_from_bet）
-GAMBLE_EXP_MIN = 12
-GAMBLE_EXP_MAX = 38
-RED_PACKET_MIN_SECONDS = 10
-ROB_COOLDOWN_SECONDS = 60
-ROB_VICTIM_PROTECT_SECONDS = 3600
+GAMBLE_EXP_MIN = config.GAMBLE_EXP_MIN
+GAMBLE_EXP_MAX = config.GAMBLE_EXP_MAX
+RED_PACKET_MIN_SECONDS = config.RED_PACKET_MIN_SECONDS
+ROB_COOLDOWN_SECONDS = config.ROB_COOLDOWN_SECONDS
+ROB_VICTIM_PROTECT_SECONDS = config.ROB_VICTIM_PROTECT_SECONDS
 # /rob 專用：基礎成功率；每 1 級差距 ±1%，再 clamp 至 5%～95%
-ROB_BASE_SUCCESS_RATE = 0.60
+ROB_BASE_SUCCESS_RATE = config.ROB_BASE_SUCCESS_RATE
 # 平民 `/counter_rob` 加倍搶回專用基礎機率（與 `/rob` 分開）。
-COUNTER_ROB_BASE_SUCCESS_RATE = 0.30
+COUNTER_ROB_BASE_SUCCESS_RATE = config.COUNTER_ROB_BASE_SUCCESS_RATE
 # 賭場回收分潤：僅在「實際回收」時切割，不在下注當下抽成
-CASINO_RECOVERY_SHARE_ENABLED = str(os.getenv("CASINO_RECOVERY_SHARE_ENABLED", "true")).strip().lower() in {
-    "1", "true", "yes", "on"
-}
-CASINO_RECOVERY_SHARE_TARGET_ID = str(
-    os.getenv("CASINO_RECOVERY_SHARE_TARGET_ID", "531308526262550528")
-).strip()
-try:
-    CASINO_RECOVERY_SHARE_RATE = float(os.getenv("CASINO_RECOVERY_SHARE_RATE", "0.10"))
-except Exception:
-    CASINO_RECOVERY_SHARE_RATE = 0.10
-CASINO_RECOVERY_SHARE_RATE = max(0.0, min(1.0, CASINO_RECOVERY_SHARE_RATE))
-CASINO_RECOVERY_SHARE_REASON_PREFIX = "賭場回收分潤"
+CASINO_RECOVERY_SHARE_ENABLED = config.CASINO_RECOVERY_SHARE_ENABLED
+CASINO_RECOVERY_SHARE_TARGET_ID = config.CASINO_RECOVERY_SHARE_TARGET_ID
+CASINO_RECOVERY_SHARE_RATE = config.CASINO_RECOVERY_SHARE_RATE
+CASINO_RECOVERY_SHARE_REASON_PREFIX = config.CASINO_RECOVERY_SHARE_REASON_PREFIX
 # 可線上切換的功能開關（不需重啟）
 FEATURE_TOGGLES: typing.Dict[str, bool] = {
     "rob": True,
@@ -140,77 +179,28 @@ FEATURE_TOGGLES: typing.Dict[str, bool] = {
     "duel": True,
     "redpacket": True,
 }
-BICYCLE_COOLDOWN_SECONDS = 10 * 60
+BICYCLE_COOLDOWN_SECONDS = config.BICYCLE_COOLDOWN_SECONDS
 red_packet_seq = 0
-MSG_DB_FLUSH_EVERY_SECONDS = 8
-MSG_DB_FLUSH_COUNT = 3
+MSG_DB_FLUSH_EVERY_SECONDS = config.MSG_DB_FLUSH_EVERY_SECONDS
+MSG_DB_FLUSH_COUNT = config.MSG_DB_FLUSH_COUNT
 # logs 流水表：只保留最近 N 天，排程定期刪除更早資料（與 MySQL session 時區一致）
-LOG_RETENTION_DAYS = int(os.getenv("LOG_RETENTION_DAYS", "14"))
-LOG_PURGE_INTERVAL_SECONDS = int(os.getenv("LOG_PURGE_INTERVAL_SECONDS", str(24 * 3600)))
+LOG_RETENTION_DAYS = config.LOG_RETENTION_DAYS
+LOG_PURGE_INTERVAL_SECONDS = config.LOG_PURGE_INTERVAL_SECONDS
 # 台灣時間 (UTC+8)；與 get_db_connection 的 MySQL session time_zone 一致
-TW_TZ = datetime.timezone(datetime.timedelta(hours=8))
+TW_TZ = config.TW_TZ
 
 # 新用戶預設起始金（ensure_user_exists 預設）
-DEFAULT_STARTUP_BALANCE = 50_000
-REASON_USER_INITIAL_BALANCE = "帳號建立初始資金"
+DEFAULT_STARTUP_BALANCE = config.DEFAULT_STARTUP_BALANCE
+REASON_USER_INITIAL_BALANCE = config.REASON_USER_INITIAL_BALANCE
 
 
 def now_tw_naive() -> datetime.datetime:
     """目前台灣本地時間（naive datetime）。"""
-    return datetime.datetime.now(TW_TZ).replace(tzinfo=None)
+    return config.now_tw_naive()
 
 
-MINECRAFT_DEATH_MESSAGES_PATH = os.path.join(
-    os.path.dirname(__file__),
-    "data",
-    "minecraft_death_messages_zh_tw.json",
-)
-MINECRAFT_ITEMS_PATH = os.path.join(
-    os.path.dirname(__file__),
-    "data",
-    "minecraft_items_zh_tw.json",
-)
-DEFAULT_MINECRAFT_DEATH_MESSAGES = [
-    "{target} 死了",
-    "{target} 在嘗試與地形理論辯論時失敗了",
-    "{target} 以為自己能扛住這一下",
-]
-
-def load_minecraft_death_messages() -> typing.List[str]:
-    try:
-        with open(MINECRAFT_DEATH_MESSAGES_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        msgs = data.get("messages") if isinstance(data, dict) else None
-        if not isinstance(msgs, list):
-            return DEFAULT_MINECRAFT_DEATH_MESSAGES[:]
-        cleaned = [str(x).strip() for x in msgs if isinstance(x, str) and x.strip()]
-        return cleaned if cleaned else DEFAULT_MINECRAFT_DEATH_MESSAGES[:]
-    except Exception as e:
-        print(f"⚠️ 載入 Minecraft 死法 JSON 失敗: {e}")
-        return DEFAULT_MINECRAFT_DEATH_MESSAGES[:]
-
-MINECRAFT_DEATH_MESSAGES = load_minecraft_death_messages()
-DEFAULT_MINECRAFT_ITEMS = [
-    "鑽石劍", "下界合金劍", "弓", "弩", "三叉戟", "鐵斧", "鑽石斧", "終界水晶",
-    "TNT 炸藥", "火焰彈", "烈焰棒", "不死圖騰", "附魔金蘋果", "終界珍珠", "地獄石",
-    "黑曜石", "床", "熔岩桶", "水桶", "鐵砧", "盾牌", "雪球", "雞蛋", "釣魚竿",
-    "鵝卵石", "鑽石鎬", "下界之星", "煙火火箭", "歌萊果", "苦力怕頭顱"
-]
-
-def load_minecraft_items() -> typing.List[str]:
-    try:
-        with open(MINECRAFT_ITEMS_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        items = data.get("items") if isinstance(data, dict) else None
-        if not isinstance(items, list):
-            return DEFAULT_MINECRAFT_ITEMS[:]
-        cleaned = [str(x).strip() for x in items if isinstance(x, str) and x.strip()]
-        return cleaned if cleaned else DEFAULT_MINECRAFT_ITEMS[:]
-    except Exception as e:
-        print(f"⚠️ 載入 Minecraft 物品 JSON 失敗: {e}")
-        return DEFAULT_MINECRAFT_ITEMS[:]
-
-MINECRAFT_ITEMS = load_minecraft_items()
+MINECRAFT_DEATH_MESSAGES = config.MINECRAFT_DEATH_MESSAGES
+MINECRAFT_ITEMS = config.MINECRAFT_ITEMS
 _pending_msg_counts: typing.Dict[str, int] = {}
 _last_msg_flush_ts: typing.Dict[str, float] = {}
 _last_exp_award_ts: typing.Dict[str, float] = {}
@@ -227,6 +217,24 @@ RelayForwardMeta = typing.Tuple[int, bool, int, int, int]
 _relay_forward_meta: typing.Dict[int, RelayForwardMeta] = {}
 
 _discord_log_handler_installed = False
+
+
+def get_is_event_active() -> bool:
+    return bool(IS_EVENT_ACTIVE)
+
+
+def set_is_event_active(value: bool) -> None:
+    global IS_EVENT_ACTIVE
+    IS_EVENT_ACTIVE = bool(value)
+
+
+def get_share_enabled() -> bool:
+    return bool(CASINO_RECOVERY_SHARE_ENABLED)
+
+
+def set_share_enabled(value: bool) -> None:
+    global CASINO_RECOVERY_SHARE_ENABLED
+    CASINO_RECOVERY_SHARE_ENABLED = bool(value)
 
 # ==============================================================================
 # 【四】Discord 頻道日誌轉發
@@ -465,10 +473,6 @@ async def db_to_thread(func: typing.Callable[..., typing.Any], *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
 
 
-async def ensure_user_exists_async(user_id, startup_balance=DEFAULT_STARTUP_BALANCE):
-    return await db_to_thread(ensure_user_exists, user_id, startup_balance)
-
-
 async def get_user_stats_async(user_id):
     return await db_to_thread(get_user_stats, user_id)
 
@@ -533,24 +537,22 @@ async def load_rob_context_async(robber_id, target_id):
     return await db_to_thread(load_rob_context, robber_id, target_id)
 
 
-async def apply_rob_success_db_async(robber_id, target_id, now, target_balance_snapshot, success_rate_pct):
+async def apply_rob_success_db_async(robber_id, target_id, now, success_rate_pct):
     return await db_to_thread(
         apply_rob_success_db,
         robber_id,
         target_id,
         now,
-        target_balance_snapshot,
         success_rate_pct,
     )
 
 
-async def apply_rob_fail_db_async(robber_id, target_id, now, robber_balance_snapshot):
+async def apply_rob_fail_db_async(robber_id, target_id, now):
     return await db_to_thread(
         apply_rob_fail_db,
         robber_id,
         target_id,
         now,
-        robber_balance_snapshot,
     )
 
 
@@ -567,15 +569,15 @@ async def toggle_good_citizen_sync_async(user_id, now):
 
 
 async def fetch_good_citizen_rows_sync_async():
-    return await db_to_thread(fetch_good_citizen_rows_sync)
+    return await get_good_citizen_rows_cached()
 
 
 async def fetch_wanted_status_row_sync_async(user_id):
-    return await db_to_thread(fetch_wanted_status_row_sync, user_id)
+    return await get_wanted_status_cached(user_id)
 
 
 async def fetch_wanted_list_rows_sync_async():
-    return await db_to_thread(fetch_wanted_list_rows_sync)
+    return await get_wanted_list_rows_cached()
 
 
 async def pay_bail_sync_async(user_id, now):
@@ -599,11 +601,35 @@ async def transfer_sync_async(sender_id, receiver_id, amount, note_text):
 
 
 async def fetch_balance_leaderboard_core_async(user_id):
-    return await db_to_thread(fetch_balance_leaderboard_core, user_id)
+    rows = await get_balance_leaderboard_rows_cached()
+    uid = str(user_id)
+    my_bal = 0
+    global_rank = len(rows) + 1
+    for idx, (rid, bal) in enumerate(rows):
+        if str(rid) == uid:
+            my_bal = int(bal or 0)
+            global_rank = idx + 1
+            break
+    pool = rows[:LEADERBOARD_POOL]
+    richer = [(r[0],) for r in rows[: max(0, min(global_rank - 1, LEADERBOARD_RANK_SCAN))]]
+    top10 = rows[:10]
+    return my_bal, pool, richer, top10, global_rank
 
 
 async def fetch_level_leaderboard_core_async(user_id):
-    return await db_to_thread(fetch_level_leaderboard_core, user_id)
+    rows = await get_level_leaderboard_rows_cached()
+    uid = str(user_id)
+    my_level, my_exp = 1, 0
+    global_rank = len(rows) + 1
+    for idx, (rid, lv, exp) in enumerate(rows):
+        if str(rid) == uid:
+            my_level, my_exp = int(lv or 1), int(exp or 0)
+            global_rank = idx + 1
+            break
+    pool = rows[:LEADERBOARD_POOL]
+    richer_lv = [(r[0],) for r in rows[: max(0, min(global_rank - 1, LEADERBOARD_RANK_SCAN))]]
+    top10 = rows[:10]
+    return my_level, my_exp, pool, richer_lv, top10, global_rank
 
 
 # ··············································································
@@ -616,371 +642,6 @@ async def fetch_level_leaderboard_core_async(user_id):
 # 里程碑領獎、時薪銀行；排行榜取樣輔助等。
 # （二十一點「牌面」介面邏輯在【八】【九】）
 # ==============================================================================
-
-_mysql_pool: typing.Optional[PooledDB] = None
-_mysql_pool_lock = threading.Lock()
-
-
-def _mysql_connect_kwargs() -> dict:
-    """供連線池建立時傳入 pymysql.connect 的參數。"""
-    mysql_url = os.getenv("MYSQL_URL") or os.getenv("DATABASE_URL")
-    if mysql_url:
-        parsed = urlparse(mysql_url)
-        if parsed.scheme.startswith("mysql"):
-            return {
-                "host": parsed.hostname,
-                "port": parsed.port or 3306,
-                "user": parsed.username,
-                "password": parsed.password,
-                "database": (parsed.path or "/").lstrip("/"),
-                "charset": "utf8mb4",
-                "init_command": "SET time_zone = '+08:00'",
-            }
-    return {
-        "host": os.getenv("MYSQLHOST") or os.getenv("DB_HOST"),
-        "port": int(os.getenv("MYSQLPORT") or os.getenv("DB_PORT", 3306)),
-        "user": os.getenv("MYSQLUSER") or os.getenv("DB_USER"),
-        "password": os.getenv("MYSQLPASSWORD") or os.getenv("DB_PASS"),
-        "database": os.getenv("MYSQLDATABASE") or os.getenv("DB_NAME"),
-        "charset": "utf8mb4",
-        "init_command": "SET time_zone = '+08:00'",
-    }
-
-
-def _get_mysql_pool() -> PooledDB:
-    global _mysql_pool
-    if _mysql_pool is None:
-        with _mysql_pool_lock:
-            if _mysql_pool is None:
-                kw = _mysql_connect_kwargs()
-                _mysql_pool = PooledDB(
-                    creator=pymysql,
-                    mincached=int(os.getenv("MYSQL_POOL_MINCACHED", "1")),
-                    maxcached=int(os.getenv("MYSQL_POOL_MAXCACHED", "8")),
-                    maxconnections=int(os.getenv("MYSQL_POOL_MAX", "16")),
-                    blocking=True,
-                    ping=1,
-                    **kw,
-                )
-    return _mysql_pool
-
-
-def get_db_connection():
-    """從連線池取得連線；用完請 commit／rollback 並 close（會歸還池中）。"""
-    return _get_mysql_pool().connection()
-
-
-def init_db():
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS users 
-                 (user_id VARCHAR(255) PRIMARY KEY, balance BIGINT, rescue_count INT DEFAULT 0,
-                  total_games INT DEFAULT 0, wins INT DEFAULT 0, total_profit BIGINT DEFAULT 0,
-                  last_work TIMESTAMP NULL, last_beg TIMESTAMP NULL, last_rescue TIMESTAMP NULL, last_rob TIMESTAMP NULL, last_robbed TIMESTAMP NULL,
-                  exp BIGINT DEFAULT 0, level INT DEFAULT 1,
-                  last_hourly_claim TIMESTAMP NULL, hourly_bank INT DEFAULT 0,
-                  good_citizen_cert_active TINYINT(1) DEFAULT 0, last_good_citizen_cert_action TIMESTAMP NULL,
-                  good_citizen_cert_broken_until TIMESTAMP NULL)''')
-    # 確保現有表也有新欄位 (Migration)
-    try: c.execute("ALTER TABLE users ADD COLUMN last_work TIMESTAMP NULL")
-    except: pass
-    try: c.execute("ALTER TABLE users ADD COLUMN last_beg TIMESTAMP NULL")
-    except: pass
-    try: c.execute("ALTER TABLE users ADD COLUMN last_rescue TIMESTAMP NULL")
-    except: pass
-    try: c.execute("ALTER TABLE users ADD COLUMN last_rob TIMESTAMP NULL")
-    except: pass
-    try: c.execute("ALTER TABLE users ADD COLUMN last_robbed TIMESTAMP NULL")
-    except: pass
-    try: c.execute("ALTER TABLE users ADD COLUMN exp BIGINT DEFAULT 0")
-    except: pass
-    try: c.execute("ALTER TABLE users ADD COLUMN level INT DEFAULT 1")
-    except: pass
-    try: c.execute("ALTER TABLE users ADD COLUMN last_hourly_claim TIMESTAMP NULL")
-    except: pass
-    try: c.execute("ALTER TABLE users ADD COLUMN hourly_bank INT DEFAULT 0")
-    except: pass
-    # 警察／搶匪／通緝／監獄
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN role VARCHAR(20) DEFAULT 'civilian'")
-    except Exception:
-        pass
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN wanted_stars INT DEFAULT 0")
-    except Exception:
-        pass
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN wanted_hunted_count INT DEFAULT 0")
-    except Exception:
-        pass
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN last_five_robs TEXT NULL")
-    except Exception:
-        pass
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN in_prison TINYINT(1) DEFAULT 0")
-    except Exception:
-        pass
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN prison_start TIMESTAMP NULL")
-    except Exception:
-        pass
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN arrest_count INT DEFAULT 0")
-    except Exception:
-        pass
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN revenge_pending TINYINT(1) DEFAULT 0")
-    except Exception:
-        pass
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN revenge_robber_id VARCHAR(255) NULL")
-    except Exception:
-        pass
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN revenge_amount BIGINT DEFAULT 0")
-    except Exception:
-        pass
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN last_wanted_buyout TIMESTAMP NULL")
-    except Exception:
-        pass
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN last_bicycle TIMESTAMP NULL")
-    except Exception:
-        pass
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN last_role_change TIMESTAMP NULL")
-    except Exception:
-        pass
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN bail_debt BIGINT DEFAULT 0")
-    except Exception:
-        pass
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN good_citizen_cert_active TINYINT(1) DEFAULT 0")
-    except Exception:
-        pass
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN last_good_citizen_cert_action TIMESTAMP NULL")
-    except Exception:
-        pass
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN good_citizen_cert_broken_until TIMESTAMP NULL")
-    except Exception:
-        pass
-
-    c.execute(
-        """CREATE TABLE IF NOT EXISTS wanted_log (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        criminal_id VARCHAR(255) NOT NULL,
-        cop_id VARCHAR(255) NOT NULL,
-        wanted_stars INT NOT NULL,
-        caught TINYINT(1) DEFAULT 0,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )"""
-    )
-    c.execute(
-        """CREATE TABLE IF NOT EXISTS prison_records (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        criminal_id VARCHAR(255) NOT NULL,
-        cop_id VARCHAR(255) NOT NULL,
-        wanted_stars INT NOT NULL,
-        confiscated_amount BIGINT NOT NULL,
-        cop_reward BIGINT NOT NULL,
-        bail_cost BIGINT DEFAULT 100000,
-        arrested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        released_at TIMESTAMP NULL
-        )"""
-    )
-
-    c.execute('''CREATE TABLE IF NOT EXISTS activity_stats 
-                 (user_id VARCHAR(255) PRIMARY KEY, msg_count INT DEFAULT 0, 
-                  last_msg_reward TIMESTAMP NULL, last_vc_reward TIMESTAMP NULL,
-                  last_exp_reward TIMESTAMP NULL)''')
-    try: c.execute("ALTER TABLE activity_stats ADD COLUMN last_exp_reward TIMESTAMP NULL")
-    except: pass
-
-    c.execute('''CREATE TABLE IF NOT EXISTS blacklist (user_id VARCHAR(255) PRIMARY KEY)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS daily_claims (user_id VARCHAR(255) PRIMARY KEY, last_claim DATE)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS logs (id INT AUTO_INCREMENT PRIMARY KEY, user_id VARCHAR(255), amount BIGINT, reason VARCHAR(255), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
-    try: c.execute("CREATE INDEX idx_logs_user_created ON logs (user_id, created_at)")
-    except: pass
-    # 經濟總帳鏡像（對應 logs 每一筆；不受 logs_retention_task 清理）
-    c.execute(
-        '''CREATE TABLE IF NOT EXISTS casino_logs (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            user_id VARCHAR(255),
-            amount BIGINT,
-            reason VARCHAR(255),
-            source_log_id INT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )'''
-    )
-    try:
-        c.execute("ALTER TABLE casino_logs ADD COLUMN source_log_id INT NULL")
-    except Exception:
-        pass
-    try: c.execute("CREATE UNIQUE INDEX uq_casino_logs_source_log_id ON casino_logs (source_log_id)")
-    except Exception:
-        pass
-    try: c.execute("CREATE INDEX idx_casino_logs_user_created ON casino_logs (user_id, created_at)")
-    except Exception:
-        pass
-    # 一次性／增量對齊：以 logs.id 去重，將既有流水完整鏡像到 casino_logs（全期總金流）
-    try:
-        c.execute("SELECT COUNT(*) FROM casino_logs WHERE source_log_id IS NOT NULL")
-        _mapped_row = c.fetchone()
-        _mapped_cnt = int((_mapped_row[0] if _mapped_row else 0) or 0)
-        if _mapped_cnt == 0:
-            c.execute("SELECT COUNT(*) FROM casino_logs")
-            _cl_any_row = c.fetchone()
-            _cl_any_cnt = int((_cl_any_row[0] if _cl_any_row else 0) or 0)
-            if _cl_any_cnt > 0:
-                try:
-                    c.execute("TRUNCATE TABLE casino_logs")
-                except Exception:
-                    c.execute("DELETE FROM casino_logs")
-            c.execute(
-                "INSERT INTO casino_logs (user_id, amount, reason, source_log_id, created_at) "
-                "SELECT user_id, amount, reason, id, created_at FROM logs"
-            )
-        else:
-            c.execute(
-                "INSERT INTO casino_logs (user_id, amount, reason, source_log_id, created_at) "
-                "SELECT l.user_id, l.amount, l.reason, l.id, l.created_at FROM logs l "
-                "LEFT JOIN casino_logs c ON c.source_log_id = l.id "
-                "WHERE c.source_log_id IS NULL"
-            )
-    except Exception:
-        pass
-    try: c.execute("CREATE INDEX idx_users_level_exp ON users (level, exp)")
-    except: pass
-    c.execute('''CREATE TABLE IF NOT EXISTS level_milestone_claims (
-                 user_id VARCHAR(255) NOT NULL,
-                 milestone INT NOT NULL,
-                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                 PRIMARY KEY (user_id, milestone)
-                 )''')
-    # 清除舊版里程碑（10/25/50），改為 20/40/60/80/100 後不再使用
-    try:
-        c.execute("DELETE FROM level_milestone_claims WHERE milestone IN (10, 25, 50)")
-    except Exception:
-        pass
-    conn.commit()
-    conn.close()
-
-def log_transaction(user_id, amount, reason):
-    if amount == 0:
-        return
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO logs (user_id, amount, reason) VALUES (%s, %s, %s)",
-        (str(user_id), amount, reason),
-    )
-    new_log_id = c.lastrowid
-    c.execute(
-        "INSERT INTO casino_logs (user_id, amount, reason, source_log_id) VALUES (%s, %s, %s, %s)",
-        (str(user_id), amount, reason, new_log_id),
-    )
-    conn.commit()
-    conn.close()
-
-
-def log_casino_transaction(user_id, amount, reason, source_log_id=None, created_at=None):
-    """logs 鏡像列（給 /casino_stats 全期總金流；不受一般 logs 清理影響）。"""
-    if amount == 0:
-        return
-    conn = get_db_connection()
-    c = conn.cursor()
-    if created_at is not None:
-        c.execute(
-            "INSERT INTO casino_logs (user_id, amount, reason, source_log_id, created_at) VALUES (%s, %s, %s, %s, %s)",
-            (str(user_id), amount, reason, source_log_id, created_at),
-        )
-    else:
-        c.execute(
-            "INSERT INTO casino_logs (user_id, amount, reason, source_log_id) VALUES (%s, %s, %s, %s)",
-            (str(user_id), amount, reason, source_log_id),
-        )
-    conn.commit()
-    conn.close()
-
-def is_blacklisted(user_id):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT 1 FROM blacklist WHERE user_id=%s", (str(user_id),))
-    res = c.fetchone()
-    conn.close()
-    return res is not None
-
-def get_user_stats(user_id):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT balance, total_games, wins, total_profit FROM users WHERE user_id=%s", (str(user_id),))
-    res = c.fetchone()
-    conn.close()
-    return res
-
-
-def fetch_record_rows(user_id, limit: int = 50):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute(
-        "SELECT amount, reason, created_at FROM logs WHERE user_id=%s ORDER BY created_at DESC LIMIT %s",
-        (str(user_id), int(limit)),
-    )
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-
-def fetch_casino_stats_rows():
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT COALESCE(SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END), 0) FROM casino_logs")
-    issued_row = c.fetchone()
-    c.execute("SELECT COALESCE(SUM(CASE WHEN amount < 0 THEN -amount ELSE 0 END), 0) FROM casino_logs")
-    recovered_row = c.fetchone()
-    c.execute("SELECT COALESCE(SUM(balance), 0) FROM users")
-    circulation_row = c.fetchone()
-    conn.close()
-    return (
-        int((issued_row[0] if issued_row else 0) or 0),
-        int((recovered_row[0] if recovered_row else 0) or 0),
-        int((circulation_row[0] if circulation_row else 0) or 0),
-    )
-
-
-def fetch_casino_share_stats_rows(days: int = 7):
-    days = max(1, int(days))
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute(
-        "SELECT COALESCE(SUM(amount), 0) FROM logs "
-        "WHERE user_id=%s AND amount > 0 AND reason LIKE %s",
-        (CASINO_RECOVERY_SHARE_TARGET_ID, f"{CASINO_RECOVERY_SHARE_REASON_PREFIX}%"),
-    )
-    total_row = c.fetchone()
-    c.execute(
-        "SELECT COALESCE(SUM(amount), 0) FROM logs "
-        "WHERE user_id=%s AND amount > 0 AND reason LIKE %s "
-        "AND created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)",
-        (CASINO_RECOVERY_SHARE_TARGET_ID, f"{CASINO_RECOVERY_SHARE_REASON_PREFIX}%", days),
-    )
-    recent_row = c.fetchone()
-    c.execute(
-        "SELECT reason, COALESCE(SUM(amount), 0) AS s FROM logs "
-        "WHERE user_id=%s AND amount > 0 AND reason LIKE %s "
-        "GROUP BY reason ORDER BY s DESC LIMIT 10",
-        (CASINO_RECOVERY_SHARE_TARGET_ID, f"{CASINO_RECOVERY_SHARE_REASON_PREFIX}%"),
-    )
-    by_reason_rows = c.fetchall()
-    conn.close()
-    total = int((total_row[0] if total_row else 0) or 0)
-    recent = int((recent_row[0] if recent_row else 0) or 0)
-    return total, recent, by_reason_rows
 
 
 def apply_casino_recovery_share(recovered_amount: int, source: str) -> int:
@@ -1007,22 +668,6 @@ def apply_casino_recovery_share(recovered_amount: int, source: str) -> int:
     )
     return share_amount
 
-def ensure_user_exists(user_id, startup_balance=DEFAULT_STARTUP_BALANCE):
-    uid = str(user_id)
-    bal = int(startup_balance)
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute(
-        "INSERT IGNORE INTO users (user_id, balance) VALUES (%s, %s)",
-        (uid, bal),
-    )
-    inserted = c.rowcount > 0
-    conn.commit()
-    conn.close()
-    if inserted and bal != 0:
-        log_transaction(uid, bal, REASON_USER_INITIAL_BALANCE)
-
-
 def _user_role_value(raw) -> str:
     """將 users.role 轉成與程式一致的鍵（cop/criminal/civilian），避免大小寫／空白／bytes 造成比對失敗。"""
     if raw is None:
@@ -1031,6 +676,12 @@ def _user_role_value(raw) -> str:
         raw = raw.decode("utf-8", "replace")
     s = str(raw).strip().lower()
     return s if s else "civilian"
+
+
+# DB 交易規範（重要）：
+# 1) 涉及金流/冷卻判斷時，先 lock_user_rows(...) 或 SELECT ... FOR UPDATE，再做判斷與更新。
+# 2) 同一筆交易中的資金變化，優先使用 log_transaction_in_tx(...) 同交易寫流水，避免資金與流水分離。
+# 3) 多人互動（轉帳、追捕、反搶等）一律固定順序上鎖，避免死鎖。
 
 
 def get_inflation_multiplier():
@@ -1070,236 +721,74 @@ GOOD_CITIZEN_BROKEN_LOCK_DAYS = 10
 
 
 def append_rob_history_on_cursor(c, user_id: int, steal_amount: int) -> None:
-    """在同一 DB cursor／交易中更新搶匪最近五次成功搶劫紀錄（JSON 陣列）。"""
-    uid_str = str(user_id)
-    c.execute("SELECT last_five_robs FROM users WHERE user_id=%s", (uid_str,))
-    row = c.fetchone()
-    history: typing.List[typing.Any] = []
-    raw = row[0] if row else None
-    if raw:
-        try:
-            parsed = json.loads(raw)
-            history = parsed if isinstance(parsed, list) else []
-        except Exception:
-            history = []
-    history.append(
-        {
-            "amount": int(steal_amount),
-            "time": now_tw_naive().strftime("%Y-%m-%d %H:%M:%S"),
-        }
-    )
-    history = history[-5:]
-    c.execute(
-        "UPDATE users SET last_five_robs=%s WHERE user_id=%s",
-        (json.dumps(history, ensure_ascii=False), uid_str),
-    )
+    return rob_repo.append_rob_history_on_cursor(c, user_id, steal_amount, now_tw_naive)
 
 
 def get_last_five_robs_total(user_id: typing.Union[int, str]) -> typing.Tuple[int, int, typing.List[typing.Any]]:
-    """回傳 (五次內搶劫總額, 筆數, 明細列表)。"""
-    uid = str(user_id)
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT last_five_robs FROM users WHERE user_id=%s", (uid,))
-    row = c.fetchone()
-    conn.close()
-    if not row or not row[0]:
-        return 0, 0, []
-    try:
-        history = json.loads(row[0])
-    except Exception:
-        return 0, 0, []
-    if not isinstance(history, list):
-        return 0, 0, []
-    total = sum(int(item.get("amount", 0) or 0) for item in history if isinstance(item, dict))
-    return total, len(history), history
+    return rob_repo.get_last_five_robs_total(get_db_connection, user_id)
 
 
 def rob_history_total_from_raw(raw: typing.Any) -> typing.Tuple[int, int]:
-    if not raw:
-        return 0, 0
-    try:
-        history = json.loads(raw)
-    except Exception:
-        return 0, 0
-    if not isinstance(history, list):
-        return 0, 0
-    total = sum(int(item.get("amount", 0) or 0) for item in history if isinstance(item, dict))
-    return total, len(history)
+    return rob_repo.rob_history_total_from_raw(raw)
 
 
 def clear_rob_history(user_id: typing.Union[int, str]) -> None:
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("UPDATE users SET last_five_robs=NULL WHERE user_id=%s", (str(user_id),))
-    conn.commit()
-    conn.close()
+    return rob_repo.clear_rob_history(get_db_connection, user_id)
 
 
 def load_rob_context(robber_id: int, target_id: int) -> typing.Dict[str, typing.Any]:
-    """讀取 /rob 前置檢查所需資料。"""
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute(
-        "SELECT COALESCE(in_prison,0), COALESCE(role,'civilian'), balance, last_rob, level FROM users WHERE user_id=%s",
-        (str(robber_id),),
+    return rob_repo.load_rob_context(
+        get_db_connection,
+        lock_user_rows,
+        _user_role_value,
+        robber_id,
+        target_id,
     )
-    robber_row = c.fetchone() or (0, "civilian", 0, None, 1)
-    c.execute(
-        "SELECT balance, level, last_robbed, COALESCE(good_citizen_cert_active,0) FROM users WHERE user_id=%s",
-        (str(target_id),),
-    )
-    target_row = c.fetchone() or (0, 1, None, 0)
-    conn.close()
-    return {
-        "in_prison": int(robber_row[0] or 0),
-        "robber_role": _user_role_value(robber_row[1]),
-        "robber_balance": int(robber_row[2] or 0),
-        "last_rob": robber_row[3],
-        "robber_level": int(robber_row[4] or 1),
-        "target_balance": int(target_row[0] or 0),
-        "target_level": int(target_row[1] or 1),
-        "target_last_robbed": target_row[2],
-        "target_good_cert": int(target_row[3] or 0),
-    }
 
 
 def apply_rob_success_db(
     robber_id: int,
     target_id: int,
     now: datetime.datetime,
-    target_balance_snapshot: int,
     success_rate_pct: int,
 ) -> typing.Dict[str, typing.Any]:
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("UPDATE users SET last_rob=%s WHERE user_id=%s", (now, str(robber_id)))
-    steal_amount = int(max(1, min(target_balance_snapshot * random.uniform(0.10, 0.25), 1_000_000)))
-    c.execute(
-        "UPDATE users SET balance=balance-%s WHERE user_id=%s AND balance >= %s",
-        (steal_amount, str(target_id), steal_amount),
+    return rob_repo.apply_rob_success_db(
+        get_db_connection,
+        lock_user_rows,
+        now_tw_naive,
+        _user_role_value,
+        COP_HUNT_CAPTURE_BASE_PCT,
+        COP_HUNT_CAPTURE_PER_STAR_PCT,
+        robber_id,
+        target_id,
+        now,
+        success_rate_pct,
     )
-    if c.rowcount == 0:
-        conn.commit()
-        conn.close()
-        return {"ok": False, "reason": "target_hidden"}
-
-    c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (steal_amount, str(robber_id)))
-    c.execute("UPDATE users SET last_robbed=%s WHERE user_id=%s", (now, str(target_id)))
-    append_rob_history_on_cursor(c, robber_id, steal_amount)
-
-    wanted_info = ""
-    c.execute("SELECT COALESCE(wanted_stars,0) FROM users WHERE user_id=%s", (str(robber_id),))
-    _ws = c.fetchone()
-    current_wanted = int(_ws[0] or 0) if _ws else 0
-    if current_wanted < 5:
-        c.execute(
-            "UPDATE users SET wanted_stars=LEAST(5, COALESCE(wanted_stars,0)+1), wanted_hunted_count=0 WHERE user_id=%s",
-            (str(robber_id),),
-        )
-        c.execute("SELECT COALESCE(wanted_stars,0) FROM users WHERE user_id=%s", (str(robber_id),))
-        _nw = c.fetchone()
-        new_wanted = int(_nw[0] or 0) if _nw else 0
-        stars_display = "⭐" * new_wanted + "☆" * (5 - new_wanted)
-        if new_wanted == 5:
-            wanted_info = (
-                f"\n🔴 **達到最高通緝！** {stars_display}\n"
-                f"⚠️ 每次搶劫成功後警察可追捕一次。"
-            )
-        else:
-            cap = min(95, COP_HUNT_CAPTURE_BASE_PCT + new_wanted * COP_HUNT_CAPTURE_PER_STAR_PCT)
-            wanted_info = (
-                f"\n⚠️ **通緝等級提升** → {stars_display}（{new_wanted}/5）\n"
-                f"🚔 追捕成功率基準約：**{cap}%**（實際另受警匪等級差影響，每級 ±1%）"
-            )
-    else:
-        c.execute(
-            "UPDATE users SET wanted_hunted_count=0 WHERE user_id=%s",
-            (str(robber_id),),
-        )
-        _cap5 = min(95, COP_HUNT_CAPTURE_BASE_PCT + 5 * COP_HUNT_CAPTURE_PER_STAR_PCT)
-        wanted_info = (
-            f"\n🔴 **滿星通緝中** ⭐⭐⭐⭐⭐\n"
-            f"🚔 每次搶劫成功後警察可追捕一次（基準約 **`{_cap5}%`**，實際另受警匪等級差影響，每級 ±1%）。"
-        )
-
-    revenge_hint = ""
-    c.execute(
-        "SELECT COALESCE(role,'civilian') FROM users WHERE user_id=%s",
-        (str(target_id),),
-    )
-    vrole_row = c.fetchone()
-    victim_role = _user_role_value(vrole_row[0] if vrole_row else None)
-    if victim_role == "civilian":
-        c.execute(
-            "UPDATE users SET revenge_pending=1, revenge_robber_id=%s, revenge_amount=%s WHERE user_id=%s",
-            (str(robber_id), steal_amount, str(target_id)),
-        )
-        revenge_hint = (
-            f"\n\n💢 <@{target_id}> 身為**平民**被搶成功，獲得 **一次**機會：使用 `/counter_rob` "
-            f"可依每級差距 ±1% 公式（與搶劫相同結構，基礎成功率較低），嘗試從搶匪處**加倍搶回**（至多 `{(steal_amount * 2):,}` 幣，實際以搶匪餘額為準）。"
-        )
-
-    conn.commit()
-    conn.close()
-    return {
-        "ok": True,
-        "steal_amount": steal_amount,
-        "wanted_info": wanted_info,
-        "revenge_hint": revenge_hint,
-        "success_rate_pct": success_rate_pct,
-    }
 
 
 def apply_rob_fail_db(
     robber_id: int,
     target_id: int,
     now: datetime.datetime,
-    robber_balance_snapshot: int,
 ) -> typing.Dict[str, typing.Any]:
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("UPDATE users SET last_rob=%s WHERE user_id=%s", (now, str(robber_id)))
-    fail_penalty = int(max(1, min(robber_balance_snapshot * random.uniform(0.15, 0.45), 1_000_000)))
-    deducted = False
-    if fail_penalty > 0:
-        c.execute(
-            "UPDATE users SET balance=balance-%s WHERE user_id=%s AND balance >= %s",
-            (fail_penalty, str(robber_id), fail_penalty),
-        )
-        deducted = c.rowcount > 0
-        if deducted:
-            c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (fail_penalty, str(target_id)))
-    conn.commit()
-    conn.close()
-    return {"fail_penalty": fail_penalty, "deducted": deducted}
+    return rob_repo.apply_rob_fail_db(
+        get_db_connection,
+        lock_user_rows,
+        robber_id,
+        target_id,
+        now,
+    )
 
 
 def claim_beg_sync(user_id: int) -> typing.Dict[str, typing.Any]:
-    ensure_user_exists(user_id, 50000)
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT balance, last_beg FROM users WHERE user_id=%s", (str(user_id),))
-    row = c.fetchone()
-    now = now_tw_naive()
-    if row and row[1] and (now - row[1]).total_seconds() < 120:
-        conn.close()
-        remain = 120 - int((now - row[1]).total_seconds())
-        return {"ok": False, "reason": "cooldown", "remain_sec": max(1, remain)}
-    inflation_mult, _, _ = get_inflation_multiplier()
-    base_earn = random.randint(100, 600)
-    earn = max(50, int(base_earn * inflation_mult))
-    fail = random.random() < 0.3
-    if fail:
-        c.execute("UPDATE users SET last_beg=%s WHERE user_id=%s", (now, str(user_id)))
-        conn.commit()
-        conn.close()
-        return {"ok": True, "earned": 0, "fail": True}
-    c.execute("UPDATE users SET balance=balance+%s, last_beg=%s WHERE user_id=%s", (earn, now, str(user_id)))
-    conn.commit()
-    conn.close()
-    log_transaction(user_id, earn, "乞討所得")
-    return {"ok": True, "earned": earn, "fail": False}
+    return economy_repo.claim_beg_sync(
+        ensure_user_exists,
+        get_db_connection,
+        now_tw_naive,
+        get_inflation_multiplier,
+        log_transaction_in_tx,
+        user_id,
+    )
 
 
 def choose_role_sync(user_id: int, role: str, now: datetime.datetime) -> typing.Dict[str, typing.Any]:
@@ -1309,7 +798,7 @@ def choose_role_sync(user_id: int, role: str, now: datetime.datetime) -> typing.
     c.execute(
         """SELECT COALESCE(role,'civilian'), COALESCE(wanted_stars,0), last_role_change,
                   COALESCE(good_citizen_cert_active,0)
-           FROM users WHERE user_id=%s""",
+           FROM users WHERE user_id=%s FOR UPDATE""",
         (str(user_id),),
     )
     row = c.fetchone()
@@ -1353,7 +842,7 @@ def toggle_good_citizen_sync(user_id: int, now: datetime.datetime) -> typing.Dic
         """SELECT COALESCE(role,'civilian'), COALESCE(balance,0),
                   COALESCE(good_citizen_cert_active,0), last_good_citizen_cert_action,
                   good_citizen_cert_broken_until
-           FROM users WHERE user_id=%s""",
+           FROM users WHERE user_id=%s FOR UPDATE""",
         (uid,),
     )
     row = c.fetchone()
@@ -1380,6 +869,7 @@ def toggle_good_citizen_sync(user_id: int, now: datetime.datetime) -> typing.Dic
         conn.close()
         return {"ok": False, "reason": "insufficient", "balance": bal}
     next_active = 0 if cert_active else 1
+    reason = "啟用良民證（防搶）" if next_active else "解除良民證（取消防搶）"
     c.execute(
         """UPDATE users
            SET balance=balance-%s,
@@ -1391,227 +881,76 @@ def toggle_good_citizen_sync(user_id: int, now: datetime.datetime) -> typing.Dic
     if c.rowcount == 0:
         conn.close()
         return {"ok": False, "reason": "deduct_failed"}
+    log_transaction_in_tx(c, user_id, -GOOD_CITIZEN_CERT_COST, reason)
     conn.commit()
     conn.close()
-    reason = "啟用良民證（防搶）" if next_active else "解除良民證（取消防搶）"
-    log_transaction(user_id, -GOOD_CITIZEN_CERT_COST, reason)
     return {"ok": True, "next_active": next_active, "new_balance": bal - GOOD_CITIZEN_CERT_COST}
 
 
 def fetch_good_citizen_rows_sync() -> typing.List[typing.Tuple[typing.Any, typing.Any, typing.Any]]:
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute(
-        """SELECT user_id, COALESCE(balance,0), last_good_citizen_cert_action
-           FROM users
-           WHERE COALESCE(good_citizen_cert_active,0)=1
-           ORDER BY last_good_citizen_cert_action DESC, user_id ASC
-           LIMIT 100"""
-    )
-    rows = c.fetchall()
-    conn.close()
-    return rows
+    return wanted_repo.fetch_good_citizen_rows_sync(get_db_connection)
 
 
 def fetch_wanted_status_row_sync(user_id: int):
-    ensure_user_exists(user_id, 50000)
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute(
-        """SELECT COALESCE(role,'civilian'), COALESCE(wanted_stars,0), COALESCE(wanted_hunted_count,0),
-                  COALESCE(in_prison,0), last_five_robs, COALESCE(arrest_count,0),
-                  COALESCE(revenge_pending,0), COALESCE(revenge_amount,0), COALESCE(bail_debt,0),
-                  COALESCE(good_citizen_cert_active,0)
-           FROM users WHERE user_id=%s""",
-        (str(user_id),),
+    return wanted_repo.fetch_wanted_status_row_sync(
+        ensure_user_exists,
+        get_db_connection,
+        user_id,
     )
-    row = c.fetchone()
-    conn.close()
-    return row
 
 
 def fetch_wanted_list_rows_sync():
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute(
-        """SELECT user_id, COALESCE(wanted_stars,0), COALESCE(wanted_hunted_count,0),
-                  COALESCE(in_prison,0), last_five_robs
-           FROM users WHERE wanted_stars > 0
-           ORDER BY wanted_stars DESC, user_id ASC LIMIT 50"""
-    )
-    rows = c.fetchall()
-    conn.close()
-    return rows
+    return wanted_repo.fetch_wanted_list_rows_sync(get_db_connection)
 
 
 def pay_bail_sync(user_id: int, now: datetime.datetime) -> typing.Dict[str, typing.Any]:
-    ensure_user_exists(user_id, 0)
-    uid = str(user_id)
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute(
-        "SELECT COALESCE(in_prison,0), COALESCE(balance,0), COALESCE(bail_debt,0) FROM users WHERE user_id=%s",
-        (uid,),
+    return wanted_repo.pay_bail_sync(
+        ensure_user_exists,
+        get_db_connection,
+        log_transaction_in_tx,
+        BAIL_COST,
+        user_id,
+        now,
     )
-    row = c.fetchone()
-    if not row or not int(row[0] or 0):
-        conn.close()
-        return {"ok": False, "reason": "not_in_prison"}
-    bal = int(row[1] or 0)
-    debt = int(row[2] or 0)
-    total_bail = BAIL_COST + debt
-    if bal < total_bail:
-        conn.close()
-        return {"ok": False, "reason": "insufficient", "debt": debt, "total_bail": total_bail}
-    c.execute(
-        """UPDATE users SET balance=balance-%s, bail_debt=0, in_prison=0, prison_start=NULL
-           WHERE user_id=%s AND balance >= %s""",
-        (total_bail, uid, total_bail),
-    )
-    if c.rowcount == 0:
-        conn.close()
-        return {"ok": False, "reason": "deduct_failed"}
-    c.execute(
-        "UPDATE prison_records SET released_at=%s WHERE criminal_id=%s AND released_at IS NULL ORDER BY id DESC LIMIT 1",
-        (now, uid),
-    )
-    conn.commit()
-    conn.close()
-    log_transaction(user_id, -total_bail, "監獄假釋金（含累計欠款）")
-    return {"ok": True, "debt": debt, "total_bail": total_bail}
 
 
 def claim_rescue_sync(user_id: int) -> typing.Dict[str, typing.Any]:
-    ensure_user_exists(user_id, 50000)
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT balance, last_rescue, rescue_count FROM users WHERE user_id=%s", (str(user_id),))
-    row = c.fetchone()
-    if not row:
-        conn.close()
-        return {"ok": False, "reason": "not_found"}
-    balance = int(row[0] or 0)
-    if balance > 0:
-        conn.close()
-        return {"ok": False, "reason": "not_bankrupt", "balance": balance}
-    rescue_count = int(row[2] or 0)
-    if rescue_count >= 10:
-        conn.close()
-        return {"ok": False, "reason": "limit_reached"}
-    now = now_tw_naive()
-    if row[1] and (now - row[1]).total_seconds() < 3600:
-        rem = 3600 - (now - row[1]).total_seconds()
-        conn.close()
-        return {"ok": False, "reason": "cooldown", "remain_sec": max(1, int(rem))}
-    inflation_mult, _, _ = get_inflation_multiplier()
-    rescue_reward = max(500, min(50000, int(1000 * inflation_mult)))
-    c.execute(
-        "UPDATE users SET balance=balance+%s, last_rescue=%s, rescue_count=rescue_count+1 WHERE user_id=%s",
-        (rescue_reward, now, str(user_id)),
+    return economy_repo.claim_rescue_sync(
+        ensure_user_exists,
+        get_db_connection,
+        now_tw_naive,
+        get_inflation_multiplier,
+        log_transaction_in_tx,
+        user_id,
     )
-    conn.commit()
-    conn.close()
-    log_transaction(user_id, rescue_reward, "賭狗破產救濟")
-    return {"ok": True, "reward": rescue_reward, "claim_no": rescue_count + 1}
 
 
 def wanted_buyout_sync(user_id: int, now: datetime.datetime) -> typing.Dict[str, typing.Any]:
-    ensure_user_exists(user_id, 50000)
-    uid = str(user_id)
-    cost = WANTED_BUYOUT_COST
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute(
-        "SELECT role, COALESCE(wanted_stars,0), COALESCE(balance,0), COALESCE(in_prison,0), last_wanted_buyout FROM users WHERE user_id=%s",
-        (uid,),
+    return wanted_repo.wanted_buyout_sync(
+        ensure_user_exists,
+        get_db_connection,
+        _user_role_value,
+        log_transaction_in_tx,
+        WANTED_BUYOUT_COST,
+        WANTED_BUYOUT_COOLDOWN_SECONDS,
+        user_id,
+        now,
     )
-    row = c.fetchone()
-    if not row:
-        conn.close()
-        return {"ok": False, "reason": "not_found"}
-    role = _user_role_value(row[0])
-    stars = int(row[1] or 0)
-    bal = int(row[2] or 0)
-    in_pr = int(row[3] or 0)
-    last_buyout = row[4]
-    if role != "criminal":
-        conn.close()
-        return {"ok": False, "reason": "not_criminal"}
-    if in_pr:
-        conn.close()
-        return {"ok": False, "reason": "in_prison"}
-    if stars <= 0:
-        conn.close()
-        return {"ok": False, "reason": "no_stars"}
-    if bal < cost:
-        conn.close()
-        return {"ok": False, "reason": "insufficient", "balance": bal}
-    if last_buyout is not None:
-        elapsed = (now - last_buyout).total_seconds()
-        if elapsed < WANTED_BUYOUT_COOLDOWN_SECONDS:
-            conn.close()
-            next_dt = last_buyout + datetime.timedelta(seconds=WANTED_BUYOUT_COOLDOWN_SECONDS)
-            return {"ok": False, "reason": "cooldown", "next_dt": next_dt}
-    c.execute(
-        """UPDATE users SET balance=balance-%s,
-           wanted_stars=0, wanted_hunted_count=0, last_five_robs=NULL, last_wanted_buyout=%s
-           WHERE user_id=%s AND balance >= %s""",
-        (cost, now, uid, cost),
-    )
-    if c.rowcount == 0:
-        conn.close()
-        return {"ok": False, "reason": "deduct_failed"}
-    conn.commit()
-    conn.close()
-    log_transaction(user_id, -cost, "通緝買斷（消除通緝星）")
-    return {"ok": True, "stars_was": stars, "new_balance": bal - cost}
 
 
 def break_citizen_sync(attacker_id: int, target_id: int, now: datetime.datetime) -> typing.Dict[str, typing.Any]:
-    ensure_user_exists(attacker_id, 50000)
-    ensure_user_exists(target_id, 0)
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT COALESCE(balance,0) FROM users WHERE user_id=%s", (str(attacker_id),))
-    atk_row = c.fetchone()
-    attacker_bal = int((atk_row[0] if atk_row else 0) or 0)
-    if attacker_bal < GOOD_CITIZEN_DESTROY_COST:
-        conn.close()
-        return {"ok": False, "reason": "insufficient", "balance": attacker_bal}
-    c.execute(
-        """SELECT COALESCE(good_citizen_cert_active,0), good_citizen_cert_broken_until
-           FROM users WHERE user_id=%s""",
-        (str(target_id),),
+    return wanted_repo.break_citizen_sync(
+        ensure_user_exists,
+        get_db_connection,
+        lock_user_rows,
+        get_locked_user_balance,
+        log_transaction_in_tx,
+        GOOD_CITIZEN_DESTROY_COST,
+        GOOD_CITIZEN_BROKEN_LOCK_DAYS,
+        attacker_id,
+        target_id,
+        now,
     )
-    t_row = c.fetchone()
-    if not t_row:
-        conn.close()
-        return {"ok": False, "reason": "target_not_found"}
-    target_active = int(t_row[0] or 0)
-    target_broken_until = t_row[1]
-    if target_active != 1:
-        conn.close()
-        return {"ok": False, "reason": "target_not_active", "target_broken_until": target_broken_until}
-    broken_until = now + datetime.timedelta(days=GOOD_CITIZEN_BROKEN_LOCK_DAYS)
-    c.execute(
-        "UPDATE users SET balance=balance-%s WHERE user_id=%s AND balance >= %s",
-        (GOOD_CITIZEN_DESTROY_COST, str(attacker_id), GOOD_CITIZEN_DESTROY_COST),
-    )
-    if c.rowcount == 0:
-        conn.close()
-        return {"ok": False, "reason": "deduct_failed"}
-    c.execute(
-        """UPDATE users
-           SET good_citizen_cert_active=0,
-               good_citizen_cert_broken_until=%s,
-               last_good_citizen_cert_action=%s
-           WHERE user_id=%s""",
-        (broken_until, now, str(target_id)),
-    )
-    conn.commit()
-    conn.close()
-    log_transaction(attacker_id, -GOOD_CITIZEN_DESTROY_COST, f"摧毀良民證（目標:{target_id}）")
-    return {"ok": True, "broken_until": broken_until}
 
 
 def transfer_sync(sender_id: int, receiver_id: int, amount: int, note_text: str) -> typing.Dict[str, typing.Any]:
@@ -1619,32 +958,31 @@ def transfer_sync(sender_id: int, receiver_id: int, amount: int, note_text: str)
     ensure_user_exists(receiver_id, 0)
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT balance FROM users WHERE user_id=%s", (str(sender_id),))
-    sender_before_row = c.fetchone()
-    c.execute("SELECT balance FROM users WHERE user_id=%s", (str(receiver_id),))
-    receiver_before_row = c.fetchone()
-    sender_before = int((sender_before_row[0] if sender_before_row else 0) or 0)
-    receiver_before = int((receiver_before_row[0] if receiver_before_row else 0) or 0)
+    # 固定順序鎖住雙方列，避免互轉造成死鎖／讀寫交錯
+    sid, rid = str(sender_id), str(receiver_id)
+    lock_user_rows(c, [sid, rid])
+    sender_before = get_locked_user_balance(c, sid)
+    receiver_before = get_locked_user_balance(c, rid)
     c.execute(
         "UPDATE users SET balance=balance-%s WHERE user_id=%s AND balance >= %s",
-        (amount, str(sender_id), amount),
+        (amount, sid, amount),
     )
     if c.rowcount == 0:
         conn.close()
         return {"ok": False, "reason": "insufficient"}
-    c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (amount, str(receiver_id)))
+    c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (amount, rid))
     sender_after = sender_before - amount
     receiver_after = receiver_before + amount
-    conn.commit()
-    conn.close()
     if note_text:
         out_reason = f"轉帳給 {receiver_id}（備註: {note_text}）"
         in_reason = f"收到 {sender_id} 的轉帳（備註: {note_text}）"
     else:
         out_reason = f"轉帳給 {receiver_id}"
         in_reason = f"收到 {sender_id} 的轉帳"
-    log_transaction(sender_id, -amount, out_reason)
-    log_transaction(receiver_id, amount, in_reason)
+    log_transaction_in_tx(c, sender_id, -amount, out_reason)
+    log_transaction_in_tx(c, receiver_id, amount, in_reason)
+    conn.commit()
+    conn.close()
     return {
         "ok": True,
         "sender_after": sender_after,
@@ -1652,91 +990,50 @@ def transfer_sync(sender_id: int, receiver_id: int, amount: int, note_text: str)
     }
 
 
-def fetch_balance_leaderboard_core(user_id: int):
+def fetch_balance_leaderboard_snapshot():
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT balance FROM users WHERE user_id=%s", (str(user_id),))
-    my_row = c.fetchone()
-    my_bal = int((my_row[0] if my_row else 0) or 0)
-    c.execute("SELECT user_id, balance FROM users ORDER BY balance DESC LIMIT %s", (LEADERBOARD_POOL,))
-    pool = c.fetchall()
-    c.execute("SELECT user_id FROM users WHERE balance > %s ORDER BY balance DESC LIMIT %s", (my_bal, LEADERBOARD_RANK_SCAN))
-    richer = c.fetchall()
-    c.execute("SELECT user_id, balance FROM users ORDER BY balance DESC LIMIT 10")
-    top10 = c.fetchall()
-    c.execute("SELECT COUNT(*) FROM users WHERE balance > %s", (my_bal,))
-    rank_row = c.fetchone()
+    c.execute("SELECT user_id, balance FROM users ORDER BY balance DESC")
+    rows = c.fetchall()
     conn.close()
-    global_rank = (rank_row[0] if rank_row else 0) + 1
-    return my_bal, pool, richer, top10, global_rank
+    return rows
 
 
-def fetch_level_leaderboard_core(user_id: int):
+def fetch_level_leaderboard_snapshot():
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT level, exp FROM users WHERE user_id=%s", (str(user_id),))
-    me = c.fetchone()
-    if me:
-        my_level, my_exp = int(me[0] or 1), int(me[1] or 0)
-    else:
-        my_level, my_exp = 1, 0
-    c.execute("SELECT user_id, level, exp FROM users ORDER BY level DESC, exp DESC LIMIT %s", (LEADERBOARD_POOL,))
-    pool = c.fetchall()
-    c.execute(
-        """SELECT user_id FROM users
-        WHERE (level > %s OR (level = %s AND exp > %s))
-        ORDER BY level DESC, exp DESC LIMIT %s""",
-        (my_level, my_level, my_exp, LEADERBOARD_RANK_SCAN),
-    )
-    richer_lv = c.fetchall()
-    c.execute("SELECT user_id, level, exp FROM users ORDER BY level DESC, exp DESC LIMIT 10")
-    top10 = c.fetchall()
-    c.execute(
-        "SELECT COUNT(*) FROM users WHERE (level > %s OR (level = %s AND exp > %s))",
-        (my_level, my_level, my_exp),
-    )
-    rank_row = c.fetchone()
+    c.execute("SELECT user_id, level, exp FROM users ORDER BY level DESC, exp DESC")
+    rows = c.fetchall()
     conn.close()
-    global_rank = (rank_row[0] if rank_row else 0) + 1
-    return my_level, my_exp, pool, richer_lv, top10, global_rank
+    return rows
 
 
 def try_deduct_balance(user_id, amount, reason):
-    if amount <= 0:
-        return True
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute(
-        "UPDATE users SET balance=balance-%s WHERE user_id=%s AND balance >= %s",
-        (amount, str(user_id), amount)
+    return economy_repo.try_deduct_balance(
+        get_db_connection,
+        get_locked_user_balance,
+        log_transaction_in_tx,
+        user_id,
+        amount,
+        reason,
     )
-    ok = c.rowcount > 0
-    conn.commit()
-    conn.close()
-    if ok:
-        log_transaction(user_id, -amount, reason)
-    return ok
 
 
 def credit_balance_with_log(user_id, amount, reason):
-    """入帳並同步寫交易紀錄。"""
-    if amount <= 0:
-        return
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute(
-        "UPDATE users SET balance=balance+%s WHERE user_id=%s",
-        (amount, str(user_id)),
+    return economy_repo.credit_balance_with_log(
+        get_db_connection,
+        log_transaction_in_tx,
+        user_id,
+        amount,
+        reason,
     )
-    conn.commit()
-    conn.close()
-    log_transaction(user_id, amount, reason)
 
 
 def settle_duel_payouts_with_log(challenger_id, opponent_id, a_amt, b_amt, s_a, s_b):
     """E 卡結算：先入帳，再寫各自分配紀錄。"""
     conn = get_db_connection()
     cur = conn.cursor()
+    lock_user_rows(cur, [challenger_id, opponent_id])
     if a_amt > 0:
         cur.execute(
             "UPDATE users SET balance=balance+%s WHERE user_id=%s",
@@ -1747,131 +1044,55 @@ def settle_duel_payouts_with_log(challenger_id, opponent_id, a_amt, b_amt, s_a, 
             "UPDATE users SET balance=balance+%s WHERE user_id=%s",
             (b_amt, str(opponent_id)),
         )
+    if a_amt > 0:
+        log_transaction_in_tx(cur, challenger_id, a_amt, f"E卡決鬥分配（積分 {s_a}:{s_b}）")
+    if b_amt > 0:
+        log_transaction_in_tx(cur, opponent_id, b_amt, f"E卡決鬥分配（積分 {s_a}:{s_b}）")
     conn.commit()
     conn.close()
-    if a_amt > 0:
-        log_transaction(challenger_id, a_amt, f"E卡決鬥分配（積分 {s_a}:{s_b}）")
-    if b_amt > 0:
-        log_transaction(opponent_id, b_amt, f"E卡決鬥分配（積分 {s_a}:{s_b}）")
 
 def roll_gamble_exp_from_bet(main_bet: int) -> int:
-    """完成一局 21 點時發放的隨機 EXP；主注越高可略增上限（仍為隨機區間）。"""
-    base = random.randint(GAMBLE_EXP_MIN, GAMBLE_EXP_MAX)
-    bonus = min(max(int(main_bet), 0) // 2500, 25)
-    return base + bonus
+    return game_repo.roll_gamble_exp_from_bet(GAMBLE_EXP_MIN, GAMBLE_EXP_MAX, main_bet)
 
 
 def update_game_result(user_id, balance_delta, profit_delta, is_win, is_push=False):
-    conn = get_db_connection()
-    c = conn.cursor()
-    win_int = 1 if is_win else 0
-    if is_push:
-        c.execute("UPDATE users SET balance=GREATEST(0, balance+%s), total_profit=total_profit+%s WHERE user_id=%s",
-                  (balance_delta, profit_delta, str(user_id)))
-    else:
-        c.execute("UPDATE users SET balance=GREATEST(0, balance+%s), total_profit=total_profit+%s, total_games=total_games+1, wins=wins+%s WHERE user_id=%s",
-                  (balance_delta, profit_delta, win_int, str(user_id)))
-    conn.commit()
-    conn.close()
-    if balance_delta != 0:
-        log_transaction(user_id, balance_delta, "21點遊戲結算")
-    # 分潤切割：只在 21點整局實際「淨回收」時切 10%（不額外增發玩家成本）
-    if (
-        CASINO_RECOVERY_SHARE_ENABLED
-        and CASINO_RECOVERY_SHARE_RATE > 0
-        and profit_delta < 0
-        and CASINO_RECOVERY_SHARE_TARGET_ID
-    ):
-        recovered_amount = int(-profit_delta)
-        apply_casino_recovery_share(recovered_amount, "21點回收切割")
+    return game_repo.update_game_result(
+        get_db_connection,
+        log_transaction_in_tx,
+        apply_casino_recovery_share,
+        CASINO_RECOVERY_SHARE_ENABLED,
+        CASINO_RECOVERY_SHARE_RATE,
+        CASINO_RECOVERY_SHARE_TARGET_ID,
+        user_id,
+        balance_delta,
+        profit_delta,
+        is_win,
+        is_push,
+    )
 
 def exp_for_next_level(level):
-    lv = max(1, min(MAX_LEVEL, level))
-    return 60 + lv * 25 + int((lv ** 1.6) * 8)
+    return game_repo.exp_for_next_level(MAX_LEVEL, level)
 
 def calc_level_from_exp(exp):
-    level = 1
-    remaining = max(0, int(exp))
-    while level < MAX_LEVEL:
-        need = exp_for_next_level(level)
-        if remaining < need:
-            break
-        remaining -= need
-        level += 1
-    return level, remaining, (0 if level >= MAX_LEVEL else exp_for_next_level(level))
+    return game_repo.calc_level_from_exp(MAX_LEVEL, exp)
 
 def exp_required_for_level(target_level: int) -> int:
-    """回傳達到指定等級所需的總 EXP（例如 Lv.1 -> 0 EXP）。"""
-    lv = max(1, min(MAX_LEVEL, int(target_level)))
-    total = 0
-    for cur in range(1, lv):
-        total += exp_for_next_level(cur)
-    return total
+    return game_repo.exp_required_for_level(MAX_LEVEL, target_level)
 
 def get_level_stats(user_id):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT exp, level FROM users WHERE user_id=%s", (str(user_id),))
-    row = c.fetchone()
-    conn.close()
-    return row
+    return game_repo.get_level_stats(get_db_connection, user_id)
 
 def add_user_exp(user_id, amount):
-    if amount <= 0:
-        return None
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT exp, level FROM users WHERE user_id=%s", (str(user_id),))
-    row = c.fetchone()
-    if not row:
-        conn.close()
-        return None
-    old_exp, old_level = int(row[0] or 0), int(row[1] or 1)
-    new_exp = old_exp + int(amount)
-    new_level, _, _ = calc_level_from_exp(new_exp)
-    if new_level != old_level:
-        c.execute("UPDATE users SET exp=%s, level=%s WHERE user_id=%s", (new_exp, new_level, str(user_id)))
-    else:
-        c.execute("UPDATE users SET exp=%s WHERE user_id=%s", (new_exp, str(user_id)))
-    conn.commit()
-    conn.close()
-    return old_level, new_level, new_exp
+    return game_repo.add_user_exp(get_db_connection, calc_level_from_exp, user_id, amount)
 
 def get_claimed_milestones(user_id) -> set:
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT milestone FROM level_milestone_claims WHERE user_id=%s", (str(user_id),))
-    rows = c.fetchall()
-    conn.close()
-    return {int(r[0]) for r in rows} if rows else set()
+    return game_repo.get_claimed_milestones(get_db_connection, user_id)
 
 def try_claim_milestone(user_id, milestone, coin_amount) -> int:
-    """
-    首次記錄該里程碑：寫入 level_milestone_claims，可選加幣。
-    已領過回傳 -1；本輪新領則回傳入帳金額（0 表示僅解鎖里程碑，無幣）。
-    """
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT 1 FROM level_milestone_claims WHERE user_id=%s AND milestone=%s", (str(user_id), milestone))
-    if c.fetchone():
-        conn.close()
-        return -1
-    c.execute("INSERT INTO level_milestone_claims (user_id, milestone) VALUES (%s, %s)", (str(user_id), milestone))
-    added = 0
-    if coin_amount and coin_amount > 0:
-        c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (coin_amount, str(user_id)))
-        log_transaction(user_id, coin_amount, f"等級里程碑 Lv.{milestone}")
-        added = coin_amount
-    conn.commit()
-    conn.close()
-    return added
+    return game_repo.try_claim_milestone(get_db_connection, log_transaction_in_tx, user_id, milestone, coin_amount)
 
 def build_exp_progress_bar(cur: int, need: int, width: int = 12) -> str:
-    if need <= 0:
-        return "▓" * width + " 100%"
-    ratio = min(1.0, max(0.0, cur / need))
-    filled = int(round(ratio * width))
-    return "▓" * filled + "░" * (width - filled) + f"  {ratio * 100:.0f}%"
+    return game_repo.build_exp_progress_bar(cur, need, width)
 
 async def process_level_ups(member: typing.Union[discord.Member, discord.User], old_lv: int, new_lv: int):
     if new_lv <= old_lv or getattr(member, "bot", False):
@@ -1929,76 +1150,33 @@ async def process_level_ups(member: typing.Union[discord.Member, discord.User], 
         pass
 
 def refresh_hourly_bank(user_id):
-    now = now_tw_naive()
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT level, last_hourly_claim, hourly_bank FROM users WHERE user_id=%s", (str(user_id),))
-    row = c.fetchone()
-    if not row:
-        conn.close()
-        return None
-    level = max(1, min(MAX_LEVEL, int(row[0] or 1)))
-    last_claim = row[1]
-    bank = int(row[2] or 0)
-    if last_claim is None:
-        c.execute("UPDATE users SET last_hourly_claim=%s WHERE user_id=%s", (now, str(user_id)))
-        conn.commit()
-        conn.close()
-        return {"level": level, "bank": bank, "next_in_seconds": 3600}
-
-    elapsed_hours = int((now - last_claim).total_seconds() // 3600)
-    if elapsed_hours > 0:
-        bank = min(level, bank + elapsed_hours)
-        last_claim = last_claim + datetime.timedelta(hours=elapsed_hours)
-        c.execute("UPDATE users SET hourly_bank=%s, last_hourly_claim=%s WHERE user_id=%s", (bank, last_claim, str(user_id)))
-        conn.commit()
-    next_in_seconds = max(0, 3600 - int((now - last_claim).total_seconds()))
-    conn.close()
-    return {"level": level, "bank": bank, "next_in_seconds": next_in_seconds}
+    return economy_repo.refresh_hourly_bank(
+        get_db_connection,
+        now_tw_naive,
+        MAX_LEVEL,
+        user_id,
+    )
 
 def payout_hourly_bank(user_id, bank, reward_per_slot):
-    if bank <= 0:
-        return 0
-    payout = int(bank * reward_per_slot)
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("UPDATE users SET balance=balance+%s, hourly_bank=0 WHERE user_id=%s", (payout, str(user_id)))
-    conn.commit()
-    conn.close()
-    log_transaction(user_id, payout, "每小時簽到")
-    return payout
+    return economy_repo.payout_hourly_bank(
+        get_db_connection,
+        log_transaction_in_tx,
+        user_id,
+        bank,
+        reward_per_slot,
+    )
 
 
 def claim_daily_reward(user_id, daily_reward: int = 100_000):
-    ensure_user_exists(user_id, 50000)
-    today_tw = now_tw_naive().date()
-    tomorrow_tw = today_tw + datetime.timedelta(days=1)
-    next_claim_dt = datetime.datetime.combine(tomorrow_tw, datetime.time.min, tzinfo=TW_TZ)
-    next_ts = int(next_claim_dt.timestamp())
-
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT last_claim FROM daily_claims WHERE user_id=%s", (str(user_id),))
-    row = c.fetchone()
-    if row and row[0] == today_tw:
-        conn.close()
-        return {"claimed": False, "next_ts": next_ts}
-
-    c.execute(
-        "INSERT INTO daily_claims (user_id, last_claim) VALUES (%s, %s) ON DUPLICATE KEY UPDATE last_claim=%s",
-        (str(user_id), today_tw, today_tw),
+    return economy_repo.claim_daily_reward(
+        ensure_user_exists,
+        now_tw_naive,
+        TW_TZ,
+        get_db_connection,
+        log_transaction_in_tx,
+        user_id,
+        daily_reward,
     )
-    c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (daily_reward, str(user_id)))
-    conn.commit()
-    conn.close()
-    log_transaction(user_id, daily_reward, "每日簽到")
-    stats = get_user_stats(user_id)
-    return {
-        "claimed": True,
-        "reward": daily_reward,
-        "balance": int((stats[0] if stats else 0) or 0),
-        "next_ts": next_ts,
-    }
 
 
 def claim_hourly_reward(user_id, reward_per_slot: int = 1000):
@@ -2063,11 +1241,10 @@ def award_vc_rewards_sync(user_ids: typing.Sequence[str], now: datetime.datetime
             "INSERT INTO activity_stats (user_id, last_vc_reward) VALUES (%s, %s) ON DUPLICATE KEY UPDATE last_vc_reward=%s",
             (user_id, now, now),
         )
+        log_transaction_in_tx(c, user_id, 500, "語音通話獎勵 (10min)")
         awarded.append(user_id)
     conn.commit()
     conn.close()
-    for user_id in awarded:
-        log_transaction(user_id, 500, "語音通話獎勵 (10min)")
     return len(awarded)
 
 
@@ -2110,12 +1287,10 @@ def process_on_message_activity_sync(
                 "UPDATE activity_stats SET msg_count=0, last_msg_reward=%s WHERE user_id=%s",
                 (now, user_id),
             )
+            log_transaction_in_tx(c, user_id, 500, "聊天活躍獎勵 (10句)")
             msg_rewarded = True
     conn.commit()
     conn.close()
-
-    if msg_rewarded:
-        log_transaction(user_id, 500, "聊天活躍獎勵 (10句)")
     return {
         "exp_awarded": exp_awarded,
         "old_level": old_level,
@@ -2135,644 +1310,16 @@ def tw_naive_to_discord_ts(dt):
     return int(dt.replace(tzinfo=TW_TZ).timestamp())
 
 # ··············································································
-# [D · 二十一點與 UI]
+# [D · 互動 UI]
 # ··············································································
 
 # ==============================================================================
-# 【八】二十一點：牌組、算分、旁注與牌局訊息更新
-# 多副牌洗牌、手牌點數（含 A）、對子／21+3 旁注結算、以及嵌入式訊息編輯流程。
+# 【八】遊戲 UI 與互動 View
+# 二十一點與 E 卡決鬥已抽離到 bot_modules；此段保留其餘互動 View（如紅包、翻頁）。
 # ==============================================================================
 
 
-def get_deck(num_decks=6):
-    suits = ['♥️', '♦️', '♣️', '♠️']
-    ranks = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A']
-    return [{'rank': r, 'suit': s} for s in suits for r in ranks] * num_decks
-
-def card_to_emoji(card, guild_id=None) -> str:
-    return f"**[{card['rank']} {card['suit']}]**"
-
-def card_back_emoji(guild_id=None) -> str:
-    return "**[??]**"
-
-async def _send_game(channel, gv: 'BlackjackGame', interaction: discord.Interaction = None, message_obj: discord.Message = None, view=None, 
-                     done=False, res="", profit=0, animating=False, extra_msg="") -> discord.Message:
-    async def _with_discord_retry(coro_factory: typing.Callable[[], typing.Awaitable[typing.Any]], *, action: str):
-        last_exc: typing.Optional[Exception] = None
-        # 只針對 Discord 5xx（例如 503）做短暫重試；其餘錯誤直接拋出
-        for attempt in range(3):
-            try:
-                return await coro_factory()
-            except discord.DiscordServerError as e:
-                last_exc = e
-            except discord.HTTPException as e:
-                if int(getattr(e, "status", 0) or 0) >= 500:
-                    last_exc = e
-                else:
-                    raise
-            if attempt < 2:
-                await asyncio.sleep(0.6 * (attempt + 1))
-        logger.warning("Discord API 臨時失敗（%s）重試後仍失敗: %s", action, last_exc)
-        if last_exc:
-            raise last_exc
-        raise RuntimeError(f"Discord API retry failed: {action}")
-
-    if hasattr(gv, "_build_embed_async"):
-        embed = await gv._build_embed_async(
-            done=done,
-            res=res,
-            profit=profit,
-            animating=animating,
-            extra_msg=extra_msg,
-            guild_id=channel.guild.id if channel.guild else None,
-        )
-    else:
-        embed = gv.build_embed(done=done, res=res, profit=profit, animating=animating, extra_msg=extra_msg, guild_id=channel.guild.id if channel.guild else None)
-    current_view = view if view is not None else gv
-
-    if interaction:
-        if interaction.response.is_done():
-            if interaction.message is not None:
-                return await _with_discord_retry(
-                    lambda: interaction.message.edit(embed=embed, view=current_view, attachments=[]),
-                    action="interaction.message.edit",
-                )
-            return await _with_discord_retry(
-                lambda: interaction.edit_original_response(embed=embed, view=current_view, attachments=[]),
-                action="interaction.edit_original_response",
-            )
-        else:
-            await _with_discord_retry(
-                lambda: interaction.response.edit_message(embed=embed, view=current_view, attachments=[]),
-                action="interaction.response.edit_message",
-            )
-            if interaction.message is not None:
-                return interaction.message
-            return await _with_discord_retry(
-                lambda: interaction.original_response(),
-                action="interaction.original_response",
-            )
-    elif message_obj:
-        return await _with_discord_retry(
-            lambda: message_obj.edit(embed=embed, view=current_view, attachments=[]),
-            action="message_obj.edit",
-        )
-    return await _with_discord_retry(
-        lambda: channel.send(embed=embed, view=current_view),
-        action="channel.send",
-    )
-
-def calculate_score(hand):
-    score, aces = 0, 0
-    values = {'2':2,'3':3,'4':4,'5':5,'6':6,'7':7,'8':8,'9':9,'10':10,'J':10,'Q':10,'K':10,'A':11}
-    for c in hand:
-        score += values[c['rank']]
-        if c['rank'] == 'A': aces += 1
-    while score > 21 and aces:
-        score -= 10
-        aces -= 1
-    return score
-
-def check_sidebets(player_hand, dealer_up, p_bet, s_bet):
-    res_msg, total_p = "", 0
-    if p_bet > 0:
-        c1, c2 = player_hand[0], player_hand[1]
-        if c1['rank'] == c2['rank']:
-            if c1['suit'] == c2['suit']: mult, m = 30, "同花對子"
-            else: mult, m = 5, "混合對子"
-            total_p += p_bet * mult
-            res_msg += f"🧧 {m}！+{p_bet*mult} "
-        else:
-            total_p -= p_bet
-            res_msg += f"🧧 對子未中 -{p_bet} "
-    if s_bet > 0:
-        cards = [player_hand[0], player_hand[1], dealer_up]
-        suits = [c['suit'] for c in cards]
-        rv = {'2':2,'3':3,'4':4,'5':5,'6':6,'7':7,'8':8,'9':9,'10':10,'J':11,'Q':12,'K':13,'A':14}
-        v = sorted([rv[c['rank']] for c in cards])
-        if v == [2,3,14]: v = [1,2,3]
-        is_flush    = len(set(suits)) == 1
-        is_straight = (v[2]-v[1] == 1 and v[1]-v[0] == 1)
-        is_triplet  = len(set([c['rank'] for c in cards])) == 1
-        if is_flush and is_triplet: mult, m = 50, "同花三條"
-        elif is_flush and is_straight: mult, m = 25, "同花順"
-        elif is_triplet: mult, m = 25, "三條"
-        elif is_straight: mult, m = 10, "順子"
-        elif is_flush: mult, m = 5, "同花"
-        else: mult, m = -1, "未中"
-        
-        if mult > 0:
-            total_p += s_bet * mult
-            res_msg += f"🎯 21+3 {m}！+{s_bet*mult} "
-        else:
-            total_p -= s_bet
-            res_msg += f"🎯 21+3 未中 -{s_bet} "
-    return total_p, res_msg
-
-# ==============================================================================
-# 【九】Discord 互動介面（UI）
-# 自訂下注 Modal、二十一點主 View 與相關按鈕、全下確認、新局、紅包搶領、多行文字 Embed 翻頁等。
-# ==============================================================================
-
-
-class BetModal(discord.ui.Modal, title='自訂下注金額'):
-    def __init__(self, view):
-        super().__init__()
-        self.view = view
-        self.b_input = discord.ui.TextInput(label='主注 (最低 100)', default=str(view.base_bet), required=True)
-        self.p_input = discord.ui.TextInput(label='對子旁注', default=str(view.p_bet), required=False)
-        self.s_input = discord.ui.TextInput(label='21+3旁注', default=str(view.s_bet), required=False)
-        self.add_item(self.b_input)
-        self.add_item(self.p_input)
-        self.add_item(self.s_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            b = int(self.b_input.value)
-            p = int(self.p_input.value or 0)
-            s = int(self.s_input.value or 0)
-            if b < 100 or p < 0 or s < 0: raise ValueError
-        except ValueError:
-            return await interaction.response.send_message("請輸入有效正整數 (主注最低 100)", ephemeral=True)
-        max_side = int(b * SIDE_BET_RATIO)
-        if p + s > max_side:
-            return await interaction.response.send_message(f"旁注總和 ({p+s}) 不能超過主注的 {int(SIDE_BET_RATIO*100)}% ({max_side})", ephemeral=True)
-        await ensure_user_exists_async(self.view.user.id, 50000)
-        stats = await get_user_stats_async(self.view.user.id)
-        if stats[0] < (b + p + s): return await interaction.response.send_message(f"餘額不足！你目前有 {stats[0]} 東雲幣", ephemeral=True)
-        self.view.base_bet = b
-        self.view.max_side = max_side
-        self.view.p_bet = p
-        self.view.s_bet = s
-        await interaction.response.edit_message(embed=await self.view._build_embed_async(), view=self.view)
-
-class SetupView(discord.ui.View):
-    def __init__(self, user, base_bet, p_bet=0, s_bet=0):
-        super().__init__(timeout=90)
-        self.user, self.base_bet = user, base_bet
-        self.p_bet, self.s_bet = p_bet, s_bet
-        self.max_side = int(base_bet * SIDE_BET_RATIO)
-
-    async def _build_embed_async(self, err: str = "") -> discord.Embed:
-        await ensure_user_exists_async(self.user.id, 50000)
-        stats = await get_user_stats_async(self.user.id)
-        bal = stats[0] if stats else 0
-        embed = discord.Embed(title="🃏 21點 — 下注設定", color=0x2b2d31)
-        err_prefix = f"❌ {err}\n" if err else ""
-        embed.description = (
-            f"{err_prefix}主注：`{self.base_bet}`\n"
-            f"旁注剩餘額度：**`{self.max_side - (self.p_bet + self.s_bet)}`**\n"
-            f"你的餘額：`{bal}`"
-        )
-        embed.add_field(name="🧧 對子旁注", value=f"下注金額：`{self.p_bet}`\n**同花對子**: 30倍\n**混合對子**: 5倍", inline=True)
-        embed.add_field(name="🎯 21+3旁注", value=f"下注金額：`{self.s_bet}`\n**同花三條**: 50倍\n**同花順**: 25倍\n**三條**: 25倍\n**順子**: 10倍\n**同花**: 5倍", inline=True)
-        return embed
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.user.id:
-            await interaction.response.send_message("這不是你的牌局！", ephemeral=True)
-            return False
-        now = asyncio.get_running_loop().time()
-        if hasattr(self, "last_action") and now - self.last_action < 2.0:
-            await interaction.response.send_message("⚠️ 操作太快了！按鈕有 2 秒冷卻時間。", ephemeral=True)
-            return False
-        self.last_action = now
-        return True
-
-    def build_embed(self, err=""):
-        ensure_user_exists(self.user.id, 50000)
-        stats = get_user_stats(self.user.id)
-        embed = discord.Embed(title="🃏 21點 — 下注設定", color=0x2b2d31)
-        err_prefix = f"❌ {err}\n" if err else ""
-        embed.description = f"{err_prefix}主注：`{self.base_bet}`\n旁注剩餘額度：**`{self.max_side - (self.p_bet + self.s_bet)}`**\n你的餘額：`{stats[0]}`"
-        embed.add_field(name="🧧 對子旁注", value=f"下注金額：`{self.p_bet}`\n**同花對子**: 30倍\n**混合對子**: 5倍", inline=True)
-        embed.add_field(name="🎯 21+3旁注", value=f"下注金額：`{self.s_bet}`\n**同花三條**: 50倍\n**同花順**: 25倍\n**三條**: 25倍\n**順子**: 10倍\n**同花**: 5倍", inline=True)
-        return embed
-
-    @discord.ui.button(label="開始遊戲 (再來一局)", style=discord.ButtonStyle.success)
-    async def start(self, inter, btn):
-        if inter.user.id != self.user.id: return
-        if not FEATURE_TOGGLES.get("bj", True) or not IS_EVENT_ACTIVE:
-            return await inter.response.send_message("打烊", ephemeral=True)
-        await inter.response.defer()
-        await ensure_user_exists_async(self.user.id, 50000)
-        stats = await get_user_stats_async(self.user.id)
-        total_cost = self.base_bet + self.p_bet + self.s_bet
-        if not await try_deduct_balance_async(self.user.id, total_cost, "21點開局扣款"):
-            return await inter.followup.send("餘額不足", ephemeral=True)
-        self.stop()
-        gv = BlackjackGame(self.user, self.base_bet, self.p_bet, self.s_bet, upfront_cost=total_cost)
-        msg = await _send_game(inter.channel, gv, interaction=inter)
-        if msg is not None:
-            await gv.check_auto_bj(msg)
-        else:
-            logger.error("21點 SetupView.start：_send_game 未回傳訊息，略過自動 BJ 結算 user=%s", inter.user.id)
-
-    @discord.ui.button(label="自訂下注金額", style=discord.ButtonStyle.primary)
-    async def custom_bet(self, inter, btn):
-        if inter.user.id != self.user.id: return
-        await inter.response.send_modal(BetModal(self))
-
-class BlackjackGame(discord.ui.View):
-    def __init__(self, user, bet, p_bet, s_bet, upfront_cost=0):
-        super().__init__(timeout=90)
-        self.user, self.bet, self.p_bet, self.s_bet = user, bet, p_bet, s_bet
-        self.total_deducted = upfront_cost
-        self.hand_bets = [bet]
-        self.deck = get_deck()
-        random.shuffle(self.deck)
-        self.hands = [[self.deck.pop(), self.deck.pop()]]
-        self.d_hand = [self.deck.pop(), self.deck.pop()]
-        self.current_hand = 0
-        self.hand_results = [None]
-        self._action_lock = asyncio.Lock()
-        self.side_p, self.side_m = check_sidebets(self.hands[0], self.d_hand[0], p_bet, s_bet)
-        self.update_buttons()
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.user.id:
-            await interaction.response.send_message("這不是你的牌局！", ephemeral=True)
-            return False
-        if self._action_lock.locked():
-            await interaction.response.send_message("⏳ 上一個操作仍在處理中，請稍候。", ephemeral=True)
-            return False
-        now = asyncio.get_running_loop().time()
-        if hasattr(self, "last_action") and now - self.last_action < 1.0:
-            await interaction.response.send_message("⚠️ 操作太快了！請慢慢點擊。", ephemeral=True)
-            return False
-        self.last_action = now
-        return True
-
-    async def _edit(self, message=None, extra_msg="", interaction: discord.Interaction = None, done=False, res="", profit=0, animating=False):
-        try:
-            if interaction:
-                await _send_game(interaction.channel, self, interaction=interaction, done=done, res=res, profit=profit, animating=animating, extra_msg=extra_msg)
-            elif message:
-                await _send_game(message.channel, self, message_obj=message, done=done, res=res, profit=profit, animating=animating, extra_msg=extra_msg)
-        except Exception:
-            logger.exception("21點渲染錯誤 user=%s", self.user.id)
-
-    async def _build_embed_async(self, done=False, res="", profit=0, animating=False, extra_msg="", guild_id=None):
-        stats = await get_user_stats_async(self.user.id)
-        if stats: bal, total, wins, t_prof = stats
-        else: bal, total, wins, t_prof = 0, 0, 0, 0
-        wr = (wins / total * 100) if total > 0 else 0
-        embed = discord.Embed(title="🃏 21點大賽", color=0x2b2d31)
-        main_ui = f"💰 餘額：{bal} | 🏆 勝場：{wins} | 🎲 總局數：{total} | 📈 勝率：{wr:.1f}% | 💸 總盈虧：{t_prof}\n"
-        if extra_msg:
-            main_ui += f"**{extra_msg}**\n"
-        for i, hand in enumerate(self.hands):
-            indicator = "👉 " if i == self.current_hand and not done else ""
-            title_text = f"{indicator}👤 {self.user.display_name} 的手牌"
-            if len(self.hands) > 1:
-                title_text += f" (第 {i+1} 手)"
-            p_cards = " ".join([card_to_emoji(c, guild_id) for c in hand])
-            main_ui += f"### {title_text}\n### {p_cards} (點數: **{calculate_score(hand)}**)\n"
-        if done or animating:
-            d_cards = " ".join([card_to_emoji(c, guild_id) for c in self.d_hand])
-            main_ui += f"### 🤖 莊家手牌\n### {d_cards} (點數: **{calculate_score(self.d_hand)}**)\n"
-            if done:
-                side_profit = self.side_p
-                total_profit = profit + side_profit
-                res_line = f"### 🏆 {res}\n{self.side_m}\n"
-                side_text = f"+{side_profit}" if side_profit > 0 else str(side_profit)
-                res_line += f"🧾 主局淨損益：`{profit:+d}` | 旁注淨損益：`{side_text}`\n"
-                if total_profit > 0:
-                    res_line += f"📈 本局淨損益：`+{total_profit}` | 💰 餘額：`{bal}`\n"
-                elif total_profit < 0:
-                    res_line += f"📉 本局淨損益：`{total_profit}` | 💰 餘額：`{bal}`\n"
-                else:
-                    res_line += f"➖ 本局淨損益：`0` | 💰 餘額：`{bal}`\n"
-                main_ui += res_line
-        else:
-            main_ui += f"### 🤖 莊家手牌\n### {card_to_emoji(self.d_hand[0], guild_id)} {card_back_emoji(guild_id)} (點數: **❓**)\n"
-        embed.description = main_ui
-        return embed
-
-    @property
-    def p_hand(self): return self.hands[self.current_hand]
-
-    def update_buttons(self):
-        values = {'2':2,'3':3,'4':4,'5':5,'6':6,'7':7,'8':8,'9':9,'10':10,'J':10,'Q':10,'K':10,'A':11}
-        can_split = len(self.hands) == 1 and len(self.p_hand) == 2 and values[self.p_hand[0]['rank']] == values[self.p_hand[1]['rank']]
-        can_double = len(self.p_hand) == 2
-        for c in self.children:
-            if c.label == "分牌":
-                c.disabled = not can_split
-            elif c.label == "雙倍":
-                c.disabled = not can_double
-            elif c.label == "投降":
-                c.disabled = len(self.p_hand) > 2 or len(self.hands) > 1
-            elif c.label == "要牌":
-                c.disabled = calculate_score(self.p_hand) > 21
-
-    def build_embed(self, done=False, res="", profit=0, animating=False, extra_msg="", guild_id=None):
-        stats = get_user_stats(self.user.id)
-        if stats: bal, total, wins, t_prof = stats
-        else: bal, total, wins, t_prof = 0, 0, 0, 0
-        wr = (wins/total*100) if total>0 else 0
-        embed = discord.Embed(title="🃏 21點大賽", color=0x2b2d31)
-        main_ui = f"💰 餘額：{bal} | 🏆 勝場：{wins} | 🎲 總局數：{total} | 📈 勝率：{wr:.1f}% | 💸 總盈虧：{t_prof}\n"
-        if extra_msg: main_ui += f"**{extra_msg}**\n"
-        for i, hand in enumerate(self.hands):
-            indicator = "👉 " if i == self.current_hand and not done else ""
-            title_text = f"{indicator}👤 {self.user.display_name} 的手牌"
-            if len(self.hands) > 1: title_text += f" (第 {i+1} 手)"
-            p_cards = ' '.join([card_to_emoji(c, guild_id) for c in hand])
-            main_ui += f"### {title_text}\n### {p_cards} (點數: **{calculate_score(hand)}**)\n"
-        if done or animating:
-            d_cards = ' '.join([card_to_emoji(c, guild_id) for c in self.d_hand])
-            main_ui += f"### 🤖 莊家手牌\n### {d_cards} (點數: **{calculate_score(self.d_hand)}**)\n"
-            if done:
-                side_profit = self.side_p
-                total_profit = profit + side_profit
-                res_line = f"### 🏆 {res}\n{self.side_m}\n"
-                side_text = f"+{side_profit}" if side_profit > 0 else str(side_profit)
-                res_line += f"🧾 主局淨損益：`{profit:+d}` | 旁注淨損益：`{side_text}`\n"
-                if total_profit > 0: res_line += f"📈 本局淨損益：`+{total_profit}` | 💰 餘額：`{bal}`\n"
-                elif total_profit < 0: res_line += f"📉 本局淨損益：`{total_profit}` | 💰 餘額：`{bal}`\n"
-                else: res_line += f"➖ 本局淨損益：`0` | 💰 餘額：`{bal}`\n"
-                main_ui += res_line
-        else:
-            main_ui += f"### 🤖 莊家手牌\n### {card_to_emoji(self.d_hand[0], guild_id)} {card_back_emoji(guild_id)} (點數: **❓**)\n"
-        embed.description = main_ui
-        return embed
-
-    async def check_auto_bj(self, message):
-        if len(self.p_hand) == 2 and calculate_score(self.p_hand) == 21:
-            await asyncio.sleep(1.5)
-            try:
-                await self.advance_hand(message_obj=message)
-            except Exception:
-                logger.exception("21點 check_auto_bj 自動結算失敗 user=%s", self.user.id)
-
-    async def end(self, res, prof, win=False, is_push=False, message_obj=None, interaction=None, exp_gain=0, exp_detail=""):
-        if getattr(self, '_game_over', False): return
-        self._game_over = True
-        
-        total_p = prof + getattr(self, 'side_p', 0)
-        settlement_credit = self.total_deducted + total_p
-        await update_game_result_async(self.user.id, settlement_credit, total_p, win, is_push)
-
-        if exp_gain > 0:
-            await ensure_user_exists_async(self.user.id, 50000)
-            exp_result = await add_user_exp_async(self.user.id, exp_gain)
-            if exp_result and exp_result[1] > exp_result[0]:
-                old_lv, new_lv = exp_result[0], exp_result[1]
-                if any(old_lv < m <= new_lv for m in LEVEL_MILE_TIERS):
-                    asyncio.create_task(process_level_ups(self.user, old_lv, new_lv))
-            res = f"{res}\n✨ 經驗值 `+{exp_gain}`"
-        else:
-            res = f"{res}\n🧊 本局失利，不獲得 EXP"
-        if exp_detail:
-            res = f"{res}\n{exp_detail}"
-
-        for c in self.children: c.disabled = True
-        stats = await get_user_stats_async(self.user.id)
-        nv  = NewGameView(self.user, self.bet, self.p_bet, self.s_bet, stats[0] if stats else 0)
-        await _send_game(message_obj.channel if message_obj else interaction.channel, self, 
-                         interaction=interaction, message_obj=message_obj, view=nv, 
-                         done=True, res=res, profit=prof)
-
-    async def advance_hand(self, message_obj=None, interaction=None):
-        if getattr(self, '_game_over', False): return
-        if self.current_hand < len(self.hands) - 1:
-            self.current_hand += 1
-            self.update_buttons()
-            await self._edit(message=message_obj, interaction=interaction, extra_msg=f"👉 換第 {self.current_hand+1} 手牌")
-            if len(self.p_hand) == 2 and calculate_score(self.p_hand) == 21:
-                await asyncio.sleep(1.5)
-                await self.advance_hand(message_obj=message_obj, interaction=interaction)
-        else:
-            await self.resolve_dealer(message_obj=message_obj, interaction=interaction)
-
-    async def resolve_dealer(self, message_obj=None, interaction=None):
-        if getattr(self, '_game_over', False): return
-        need_dealer = any(hand is None for hand in self.hand_results)
-        for c in self.children: c.disabled = True
-        await self._edit(message=message_obj, interaction=interaction, animating=True)
-        if need_dealer:
-            await asyncio.sleep(1.2)
-            while calculate_score(self.d_hand) < 17 and len(self.d_hand) < 5:
-                self.d_hand.append(self.deck.pop())
-                await self._edit(message=message_obj, interaction=None, animating=True)
-                await asyncio.sleep(1.2)
-        total_prof, final_res_texts = 0, []
-        total_exp_gain = 0
-        exp_detail_texts = []
-        ds = calculate_score(self.d_hand)
-        dealer_bj = len(self.d_hand) == 2 and ds == 21
-        dealer_5_card = len(self.d_hand) == 5 and ds <= 21
-        for i, hand in enumerate(self.hands):
-            if self.hand_results[i] is not None:
-                r, p, w = self.hand_results[i]
-                final_res_texts.append(f"第 {i+1} 手: {r}" if len(self.hands)>1 else r)
-                hand_profit = p
-                total_prof += hand_profit
-                hand_exp_base = roll_gamble_exp_from_bet(self.hand_bets[i])
-                if hand_profit > 0:
-                    hand_exp_award = hand_exp_base
-                elif hand_profit == 0:
-                    hand_exp_award = max(1, hand_exp_base // 2)
-                else:
-                    hand_exp_award = 0
-                total_exp_gain += hand_exp_award
-                if len(self.hands) > 1:
-                    exp_detail_texts.append(f"第 {i+1} 手 EXP `+{hand_exp_award}`")
-                continue
-            ps = calculate_score(hand)
-            player_bj, player_5_card = (len(hand) == 2 and ps == 21), (len(hand) == 5 and ps <= 21)
-            if player_5_card and dealer_5_card:
-                final_res_texts.append("🤝 雙方皆過五關！平手")
-                hand_profit = 0
-            elif player_5_card:
-                final_res_texts.append("🐉 你過五關啦！爽贏 2.5 倍！")
-                hand_profit = int(self.hand_bets[i] * 2.5)
-            elif dealer_5_card:
-                final_res_texts.append("🐉 老子過五關啦！你這低能兒～")
-                hand_profit = -self.hand_bets[i]
-            elif player_bj and dealer_bj:
-                final_res_texts.append("🤝 雙方皆為 BlackJack！平手")
-                hand_profit = 0
-            elif player_bj:
-                final_res_texts.append("🌟 BlackJack！1.5倍賠率！")
-                hand_profit = int(self.hand_bets[i] * 1.5)
-            elif dealer_bj:
-                final_res_texts.append("💀 莊家 BlackJack！你輸啦～雜魚～")
-                hand_profit = -self.hand_bets[i]
-            elif ds > 21 or ps > ds:
-                final_res_texts.append("🎉 這次算你贏啦，腦殘！")
-                hand_profit = self.hand_bets[i]
-            elif ps < ds:
-                final_res_texts.append("💀 你輸啦～雜魚～")
-                hand_profit = -self.hand_bets[i]
-            else:
-                final_res_texts.append("🤝 就這點技術阿腦殘？")
-                hand_profit = 0
-            total_prof += hand_profit
-            hand_exp_base = roll_gamble_exp_from_bet(self.hand_bets[i])
-            if hand_profit > 0:
-                hand_exp_award = hand_exp_base
-            elif hand_profit == 0:
-                hand_exp_award = max(1, hand_exp_base // 2)
-            else:
-                hand_exp_award = 0
-            total_exp_gain += hand_exp_award
-            if len(self.hands) > 1:
-                exp_detail_texts.append(f"第 {i+1} 手 EXP `+{hand_exp_award}`")
-        final_msg = "\n".join(final_res_texts)
-        total_combined = total_prof + getattr(self, 'side_p', 0)
-        exp_detail = ""
-        if len(self.hands) > 1 and exp_detail_texts:
-            exp_detail = "🧮 分牌 EXP 明細\n" + "\n".join(exp_detail_texts)
-        await self.end(
-            final_msg,
-            total_prof,
-            total_combined > 0,
-            total_combined == 0,
-            message_obj=message_obj,
-            interaction=interaction,
-            exp_gain=total_exp_gain,
-            exp_detail=exp_detail,
-        )
-
-    @discord.ui.button(label="要牌", style=discord.ButtonStyle.success)
-    async def hit(self, inter, btn):
-        if inter.user.id != self.user.id: return
-        async with self._action_lock:
-            await inter.response.defer()
-            self.p_hand.append(self.deck.pop())
-            self.update_buttons() 
-            ps = calculate_score(self.p_hand)
-            if ps > 21 or len(self.p_hand) == 5:
-                if ps > 21: self.hand_results[self.current_hand] = ("爆牌輸了", -self.hand_bets[self.current_hand], False)
-                await self.advance_hand(interaction=inter, message_obj=inter.message)
-            else: await self._edit(interaction=inter)
-
-    @discord.ui.button(label="停牌", style=discord.ButtonStyle.danger)
-    async def stand(self, inter, btn):
-        if inter.user.id != self.user.id: return
-        async with self._action_lock:
-            await inter.response.defer(); await self.advance_hand(interaction=inter, message_obj=inter.message)
-
-    @discord.ui.button(label="投降", style=discord.ButtonStyle.secondary)
-    async def surrender(self, inter, btn):
-        if inter.user.id != self.user.id: return
-        async with self._action_lock:
-            await inter.response.defer(); self.hand_results[self.current_hand] = ("這樣就投降了嗎，雜魚～", -(self.hand_bets[self.current_hand]//2), False)
-            await self.advance_hand(interaction=inter, message_obj=inter.message)
-
-    @discord.ui.button(label="雙倍", style=discord.ButtonStyle.primary)
-    async def double_down(self, inter, btn):
-        if inter.user.id != self.user.id: return
-        async with self._action_lock:
-            await inter.response.defer()
-            extra_cost = self.hand_bets[self.current_hand]
-            if not await try_deduct_balance_async(self.user.id, extra_cost, "21點雙倍加注"):
-                return await inter.followup.send("餘額不足", ephemeral=True)
-            self.total_deducted += extra_cost
-            self.hand_bets[self.current_hand] *= 2
-            self.p_hand.append(self.deck.pop())
-            if calculate_score(self.p_hand) > 21: self.hand_results[self.current_hand] = ("你爆牌囉～小丑～", -self.hand_bets[self.current_hand], False)
-            await self.advance_hand(interaction=inter, message_obj=inter.message)
-
-    @discord.ui.button(label="分牌", style=discord.ButtonStyle.primary)
-    async def split(self, inter, btn):
-        if inter.user.id != self.user.id: return
-        async with self._action_lock:
-            await inter.response.defer()
-            if not await try_deduct_balance_async(self.user.id, self.bet, "21點分牌加注"):
-                return await inter.followup.send("餘額不足", ephemeral=True)
-            self.total_deducted += self.bet
-            self.is_split, c1, c2 = True, self.hands[0][0], self.hands[0][1]
-            self.hands, self.hand_results, self.hand_bets = [[c1, self.deck.pop()], [c2, self.deck.pop()]], [None, None], [self.bet, self.bet]
-            self.update_buttons(); await self._edit(interaction=inter, extra_msg="✌️ 你選擇了分牌！")
-            if calculate_score(self.p_hand) == 21: await asyncio.sleep(1.5); await self.advance_hand(interaction=None, message_obj=inter.message)
-
-class ConfirmAllInView(discord.ui.View):
-    def __init__(self, user, parent_msg):
-        super().__init__(timeout=30)
-        self.user, self.parent_msg = user, parent_msg
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.user.id: return False
-        return True
-    @discord.ui.button(label="確定 All In！", style=discord.ButtonStyle.danger)
-    async def confirm(self, inter, btn):
-        if not FEATURE_TOGGLES.get("bj", True) or not IS_EVENT_ACTIVE:
-            return await inter.response.send_message("打烊", ephemeral=True)
-        stats = await get_user_stats_async(self.user.id)
-        if not stats or stats[0] < 100: return await inter.response.send_message("去乞討吧雜魚", ephemeral=True)
-        self.stop(); await inter.response.edit_message(content="🔥 All In 已確認！正在為你開牌...", view=None)
-        try: await self.parent_msg.delete()
-        except: pass
-        gv = BlackjackGame(self.user, stats[0], 0, 0)
-        msg = await _send_game(inter.channel, gv)
-        if msg is not None:
-            await gv.check_auto_bj(msg)
-
-class NewGameView(discord.ui.View):
-    def __init__(self, user, last_bet, last_p_bet, last_s_bet, current_bal):
-        super().__init__(timeout=90)
-        self.user, self.last_bet, self.last_p_bet, self.last_s_bet, self.current_bal = user, last_bet, last_p_bet, last_s_bet, current_bal
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.user.id: return False
-        return True
-    @discord.ui.button(label="再來一局", style=discord.ButtonStyle.success)
-    async def again(self, inter, btn):
-        if inter.user.id != self.user.id: return
-        if not FEATURE_TOGGLES.get("bj", True) or not IS_EVENT_ACTIVE:
-            return await inter.response.send_message("打烊", ephemeral=True)
-        await inter.response.defer()
-        total_cost = self.last_bet + self.last_p_bet + self.last_s_bet
-        if not await try_deduct_balance_async(self.user.id, total_cost, "21點開局扣款"):
-            return await inter.followup.send("餘額不足", ephemeral=True)
-        self.stop()
-        gv = BlackjackGame(self.user, self.last_bet, self.last_p_bet, self.last_s_bet, upfront_cost=total_cost)
-        msg = await _send_game(inter.channel, gv, interaction=inter)
-        if msg is not None:
-            await gv.check_auto_bj(msg)
-        else:
-            logger.error("21點 NewGameView.again：_send_game 未回傳訊息，略過自動 BJ 結算 user=%s", inter.user.id)
-    @discord.ui.button(label="雙倍再局 (Double)", style=discord.ButtonStyle.primary)
-    async def double_again(self, inter, btn):
-        if inter.user.id != self.user.id: return
-        if not FEATURE_TOGGLES.get("bj", True) or not IS_EVENT_ACTIVE:
-            return await inter.response.send_message("打烊", ephemeral=True)
-        await inter.response.defer()
-        new_bet = self.last_bet * 2
-        total_cost = new_bet + self.last_p_bet + self.last_s_bet
-        if not await try_deduct_balance_async(self.user.id, total_cost, "21點開局扣款"):
-            return await inter.followup.send("餘額不足", ephemeral=True)
-        self.stop()
-        gv = BlackjackGame(self.user, new_bet, self.last_p_bet, self.last_s_bet, upfront_cost=total_cost)
-        msg = await _send_game(inter.channel, gv, interaction=inter)
-        if msg is not None:
-            await gv.check_auto_bj(msg)
-        else:
-            logger.error("21點 NewGameView.double_again：_send_game 未回傳訊息，略過自動 BJ 結算 user=%s", inter.user.id)
-    @discord.ui.button(label="修改下注", style=discord.ButtonStyle.secondary)
-    async def modify_bet(self, inter, btn):
-        self.stop(); await inter.response.defer()
-        try: await inter.message.delete()
-        except: pass
-        setup = SetupView(self.user, self.last_bet, self.last_p_bet, self.last_s_bet)
-        await inter.channel.send(embed=setup.build_embed(), view=setup)
-    @discord.ui.button(label="All In (全押)", style=discord.ButtonStyle.danger)
-    async def all_in(self, inter, btn):
-        cv = ConfirmAllInView(self.user, inter.message)
-        await inter.response.send_message("⚠️ 警告：要全押嗎雜魚？", view=cv, ephemeral=True)
-
-def build_random_splits(total_amount, count):
-    remaining = total_amount
-    amounts = []
-    for i in range(count - 1):
-        max_pick = remaining - (count - i - 1)
-        pick = random.randint(1, max_pick)
-        amounts.append(pick)
-        remaining -= pick
-    amounts.append(remaining)
-    random.shuffle(amounts)
-    return amounts
+# 二十一點 UI／流程已抽離到 bot_modules/commands/blackjack.py
 
 class RedPacketView(discord.ui.View):
     def __init__(self, creator_id, total_amount, count):
@@ -3280,6 +1827,35 @@ async def relay_staff_reply_to_dm_user(message: discord.Message) -> bool:
 # on_message：私訊轉接、轉接頻道內工作人員回覆、群組 @ 轉發、聊天句數與 EXP 等。
 # ==============================================================================
 
+_event_tasks = register_events(
+    bot,
+    {
+        "logger": logger,
+        "now_tw_naive": now_tw_naive,
+        "db_to_thread": db_to_thread,
+        "award_vc_rewards_sync": award_vc_rewards_sync,
+        "purge_old_logs_sync": purge_old_logs_sync,
+        "relay_dm_to_staff_channel": relay_dm_to_staff_channel,
+        "relay_staff_reply_to_dm_user": relay_staff_reply_to_dm_user,
+        "relay_user_message_to_staff_channel": relay_user_message_to_staff_channel,
+        "process_on_message_activity_sync": process_on_message_activity_sync,
+        "process_level_ups": process_level_ups,
+        "cleanup_local_caches": cleanup_local_caches,
+        "DM_RELAY_CHANNEL_ID": DM_RELAY_CHANNEL_ID,
+        "DELETE_LOG_CHANNEL_ID": DELETE_LOG_CHANNEL_ID,
+        "MSG_DB_FLUSH_EVERY_SECONDS": MSG_DB_FLUSH_EVERY_SECONDS,
+        "MSG_DB_FLUSH_COUNT": MSG_DB_FLUSH_COUNT,
+        "EXP_COOLDOWN_SECONDS": EXP_COOLDOWN_SECONDS,
+        "CHAT_EXP_MULTIPLIER": CHAT_EXP_MULTIPLIER,
+        "LOG_RETENTION_DAYS": LOG_RETENTION_DAYS,
+        "LOG_PURGE_INTERVAL_SECONDS": LOG_PURGE_INTERVAL_SECONDS,
+        "LEVEL_MILE_TIERS": LEVEL_MILE_TIERS,
+        "_pending_msg_counts": _pending_msg_counts,
+        "_last_msg_flush_ts": _last_msg_flush_ts,
+        "_last_exp_award_ts": _last_exp_award_ts,
+    },
+)
+
 
 @bot.event
 async def on_ready():
@@ -3301,318 +1877,11 @@ async def on_ready():
             logger.info("Guild 同步完成 %s: %s 個指令", guild.id, len(gsynced))
         except Exception as e:
             logger.exception("Guild 同步失敗 %s: %s", guild.id, e)
-    bot.loop.create_task(vc_reward_task())
-    bot.loop.create_task(logs_retention_task())
+    bot.loop.create_task(_event_tasks["vc_reward_task"]())
+    bot.loop.create_task(_event_tasks["logs_retention_task"]())
+    bot.loop.create_task(_event_tasks["cache_cleanup_task"]())
+    bot.loop.create_task(emit_cache_metrics_log_task())
     logger.info("機器人已啟動: %s（伺服器數 %s）", bot.user, len(bot.guilds))
-
-
-async def logs_retention_task():
-    """依 LOG_RETENTION_DAYS 刪除過期帳務流水（預設至少保留 14 天內）。"""
-    await bot.wait_until_ready()
-    while not bot.is_closed():
-        try:
-            if LOG_RETENTION_DAYS <= 0:
-                await asyncio.sleep(LOG_PURGE_INTERVAL_SECONDS)
-                continue
-            removed = await db_to_thread(purge_old_logs_sync, LOG_RETENTION_DAYS)
-            if removed:
-                logger.info(
-                    "logs 保留最近 %s 天：已刪除 %s 筆過期紀錄",
-                    LOG_RETENTION_DAYS,
-                    removed,
-                )
-        except Exception as e:
-            logger.exception("logs 定期清理失敗: %s", e)
-        await asyncio.sleep(LOG_PURGE_INTERVAL_SECONDS)
-
-
-async def vc_reward_task():
-    await bot.wait_until_ready()
-    while not bot.is_closed():
-        await asyncio.sleep(600)
-        now = now_tw_naive()
-        candidate_user_ids: typing.Set[str] = set()
-        for guild in bot.guilds:
-            for vc in guild.voice_channels:
-                for member in vc.members:
-                    if member.bot or member.voice.self_deaf or member.voice.deaf:
-                        continue
-                    user_id = str(member.id)
-                    candidate_user_ids.add(user_id)
-        try:
-            await db_to_thread(award_vc_rewards_sync, list(candidate_user_ids), now)
-        except Exception as e:
-            logger.exception("語音獎勵發放失敗: %s", e)
-
-@bot.event
-async def on_message(message):
-    if message.author.bot:
-        return
-    try:
-        # 私訊 -> 管理伺服器指定頻道
-        if message.guild is None:
-            await relay_dm_to_staff_channel(message)
-            return
-        # 管理頻道：回覆轉發訊息 -> DM 或原頻道代發（略過 Webhook）
-        if message.channel.id == DM_RELAY_CHANNEL_ID:
-            if not message.webhook_id and await relay_staff_reply_to_dm_user(message):
-                return
-        # 任一伺服器頻道 @ 機器人（略過轉接頻道）-> 轉發後可依類型回覆
-        if (
-            message.guild
-            and message.channel.id != DM_RELAY_CHANNEL_ID
-            and bot.user is not None
-            and bot.user in message.mentions
-        ):
-            await relay_user_message_to_staff_channel(message, is_dm=False)
-        if not message.guild:
-            return
-        user_id = str(message.author.id)
-        now = now_tw_naive()
-        now_ts = time.time()
-
-        _pending_msg_counts[user_id] = _pending_msg_counts.get(user_id, 0) + 1
-        pending = _pending_msg_counts[user_id]
-        last_flush = _last_msg_flush_ts.get(user_id, 0.0)
-        should_flush = pending >= MSG_DB_FLUSH_COUNT or (now_ts - last_flush) >= MSG_DB_FLUSH_EVERY_SECONDS
-
-        last_exp_ts = _last_exp_award_ts.get(user_id, 0.0)
-        exp_due = (now_ts - last_exp_ts) >= EXP_COOLDOWN_SECONDS
-
-        if not should_flush and not exp_due:
-            return
-
-        exp_gain = random.randint(12, 20) * CHAT_EXP_MULTIPLIER if exp_due else 0
-        result = await db_to_thread(
-            process_on_message_activity_sync,
-            user_id,
-            pending,
-            now,
-            exp_due,
-            exp_gain,
-        )
-        _pending_msg_counts[user_id] = 0
-        _last_msg_flush_ts[user_id] = now_ts
-        if result.get("exp_awarded"):
-            _last_exp_award_ts[user_id] = now_ts
-            o = int(result.get("old_level") or 1)
-            n = int(result.get("new_level") or 1)
-            if n > o and any(o < m <= n for m in LEVEL_MILE_TIERS):
-                asyncio.create_task(process_level_ups(message.author, o, n))
-    except Exception as e:
-        logger.exception("on_message 錯誤: %s", e)
-    finally:
-        await bot.process_commands(message)
-
-
-DELETE_LOG_EMBED_COLOR = 0x5865F2
-# Discord 單則訊息最多 10 個 embed；圖片預覽用滿後其餘再發後續訊息
-DELETE_LOG_MAX_EMBEDS_PER_MESSAGE = 10
-
-_IMAGE_ATTACHMENT_SUFFIX = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".avif")
-_VIDEO_ATTACHMENT_SUFFIX = (".mp4", ".webm", ".mov", ".mkv")
-
-
-def _classify_attachment(a: discord.Attachment) -> str:
-    """回傳 image / video / file（供刪除訊息紀錄預覽用）。"""
-    ct = (getattr(a, "content_type", None) or "").lower()
-    fn = (getattr(a, "filename", "") or "").lower()
-    if ct.startswith("image/") or any(fn.endswith(s) for s in _IMAGE_ATTACHMENT_SUFFIX):
-        return "image"
-    if ct.startswith("video/") or any(fn.endswith(s) for s in _VIDEO_ATTACHMENT_SUFFIX):
-        return "video"
-    return "file"
-
-
-def _delete_log_image_embed(url: str) -> discord.Embed:
-    """僅含大圖預覽的嵌入（與主紀錄 embed 同色）。"""
-    e = discord.Embed(color=DELETE_LOG_EMBED_COLOR)
-    e.set_image(url=url)
-    return e
-
-
-def _chunk_plain_url_lines(urls: typing.Sequence[str], limit: int = 1950) -> typing.List[str]:
-    """將多個 URL 切成多段訊息文字（供影片連結預覽），避免超過 Discord 上限。"""
-    chunks: typing.List[str] = []
-    buf: typing.List[str] = []
-    size = 0
-    for u in urls:
-        add = len(u) + (1 if buf else 0)
-        if buf and size + add > limit:
-            chunks.append("\n".join(buf))
-            buf = [u]
-            size = len(u)
-        else:
-            if buf:
-                size += 1
-            buf.append(u)
-            size += len(u)
-    if buf:
-        chunks.append("\n".join(buf))
-    return chunks
-
-
-async def _send_delete_log_image_overflow(ch: discord.TextChannel, urls: typing.Sequence[str]) -> None:
-    """第一則已塞滿 10 個 embed 時，其餘圖片改為每則訊息最多 10 張預覽。"""
-    if not urls:
-        return
-    for i in range(0, len(urls), DELETE_LOG_MAX_EMBEDS_PER_MESSAGE):
-        part = urls[i : i + DELETE_LOG_MAX_EMBEDS_PER_MESSAGE]
-        await ch.send(embeds=[_delete_log_image_embed(u) for u in part])
-
-
-async def _is_message_deleted_by_bot(guild: discord.Guild, message: discord.Message) -> bool:
-    """若可判定此刪除由機器人執行，回傳 True（用於刪除紀錄忽略機器人刪除）。"""
-    if guild is None:
-        return False
-    try:
-        me = guild.me
-        if me and not me.guild_permissions.view_audit_log:
-            return False
-    except Exception:
-        return False
-    try:
-        async for entry in guild.audit_logs(limit=8, action=discord.AuditLogAction.message_delete):
-            target = entry.target
-            if not isinstance(target, (discord.Member, discord.User)):
-                continue
-            if message.author and target.id != message.author.id:
-                continue
-            if entry.extra and getattr(entry.extra, "channel", None):
-                if entry.extra.channel.id != message.channel.id:
-                    continue
-            try:
-                age = (datetime.datetime.now(datetime.timezone.utc) - entry.created_at).total_seconds()
-                if age > 10:
-                    continue
-            except Exception:
-                pass
-            actor = entry.user
-            if actor is not None and getattr(actor, "bot", False):
-                return True
-            return False
-    except Exception:
-        return False
-    return False
-
-
-@bot.event
-async def on_message_delete(message: discord.Message):
-    """追蹤伺服器訊息刪除，在紀錄頻道備份原文與附件連結。"""
-    try:
-        if DELETE_LOG_CHANNEL_ID <= 0:
-            return
-        if message.guild is None:
-            return
-        if await _is_message_deleted_by_bot(message.guild, message):
-            return
-        author = message.author
-        if author is not None and author.bot:
-            return
-        log_ch = bot.get_channel(DELETE_LOG_CHANNEL_ID)
-        if log_ch is None:
-            try:
-                log_ch = await bot.fetch_channel(DELETE_LOG_CHANNEL_ID)
-            except Exception:
-                return
-        if not isinstance(log_ch, discord.TextChannel):
-            return
-
-        content = (message.content or "").strip()
-        if not content:
-            content = "*（無文字內容）*"
-
-        guild = message.guild
-        icon = None
-        try:
-            if guild.icon:
-                icon = str(guild.icon.url)
-        except Exception:
-            icon = None
-
-        if author is None:
-            author_line = "發送者：`（訊息未在快取中，無法還原發送者）`"
-        else:
-            author_line = f"{author.mention} · `{author.id}`"
-
-        try:
-            ch_label = message.channel.mention
-        except Exception:
-            ch_label = f"<#{getattr(message.channel, 'id', 0)}>"
-
-        desc_lines = [
-            author_line,
-            f"{ch_label} · {guild.name}",
-        ]
-        if message.created_at:
-            desc_lines.append(f"原訊息時間：<t:{int(message.created_at.timestamp())}:F>")
-        emb = discord.Embed(
-            title="訊息已刪除",
-            description="\n".join(desc_lines),
-            color=DELETE_LOG_EMBED_COLOR,
-            timestamp=datetime.datetime.now(datetime.timezone.utc),
-        )
-        if icon and icon.startswith("http"):
-            emb.set_author(name="刪除紀錄", icon_url=icon)
-        else:
-            emb.set_author(name="刪除紀錄")
-        emb.add_field(name="原文", value=content[:1024], inline=False)
-
-        embeds_out: typing.List[discord.Embed] = [emb]
-        overflow_image_urls: typing.List[str] = []
-        images: typing.List[typing.Tuple[discord.Attachment, str]] = []
-        videos: typing.List[typing.Tuple[discord.Attachment, str]] = []
-        other_files: typing.List[typing.Tuple[discord.Attachment, str]] = []
-
-        if message.attachments:
-            for a in message.attachments:
-                try:
-                    url = a.url
-                except Exception:
-                    continue
-                if not url:
-                    continue
-                kind = _classify_attachment(a)
-                if kind == "image":
-                    images.append((a, url))
-                elif kind == "video":
-                    videos.append((a, url))
-                else:
-                    other_files.append((a, url))
-
-            if images:
-                urls_only = [u for _, u in images]
-                emb.set_image(url=urls_only[0])
-                idx = 1
-                while idx < len(urls_only) and len(embeds_out) < DELETE_LOG_MAX_EMBEDS_PER_MESSAGE:
-                    embeds_out.append(_delete_log_image_embed(urls_only[idx]))
-                    idx += 1
-                overflow_image_urls = list(urls_only[idx:])
-
-            if other_files:
-                link_lines = []
-                for i, (a, url) in enumerate(other_files, start=1):
-                    name = getattr(a, "filename", None) or f"附件{i}"
-                    link_lines.append(f"[`{name}`]({url})")
-                emb.add_field(name="附件（檔案）", value="\n".join(link_lines)[:1024], inline=False)
-
-        emb.set_footer(text=f"訊息 ID · {message.id}")
-
-        video_urls = [u for _, u in videos]
-        video_chunks = _chunk_plain_url_lines(video_urls) if video_urls else []
-
-        send_kw: typing.Dict[str, typing.Any] = {"embeds": embeds_out}
-        if video_chunks:
-            send_kw["content"] = video_chunks[0]
-        await log_ch.send(**send_kw)
-
-        for vc in video_chunks[1:]:
-            await log_ch.send(content=vc)
-
-        if overflow_image_urls:
-            await _send_delete_log_image_overflow(log_ch, overflow_image_urls)
-    except Exception as e:
-        logger.exception("on_message_delete 錯誤: %s", e)
 
 # ··············································································
 # [G · 玩家 Slash 指令]
@@ -3829,7 +2098,6 @@ async def rob(
             interaction.user.id,
             member.id,
             now,
-            target_balance,
             success_rate_pct,
         )
         if not success_result.get("ok"):
@@ -3844,7 +2112,7 @@ async def rob(
             f"{robber_name}搶了{victim_name}`{steal_amount:,}`東雲幣!!（本次成功率約 {success_rate_pct}%）{wanted_info}{revenge_hint}"
         )
 
-    fail_result = await apply_rob_fail_db_async(interaction.user.id, member.id, now, robber_balance)
+    fail_result = await apply_rob_fail_db_async(interaction.user.id, member.id, now)
     fail_penalty = int(fail_result["fail_penalty"])
     deducted = bool(fail_result["deducted"])
     if deducted:
@@ -3979,7 +2247,14 @@ async def cop_hunt_slash(
 
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT COALESCE(role,'civilian'), COALESCE(level,1) FROM users WHERE user_id=%s", (cop_id,))
+    # 固定順序鎖定警察/罪犯兩列，避免多人同時追捕造成讀寫交錯
+    lock_user_rows(c, [cop_id, criminal_id])
+
+    c.execute(
+        "SELECT COALESCE(role,'civilian'), COALESCE(level,1), COALESCE(balance,0) "
+        "FROM users WHERE user_id=%s FOR UPDATE",
+        (cop_id,),
+    )
     cop_row = c.fetchone()
     if not cop_row or cop_row[0] != "cop":
         conn.close()
@@ -3989,9 +2264,12 @@ async def cop_hunt_slash(
             ephemeral=True,
         )
     cop_level = int(cop_row[1] or 1)
+    cop_balance = int(cop_row[2] or 0)
 
     c.execute(
-        "SELECT COALESCE(wanted_stars,0), COALESCE(wanted_hunted_count,0), COALESCE(balance,0), COALESCE(in_prison,0), COALESCE(level,1) FROM users WHERE user_id=%s",
+        "SELECT COALESCE(wanted_stars,0), COALESCE(wanted_hunted_count,0), COALESCE(balance,0), "
+        "COALESCE(in_prison,0), COALESCE(level,1), last_five_robs, COALESCE(bail_debt,0) "
+        "FROM users WHERE user_id=%s FOR UPDATE",
         (criminal_id,),
     )
     criminal_row = c.fetchone()
@@ -4004,6 +2282,8 @@ async def cop_hunt_slash(
     criminal_balance = int(criminal_row[2] or 0)
     in_prison = int(criminal_row[3] or 0)
     criminal_level = int(criminal_row[4] or 1)
+    criminal_last_five_raw = criminal_row[5]
+    bail_debt_before = int(criminal_row[6] or 0)
 
     if in_prison:
         conn.close()
@@ -4037,17 +2317,17 @@ async def cop_hunt_slash(
             ephemeral=True,
         )
 
-    c.execute(
-        "UPDATE users SET balance=balance-%s WHERE user_id=%s AND balance >= %s",
-        (COP_HUNT_FEE, cop_id, COP_HUNT_FEE),
-    )
-    if c.rowcount == 0:
+    if cop_balance < COP_HUNT_FEE:
         conn.close()
         return await interaction_send(
             interaction,
             f"❌ 每次追捕須支付 **`{COP_HUNT_FEE:,}`** 東雲幣，你的餘額不足。",
             ephemeral=True,
         )
+    c.execute(
+        "UPDATE users SET balance=balance-%s WHERE user_id=%s",
+        (COP_HUNT_FEE, cop_id),
+    )
 
     capture_chance_raw = (
         COP_HUNT_CAPTURE_BASE_PCT
@@ -4062,21 +2342,23 @@ async def cop_hunt_slash(
         "INSERT INTO wanted_log (criminal_id, cop_id, wanted_stars, caught) VALUES (%s, %s, %s, %s)",
         (criminal_id, cop_id, wanted_stars, 1 if is_caught else 0),
     )
+    log_transaction_in_tx(c, cop_id, -COP_HUNT_FEE, "追捕行動費用")
 
     if is_caught:
-        last_five_total, rob_count, rob_history = get_last_five_robs_total(criminal_id)
+        last_five_total, rob_count = rob_history_total_from_raw(criminal_last_five_raw)
+        rob_history: typing.List[typing.Any] = []
+        if criminal_last_five_raw:
+            try:
+                parsed = json.loads(criminal_last_five_raw)
+                if isinstance(parsed, list):
+                    rob_history = parsed
+            except Exception:
+                rob_history = []
         cop_reward = int(last_five_total)
-        c.execute("SELECT COALESCE(balance,0) FROM users WHERE user_id=%s", (criminal_id,))
-        bal_row = c.fetchone()
-        criminal_balance = int(bal_row[0] or 0) if bal_row else 0
         confiscated_base = int(last_five_total * 0.6)
         confiscated_amount = min(confiscated_base, criminal_balance)
         conf_shortfall = max(0, confiscated_base - confiscated_amount)
         remaining_bal = max(0, criminal_balance - confiscated_amount)
-
-        c.execute("SELECT COALESCE(bail_debt, 0) FROM users WHERE user_id=%s", (criminal_id,))
-        _bd_row = c.fetchone()
-        bail_debt_before = int((_bd_row[0] if _bd_row else 0) or 0)
         bail_debt_after = bail_debt_before + conf_shortfall
         total_bail_needed = BAIL_COST + bail_debt_after
 
@@ -4092,6 +2374,8 @@ async def cop_hunt_slash(
             "UPDATE users SET balance=balance+%s WHERE user_id=%s",
             (cop_reward, cop_id),
         )
+        log_transaction_in_tx(c, criminal_id, -confiscated_amount, f"被警察逮捕沒收 {confiscated_amount:,}")
+        log_transaction_in_tx(c, cop_id, cop_reward, f"逮捕通緝犯 {criminal_user.id} 贓款")
         c.execute(
             """INSERT INTO prison_records
                (criminal_id, cop_id, wanted_stars, confiscated_amount, cop_reward, bail_cost, arrested_at)
@@ -4100,10 +2384,6 @@ async def cop_hunt_slash(
         )
         conn.commit()
         conn.close()
-
-        log_transaction(cop_id, -COP_HUNT_FEE, "追捕行動費用")
-        log_transaction(criminal_id, -confiscated_amount, f"被警察逮捕沒收 {confiscated_amount:,}")
-        log_transaction(cop_id, cop_reward, f"逮捕通緝犯 {criminal_user.id} 贓款")
 
         rob_detail = ""
         if rob_history:
@@ -4170,8 +2450,6 @@ async def cop_hunt_slash(
     )
     conn.commit()
     conn.close()
-
-    log_transaction(cop_id, -COP_HUNT_FEE, "追捕行動費用")
 
     last_five_total, rob_count, rob_history = get_last_five_robs_total(criminal_id)
     rob_detail = ""
@@ -4522,8 +2800,10 @@ async def counter_rob_slash(interaction: discord.Interaction):
 
     conn = get_db_connection()
     c = conn.cursor()
+    # 先鎖自己，再拿到 robber_id 後用共用 helper 進行固定順序上鎖
+    lock_user_rows(c, [victim_id])
     c.execute(
-        "SELECT COALESCE(role,'civilian'), revenge_pending, revenge_robber_id, revenge_amount FROM users WHERE user_id=%s",
+        "SELECT COALESCE(role,'civilian'), revenge_pending, revenge_robber_id, revenge_amount FROM users WHERE user_id=%s FOR UPDATE",
         (victim_id,),
     )
     row = c.fetchone()
@@ -4556,10 +2836,20 @@ async def counter_rob_slash(interaction: discord.Interaction):
             ephemeral=True,
         )
 
-    c.execute("SELECT level, balance FROM users WHERE user_id=%s", (victim_id,))
+    locked_ids = lock_user_rows(c, [victim_id, robber_id])
+    if str(robber_id) not in locked_ids:
+        c.execute(
+            "UPDATE users SET revenge_pending=0, revenge_robber_id=NULL, revenge_amount=0 WHERE user_id=%s",
+            (victim_id,),
+        )
+        conn.commit()
+        conn.close()
+        return await interaction_send(interaction, "找不到搶匪帳號，機會已清除。", ephemeral=True)
+
+    c.execute("SELECT level, balance FROM users WHERE user_id=%s FOR UPDATE", (victim_id,))
     vrow = c.fetchone()
     victim_level = int((vrow[0] if vrow else 1) or 1)
-    c.execute("SELECT level, balance FROM users WHERE user_id=%s", (str(robber_id),))
+    c.execute("SELECT level, balance FROM users WHERE user_id=%s FOR UPDATE", (str(robber_id),))
     rrow = c.fetchone()
     if not rrow:
         c.execute(
@@ -4609,6 +2899,9 @@ async def counter_rob_slash(interaction: discord.Interaction):
             )
             robber_imprisoned = True
         c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (doubled, victim_id))
+        log_transaction_in_tx(c, victim_id, doubled, f"平民加倍搶回（對搶匪:{robber_id}）")
+        if pay > 0:
+            log_transaction_in_tx(c, robber_id, -pay, f"被平民加倍搶回（受害者:{victim_id}）")
         transferred = doubled
 
     c.execute(
@@ -4620,9 +2913,6 @@ async def counter_rob_slash(interaction: discord.Interaction):
     pct = int(round(success_rate * 100))
 
     if transferred > 0:
-        log_transaction(victim_id, transferred, f"平民加倍搶回（對搶匪:{robber_id}）")
-        if pay > 0:
-            log_transaction(robber_id, -pay, f"被平民加倍搶回（受害者:{victim_id}）")
         robber_mem = interaction.guild.get_member(int(robber_id))
         rn = robber_mem.display_name if robber_mem else robber_id
         _am_success = discord.AllowedMentions(
@@ -4711,19 +3001,7 @@ async def rescue(interaction: discord.Interaction):
     embed.set_footer(text="請謹慎下注，避免再次破產")
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="bj", description="開始 21 點")
-@app_commands.describe(bet="注額")
-async def bj(interaction: discord.Interaction, bet: int = 1000):
-    if not FEATURE_TOGGLES.get("bj", True):
-        return await interaction_send(interaction, "⛔ `/bj` 目前暫時關閉中。", ephemeral=True)
-    if not IS_EVENT_ACTIVE:
-        return await interaction_send(interaction, "打烊", ephemeral=True)
-    if bet < 100:
-        return await interaction_send(interaction, "低消 100", ephemeral=True)
-    await interaction_defer_if_needed(interaction)
-    await ensure_user_exists_async(interaction.user.id, 50000)
-    sv = SetupView(interaction.user, bet)
-    await interaction_send(interaction, embed=await sv._build_embed_async(), view=sv)
+# /bj 已抽離到 bot_modules/commands/blackjack.py
 
 @bot.tree.command(name="balance", description="查詢個人的戰績與餘額")
 @app_commands.describe(member="要查詢的成員（選填）", user_id="或填對方使用者 ID（選填）")
@@ -4906,559 +3184,7 @@ async def redpacket(interaction: discord.Interaction, total_amount: int, count: 
     except Exception:
         logger.exception("redpacket: 無法取得 original_response 供 timeout 編輯使用")
 
-# ──────────────────────────────────────────────────────────────────────
-# E 卡決鬥（仿《賭博默示錄》）：
-# 兩大局制，第一大局隨機分派國王方／奴隸方，第二大局交換陣營。
-# 國王方持 👑×1 + 🧑×4；奴隸方持 🗡️×1 + 🧑×4。
-# 同牌（民vs民）平手 → 各自消耗該牌後進入該大局下一小局。
-# 勝負規則（克制）：👑 > 🧑、🧑 > 🗡️、🗡️ > 👑。
-# 計分：奴隸贏王 +3；其餘決勝（國王抓平民／平民抓奴隸）+1。
-# 兩大局結束後，依雙方積分比例分配彩池（共 2×注額）。
-# ──────────────────────────────────────────────────────────────────────
-DUEL_CARDS = {
-    "king": ("👑", "王"),
-    "citizen": ("🧑", "民"),
-    "slave": ("🗡️", "奴"),
-}
-
-
-def _duel_resolve_round(em_pick: str, sl_pick: str) -> str:
-    """em_pick 為國王方出牌（king/citizen），sl_pick 為奴隸方出牌（slave/citizen）。
-    回傳 'emperor'｜'slave'｜'draw'。"""
-    if em_pick == "citizen" and sl_pick == "citizen":
-        return "draw"
-    if em_pick == "king" and sl_pick == "slave":
-        return "slave"
-    return "emperor"
-
-
-class EDuelInviteView(discord.ui.View):
-    def __init__(self, challenger: discord.Member, opponent: discord.Member, bet: int):
-        super().__init__(timeout=120)
-        self.challenger = challenger
-        self.opponent = opponent
-        self.bet = int(bet)
-        self.message: typing.Optional[discord.Message] = None
-        self.resolved = False
-
-    async def _refund_challenger(self):
-        await credit_balance_with_log_async(self.challenger.id, self.bet, "E卡決鬥取消退款")
-
-    @discord.ui.button(label="接受", style=discord.ButtonStyle.success)
-    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.opponent.id:
-            return await interaction.response.send_message("這場決鬥不是邀請你的。", ephemeral=True)
-        if self.resolved:
-            return await interaction.response.defer()
-        if not await try_deduct_balance_async(self.opponent.id, self.bet, "E卡決鬥下注"):
-            return await interaction.response.send_message(
-                f"❌ 你的餘額不足，需要 `{self.bet:,}` 東雲幣才能接受此決鬥。",
-                ephemeral=True,
-            )
-        self.resolved = True
-        for child in self.children:
-            child.disabled = True
-        match = EDuelMatch(self.challenger, self.opponent, self.bet)
-        play = EDuelPlayView(match)
-        match.view = play
-        match.channel = interaction.channel
-        await interaction.response.edit_message(
-            content=None,
-            embed=match.build_selection_embed(),
-            view=play,
-        )
-        try:
-            match.message = await interaction.original_response()
-        except Exception:
-            pass
-        self.stop()
-
-    @discord.ui.button(label="拒絕", style=discord.ButtonStyle.danger)
-    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.opponent.id:
-            return await interaction.response.send_message("這場決鬥不是邀請你的。", ephemeral=True)
-        if self.resolved:
-            return await interaction.response.defer()
-        self.resolved = True
-        await self._refund_challenger()
-        for child in self.children:
-            child.disabled = True
-        await interaction.response.edit_message(
-            content=(
-                f"❌ {self.opponent.mention} 拒絕了 {self.challenger.mention} 的 E 卡決鬥。"
-                f"已退回挑戰者注金 `{self.bet:,}`。"
-            ),
-            view=self,
-        )
-        self.stop()
-
-    async def on_timeout(self):
-        if self.resolved:
-            return
-        self.resolved = True
-        await self._refund_challenger()
-        for child in self.children:
-            child.disabled = True
-        try:
-            if self.message:
-                await self.message.edit(
-                    content=(
-                        f"⌛ {self.opponent.mention} 未在時限內回應 {self.challenger.mention} 的 E 卡決鬥邀請，"
-                        f"挑戰者注金 `{self.bet:,}` 已退回。"
-                    ),
-                    view=self,
-                )
-        except Exception:
-            pass
-
-
-class _DuelCardButton(discord.ui.Button):
-    def __init__(self, key: str, match: "EDuelMatch", picker_id: int, count: int):
-        emoji, label = DUEL_CARDS[key]
-        super().__init__(
-            style=discord.ButtonStyle.primary,
-            label=f"{label} ×{count}",
-            emoji=emoji,
-        )
-        self.key = key
-        self.match = match
-        self.picker_id = picker_id
-
-    async def callback(self, interaction: discord.Interaction):
-        await self.match.record_pick(interaction, self.picker_id, self.key)
-
-
-class EDuelPickerView(discord.ui.View):
-    """每位玩家私下選牌的 ephemeral 視圖；按鈕依當下剩餘持牌動態產生。"""
-
-    def __init__(self, match: "EDuelMatch", picker_id: int):
-        super().__init__(timeout=120)
-        hand = match.hands.get(picker_id, {})
-        for key in ("king", "citizen", "slave"):
-            cnt = int(hand.get(key, 0) or 0)
-            if cnt <= 0:
-                continue
-            self.add_item(_DuelCardButton(key, match, picker_id, cnt))
-
-
-class EDuelMatch:
-    """兩大局 E 卡決鬥的對局狀態與流程控制；全程於單一訊息原地更新 embed。"""
-
-    def __init__(self, challenger: discord.Member, opponent: discord.Member, bet: int):
-        self.challenger = challenger
-        self.opponent = opponent
-        self.bet = int(bet)
-        first_emperor = random.choice([challenger.id, opponent.id])
-        first_slave = opponent.id if first_emperor == challenger.id else challenger.id
-        self.game_roles: typing.List[typing.Dict[int, str]] = [
-            {first_emperor: "emperor", first_slave: "slave"},
-            {first_emperor: "slave", first_slave: "emperor"},
-        ]
-        self.game_no = 1
-        self.round_in_game = 1
-        self.scores: typing.Dict[int, int] = {challenger.id: 0, opponent.id: 0}
-        self.round_history: typing.List[typing.Dict[str, typing.Any]] = []
-        self.last_round: typing.Optional[typing.Dict[str, typing.Any]] = None
-        self.picks: typing.Dict[int, str] = {}
-        self.hands: typing.Dict[int, typing.Dict[str, int]] = self._make_hands(0)
-        self.channel: typing.Optional[discord.abc.Messageable] = None
-        self.view: typing.Optional["EDuelPlayView"] = None
-        self.message: typing.Optional[discord.Message] = None
-        self.settled = False
-
-    def _make_hands(self, game_idx: int) -> typing.Dict[int, typing.Dict[str, int]]:
-        roles = self.game_roles[game_idx]
-        return {
-            uid: ({"king": 1, "citizen": 4} if r == "emperor" else {"slave": 1, "citizen": 4})
-            for uid, r in roles.items()
-        }
-
-    def _role_of(self, uid: int, game_no: typing.Optional[int] = None) -> str:
-        gn = game_no or self.game_no
-        return self.game_roles[gn - 1].get(uid, "emperor")
-
-    def _uid_for_role(self, role: str, game_no: typing.Optional[int] = None) -> int:
-        gn = game_no or self.game_no
-        for uid, r in self.game_roles[gn - 1].items():
-            if r == role:
-                return uid
-        return 0
-
-    def _member_for_uid(self, uid: int) -> discord.Member:
-        return self.challenger if self.challenger.id == uid else self.opponent
-
-    def _format_hand(self, uid: int) -> str:
-        h = self.hands.get(uid, {})
-        role = self._role_of(uid)
-        if role == "emperor":
-            return f"👑 ×{int(h.get('king', 0) or 0)}　🧑 ×{int(h.get('citizen', 0) or 0)}"
-        return f"🗡️ ×{int(h.get('slave', 0) or 0)}　🧑 ×{int(h.get('citizen', 0) or 0)}"
-
-    def _role_label(self, role: str) -> str:
-        return "👑 國王方" if role == "emperor" else "🗡️ 奴隸方"
-
-    def _player_status_value(self, uid: int) -> str:
-        return "✅ 已選牌" if uid in self.picks else "⏳ 等待選牌中…"
-
-    def _last_round_outcome_text(self) -> str:
-        entry = self.last_round
-        if not entry:
-            return ""
-        em_member = self._member_for_uid(entry["em_uid"])
-        sl_member = self._member_for_uid(entry["sl_uid"])
-        em_e, em_l = DUEL_CARDS[entry["em_pick"]]
-        sl_e, sl_l = DUEL_CARDS[entry["sl_pick"]]
-        if entry["result"] == "draw":
-            tag = "🤝 平手（民 vs 民），雙方消耗該牌"
-        elif entry["result"] == "emperor":
-            tag = f"🏆 {em_member.display_name}（👑 國王方）+1"
-        else:
-            tag = f"🏆 {sl_member.display_name}（🗡️ 奴隸方）+3"
-        return (
-            f"第 {entry['game']} 大局・第 {entry['round']} 小局　"
-            f"👑 {em_e} {em_l}　vs　🗡️ {sl_e} {sl_l}　— {tag}"
-        )
-
-    def build_selection_embed(self) -> discord.Embed:
-        em_uid = self._uid_for_role("emperor")
-        sl_uid = self._uid_for_role("slave")
-        em_member = self._member_for_uid(em_uid)
-        sl_member = self._member_for_uid(sl_uid)
-        emb = discord.Embed(
-            title=f"⚔️ 第 {self.game_no} 大局・第 {self.round_in_game} 小局｜選牌中",
-            description=(
-                f"{self.challenger.mention}　**VS**　{self.opponent.mention}\n"
-                f"注額：`{self.bet:,}`　｜　彩池：`{self.bet * 2:,}` 東雲幣\n"
-                f"本大局陣營：👑 {em_member.mention}　vs　🗡️ {sl_member.mention}\n"
-                "勝：👑 > 🧑、🧑 > 🗡️、🗡️ > 👑（民vs民平手繼續）\n"
-                "計分：奴隸贏王 +3｜其餘決勝 +1"
-            ),
-            color=0x5865F2,
-        )
-        if self.last_round:
-            emb.add_field(name="上一小局結果", value=self._last_round_outcome_text(), inline=False)
-        emb.add_field(
-            name=f"{em_member.display_name}　👑 國王方｜剩餘",
-            value=self._format_hand(em_uid),
-            inline=True,
-        )
-        emb.add_field(name="\u200b", value="⚔️", inline=True)
-        emb.add_field(
-            name=f"{sl_member.display_name}　🗡️ 奴隸方｜剩餘",
-            value=self._format_hand(sl_uid),
-            inline=True,
-        )
-        emb.add_field(
-            name="目前積分",
-            value=(
-                f"{self.challenger.display_name}: `{self.scores[self.challenger.id]}`　｜　"
-                f"{self.opponent.display_name}: `{self.scores[self.opponent.id]}`"
-            ),
-            inline=False,
-        )
-        emb.add_field(
-            name=self.challenger.display_name,
-            value=self._player_status_value(self.challenger.id),
-            inline=True,
-        )
-        emb.add_field(name="\u200b", value="\u200b", inline=True)
-        emb.add_field(
-            name=self.opponent.display_name,
-            value=self._player_status_value(self.opponent.id),
-            inline=True,
-        )
-        emb.set_footer(text="第二大局會交換陣營｜長時間未動作將退款")
-        return emb
-
-    def build_picker_embed(self, picker_id: int) -> discord.Embed:
-        h = self.hands.get(picker_id, {})
-        role = self._role_of(picker_id)
-        order = ("king", "citizen") if role == "emperor" else ("slave", "citizen")
-        parts = []
-        for key in order:
-            e, l = DUEL_CARDS[key]
-            cnt = int(h.get(key, 0) or 0)
-            if cnt > 0:
-                parts.append(f"{e} {l} ×{cnt}")
-        hand_text = "　".join(parts) if parts else "（已無牌）"
-        emb = discord.Embed(
-            title=f"🎴 第 {self.game_no} 大局・第 {self.round_in_game} 小局｜選牌",
-            description=(
-                f"你本大局：{self._role_label(role)}\n"
-                f"你的剩餘持牌：{hand_text}\n"
-                "勝：👑 > 🧑、🧑 > 🗡️、🗡️ > 👑"
-            ),
-            color=0x5865F2,
-        )
-        emb.set_footer(text="送出後不可更改｜長時間未動作將退款")
-        return emb
-
-    async def _refresh_message(self) -> None:
-        if not self.message or not self.view:
-            return
-        try:
-            await self.message.edit(embed=self.build_selection_embed(), view=self.view)
-        except Exception:
-            pass
-
-    def _format_history(self) -> str:
-        if not self.round_history:
-            return "（尚無紀錄）"
-        lines = []
-        last_game = 0
-        for entry in self.round_history:
-            if entry["game"] != last_game:
-                last_game = entry["game"]
-                lines.append(f"**第 {last_game} 大局**")
-            em_e, _ = DUEL_CARDS[entry["em_pick"]]
-            sl_e, _ = DUEL_CARDS[entry["sl_pick"]]
-            em_member = self._member_for_uid(entry["em_uid"])
-            sl_member = self._member_for_uid(entry["sl_uid"])
-            res = entry["result"]
-            if res == "draw":
-                tag = "🤝 平手"
-            elif res == "emperor":
-                tag = f"🏆 {em_member.display_name} +1"
-            else:
-                tag = f"🏆 {sl_member.display_name} +3"
-            lines.append(f"　第 {entry['round']} 小局：👑 {em_e}　vs　🗡️ {sl_e}　— {tag}")
-        return "\n".join(lines)
-
-    async def _refund_both(self, reason: str) -> None:
-        await credit_balance_with_log_async(self.challenger.id, self.bet, reason)
-        await credit_balance_with_log_async(self.opponent.id, self.bet, reason)
-
-    async def _settle_match(self) -> typing.Dict[str, int]:
-        pot = self.bet * 2
-        s_a = self.scores[self.challenger.id]
-        s_b = self.scores[self.opponent.id]
-        total = s_a + s_b
-        if total <= 0:
-            a_amt = self.bet
-            b_amt = pot - a_amt
-        else:
-            a_amt = pot * s_a // total
-            b_amt = pot - a_amt
-        await settle_duel_payouts_with_log_async(
-            self.challenger.id,
-            self.opponent.id,
-            a_amt,
-            b_amt,
-            s_a,
-            s_b,
-        )
-        return {"a": a_amt, "b": b_amt, "s_a": s_a, "s_b": s_b}
-
-    def _build_final_embed(self, payouts: typing.Dict[str, int]) -> discord.Embed:
-        s_a = payouts["s_a"]
-        s_b = payouts["s_b"]
-        a_amt = payouts["a"]
-        b_amt = payouts["b"]
-        if s_a == s_b:
-            outcome = f"🤝 兩大局後積分平手 **{s_a} : {s_b}**，平分彩池。"
-            color = 0xFFD166
-        elif s_a > s_b:
-            outcome = f"🏆 {self.challenger.mention} 以 **{s_a} : {s_b}** 勝出！"
-            color = 0x57F287
-        else:
-            outcome = f"🏆 {self.opponent.mention} 以 **{s_b} : {s_a}** 勝出！"
-            color = 0x57F287
-        emb = discord.Embed(title="⚔️ E 卡決鬥｜整場結算", description=outcome, color=color)
-        emb.add_field(
-            name="積分",
-            value=(
-                f"{self.challenger.display_name}: `{s_a}`　｜　"
-                f"{self.opponent.display_name}: `{s_b}`"
-            ),
-            inline=False,
-        )
-        emb.add_field(
-            name="彩池分配",
-            value=(
-                f"{self.challenger.display_name}: `{a_amt:,}`　｜　"
-                f"{self.opponent.display_name}: `{b_amt:,}`"
-            ),
-            inline=False,
-        )
-        emb.add_field(name="對戰過程", value=self._format_history()[:1024], inline=False)
-        emb.set_footer(text="計分：奴贏王 +3｜其餘決勝 +1｜兩大局制（第二大局交換陣營）")
-        return emb
-
-    async def record_pick(self, interaction: discord.Interaction, picker_id: int, key: str):
-        if interaction.user.id != picker_id:
-            return await interaction.response.send_message("這個按鈕不是給你的。", ephemeral=True)
-        if self.settled:
-            return await interaction.response.send_message("此場決鬥已結束。", ephemeral=True)
-        if picker_id in self.picks:
-            return await interaction.response.send_message("你本小局已經選過了。", ephemeral=True)
-        if int(self.hands.get(picker_id, {}).get(key, 0) or 0) <= 0:
-            return await interaction.response.send_message("你已沒有這張牌。", ephemeral=True)
-        self.picks[picker_id] = key
-        emoji, label = DUEL_CARDS[key]
-        confirm_emb = discord.Embed(
-            title=f"✅ 已送出（第 {self.game_no} 大局・第 {self.round_in_game} 小局）",
-            description=f"你出的是：{emoji} **{label}**\n等待對手出牌與翻牌結算…",
-            color=0x57F287,
-        )
-        await interaction.response.edit_message(content=None, embed=confirm_emb, view=None)
-        if not self.settled and len(self.picks) < 2:
-            await self._refresh_message()
-        if len(self.picks) == 2 and not self.settled:
-            await self._process_round()
-
-    async def _process_round(self):
-        em_uid = self._uid_for_role("emperor")
-        sl_uid = self._uid_for_role("slave")
-        em_pick = self.picks[em_uid]
-        sl_pick = self.picks[sl_uid]
-        em_hand = self.hands[em_uid]
-        sl_hand = self.hands[sl_uid]
-        em_hand[em_pick] = max(0, int(em_hand.get(em_pick, 0)) - 1)
-        sl_hand[sl_pick] = max(0, int(sl_hand.get(sl_pick, 0)) - 1)
-        result = _duel_resolve_round(em_pick, sl_pick)
-        if result == "emperor":
-            self.scores[em_uid] += 1
-        elif result == "slave":
-            self.scores[sl_uid] += 3
-        entry = {
-            "game": self.game_no,
-            "round": self.round_in_game,
-            "em_uid": em_uid,
-            "sl_uid": sl_uid,
-            "em_pick": em_pick,
-            "sl_pick": sl_pick,
-            "result": result,
-        }
-        self.round_history.append(entry)
-        self.last_round = entry
-
-        if result == "draw":
-            self.picks.clear()
-            self.round_in_game += 1
-            await self._refresh_message()
-            return
-
-        if self.game_no < 2:
-            self.game_no = 2
-            self.round_in_game = 1
-            self.hands = self._make_hands(1)
-            self.picks.clear()
-            await self._refresh_message()
-            return
-
-        self.settled = True
-        payouts = await self._settle_match()
-        if self.message and self.view:
-            for child in self.view.children:
-                child.disabled = True
-            self.view.stop()
-            try:
-                await self.message.edit(embed=self._build_final_embed(payouts), view=None)
-            except Exception:
-                pass
-
-    async def handle_timeout(self, view: "EDuelPlayView") -> None:
-        if self.settled or self.view is not view:
-            return
-        self.settled = True
-        await self._refund_both("E卡決鬥逾時退款")
-        pending = []
-        if self.challenger.id not in self.picks:
-            pending.append(self.challenger.mention)
-        if self.opponent.id not in self.picks:
-            pending.append(self.opponent.mention)
-        try:
-            for child in view.children:
-                child.disabled = True
-            if self.message:
-                await self.message.edit(
-                    content=(
-                        f"⌛ E 卡決鬥逾時（第 {self.game_no} 大局・第 {self.round_in_game} 小局未完成；"
-                        f"未選：{', '.join(pending) or '—'}）。雙方注金 `{self.bet:,}` 已退回。"
-                    ),
-                    embed=None,
-                    view=view,
-                )
-        except Exception:
-            pass
-
-
-class EDuelPlayView(discord.ui.View):
-    """全場單一訊息使用的選牌 view。"""
-
-    def __init__(self, match: EDuelMatch):
-        super().__init__(timeout=300)
-        self.match = match
-
-    @discord.ui.button(label="選牌（私下）", style=discord.ButtonStyle.primary, emoji="🎴")
-    async def pick(self, interaction: discord.Interaction, button: discord.ui.Button):
-        m = self.match
-        if interaction.user.id not in (m.challenger.id, m.opponent.id):
-            return await interaction.response.send_message("你不是這場決鬥的玩家。", ephemeral=True)
-        if m.settled:
-            return await interaction.response.send_message("此場決鬥已結束。", ephemeral=True)
-        if interaction.user.id in m.picks:
-            return await interaction.response.send_message(
-                "你本小局已經選過了，等對手出牌。", ephemeral=True
-            )
-        view = EDuelPickerView(m, interaction.user.id)
-        await interaction.response.send_message(
-            embed=m.build_picker_embed(interaction.user.id),
-            view=view,
-            ephemeral=True,
-        )
-
-    async def on_timeout(self):
-        await self.match.handle_timeout(self)
-
-
-@bot.tree.command(
-    name="duel",
-    description="E 卡決鬥（賭博默示錄風）：兩大局制，第二大局交換陣營，依積分分配彩池",
-)
-@app_commands.describe(member="對手", bet="雙方下注金額（兩邊相同）")
-async def duel_slash(
-    interaction: discord.Interaction,
-    member: discord.Member,
-    bet: int,
-):
-    if not FEATURE_TOGGLES.get("duel", True):
-        return await interaction_send(interaction, "⛔ `/duel` 目前暫時關閉中。", ephemeral=True)
-    if not interaction.guild:
-        return await interaction_send(interaction, "請在伺服器頻道使用。", ephemeral=True)
-    if member.bot:
-        return await interaction_send(interaction, "不能對機器人發起決鬥。", ephemeral=True)
-    if member.id == interaction.user.id:
-        return await interaction_send(interaction, "不能對自己發起決鬥。", ephemeral=True)
-    if bet <= 0:
-        return await interaction_send(interaction, "注金需大於 0。", ephemeral=True)
-    await interaction_defer_if_needed(interaction)
-    await ensure_user_exists_async(interaction.user.id, 50000)
-    await ensure_user_exists_async(member.id, 50000)
-    if not await try_deduct_balance_async(interaction.user.id, bet, "E卡決鬥下注"):
-        return await interaction_send(
-            interaction,
-            f"❌ 你的餘額不足，需要 `{bet:,}` 東雲幣才能發起決鬥。",
-            ephemeral=True,
-        )
-    view = EDuelInviteView(interaction.user, member, bet)
-    sent = await interaction_send(
-        interaction,
-        content=(
-            f"⚔️ {interaction.user.mention} 向 {member.mention} 發起 **E 卡決鬥**！\n"
-            f"注額：`{bet:,}` 東雲幣\n"
-            f"持牌：國王方 👑×1+🧑×4　奴隸方 🗡️×1+🧑×4\n"
-            f"勝：👑 > 🧑、🧑 > 🗡️、🗡️ > 👑\n"
-            f"計分：奴贏王 +3｜其餘決勝 +1\n"
-            f"規則：兩大局制，第一大局隨機分派陣營，第二大局交換；依積分分配彩池\n"
-            f"{member.mention} 請於 **120 秒** 內點 **接受** 或 **拒絕**。"
-        ),
-        view=view,
-    )
-    try:
-        view.message = sent or await interaction.original_response()
-    except Exception:
-        pass
+# E 卡決鬥指令／流程已抽離到 bot_modules/commands/duel.py
 
 
 @bot.tree.command(name="kill", description="在目前頻道送出 Minecraft 風格隨機死法")
@@ -5501,6 +3227,7 @@ async def bicycle_slash(interaction: discord.Interaction):
 
     conn = get_db_connection()
     c = conn.cursor()
+    lock_user_rows(c, [thief_id, target_id])
     c.execute("SELECT last_bicycle FROM users WHERE user_id=%s", (thief_id,))
     row = c.fetchone()
     last_bicycle = row[0] if row else None
@@ -5531,10 +3258,10 @@ async def bicycle_slash(interaction: discord.Interaction):
             (steal_amount, thief_id),
         )
         c.execute("UPDATE users SET last_bicycle=%s WHERE user_id=%s", (now, thief_id))
+        log_transaction_in_tx(c, target_id, -steal_amount, f"腳踏車被偷（偷車者:{thief_id}）")
+        log_transaction_in_tx(c, thief_id, steal_amount, f"偷走奈音腳踏車（目標:{target_id}）")
         conn.commit()
         conn.close()
-        log_transaction(target_id, -steal_amount, f"腳踏車被偷（偷車者:{thief_id}）")
-        log_transaction(thief_id, steal_amount, f"偷走奈音腳踏車（目標:{target_id}）")
         return await interaction.response.send_message("你成功偷走了奈音的腳踏車!")
 
     c.execute("UPDATE users SET last_bicycle=%s WHERE user_id=%s", (now, thief_id))
@@ -5594,19 +3321,202 @@ async def record_cmd(
 
 async def _is_user_in_guild(guild: discord.Guild, user_id: int) -> bool:
     """以快取或 API 確認使用者是否仍在該伺服器。"""
+    key = (int(guild.id), int(user_id))
+    now_ts = time.time()
+    cached = _guild_member_cache.get(key)
+    if cached and (now_ts - cached[0]) < GUILD_MEMBER_CACHE_SECONDS:
+        async with _metrics_lock:
+            _metrics_counters["guild_member_hit"] += 1
+        return bool(cached[1])
     if guild.get_member(user_id):
+        _guild_member_cache[key] = (now_ts, True)
+        async with _metrics_lock:
+            _metrics_counters["guild_member_miss"] += 1
         return True
-    try:
-        await guild.fetch_member(user_id)
-        return True
-    except discord.NotFound:
-        return False
-    except Exception:
-        return False
+    async with _guild_member_cache_lock:
+        now_ts = time.time()
+        cached = _guild_member_cache.get(key)
+        if cached and (now_ts - cached[0]) < GUILD_MEMBER_CACHE_SECONDS:
+            async with _metrics_lock:
+                _metrics_counters["guild_member_hit"] += 1
+            return bool(cached[1])
+        try:
+            await guild.fetch_member(user_id)
+            result = True
+        except discord.NotFound:
+            result = False
+        except Exception:
+            result = False
+        _guild_member_cache[key] = (now_ts, result)
+        async with _metrics_lock:
+            _metrics_counters["guild_member_miss"] += 1
+        return result
 
 
 LEADERBOARD_POOL = 400
 LEADERBOARD_RANK_SCAN = 800
+LEADERBOARD_CACHE_SECONDS = 30.0
+WANTED_CACHE_SECONDS = 10.0
+GOOD_CITIZEN_CACHE_SECONDS = 15.0
+GUILD_MEMBER_CACHE_SECONDS = 20.0
+METRICS_LOG_INTERVAL_SECONDS = 120
+_lb_balance_cache: typing.Optional[typing.Tuple[float, typing.List[typing.Tuple]]] = None
+_lb_level_cache: typing.Optional[typing.Tuple[float, typing.List[typing.Tuple]]] = None
+_lb_cache_lock = asyncio.Lock()
+_guild_member_cache: typing.Dict[typing.Tuple[int, int], typing.Tuple[float, bool]] = {}
+_guild_member_cache_lock = asyncio.Lock()
+_wanted_list_cache: typing.Optional[typing.Tuple[float, typing.List[typing.Tuple]]] = None
+_good_citizen_cache: typing.Optional[typing.Tuple[float, typing.List[typing.Tuple]]] = None
+_wanted_status_cache: typing.Dict[str, typing.Tuple[float, typing.Any]] = {}
+_wanted_cache_lock = asyncio.Lock()
+_metrics_counters: typing.Dict[str, int] = {
+    "wanted_status_hit": 0,
+    "wanted_status_miss": 0,
+    "wanted_list_hit": 0,
+    "wanted_list_miss": 0,
+    "good_citizen_hit": 0,
+    "good_citizen_miss": 0,
+    "guild_member_hit": 0,
+    "guild_member_miss": 0,
+}
+_metrics_lock = asyncio.Lock()
+
+
+async def get_balance_leaderboard_rows_cached() -> typing.List[typing.Tuple]:
+    global _lb_balance_cache
+    now_ts = time.time()
+    cached = _lb_balance_cache
+    if cached and (now_ts - cached[0]) < LEADERBOARD_CACHE_SECONDS:
+        return cached[1]
+    async with _lb_cache_lock:
+        now_ts = time.time()
+        cached = _lb_balance_cache
+        if cached and (now_ts - cached[0]) < LEADERBOARD_CACHE_SECONDS:
+            return cached[1]
+        rows = await db_to_thread(fetch_balance_leaderboard_snapshot)
+        _lb_balance_cache = (now_ts, rows)
+        return rows
+
+
+async def get_level_leaderboard_rows_cached() -> typing.List[typing.Tuple]:
+    global _lb_level_cache
+    now_ts = time.time()
+    cached = _lb_level_cache
+    if cached and (now_ts - cached[0]) < LEADERBOARD_CACHE_SECONDS:
+        return cached[1]
+    async with _lb_cache_lock:
+        now_ts = time.time()
+        cached = _lb_level_cache
+        if cached and (now_ts - cached[0]) < LEADERBOARD_CACHE_SECONDS:
+            return cached[1]
+        rows = await db_to_thread(fetch_level_leaderboard_snapshot)
+        _lb_level_cache = (now_ts, rows)
+        return rows
+
+
+async def get_wanted_list_rows_cached() -> typing.List[typing.Tuple]:
+    global _wanted_list_cache
+    now_ts = time.time()
+    cached = _wanted_list_cache
+    if cached and (now_ts - cached[0]) < WANTED_CACHE_SECONDS:
+        async with _metrics_lock:
+            _metrics_counters["wanted_list_hit"] += 1
+        return cached[1]
+    async with _wanted_cache_lock:
+        now_ts = time.time()
+        cached = _wanted_list_cache
+        if cached and (now_ts - cached[0]) < WANTED_CACHE_SECONDS:
+            async with _metrics_lock:
+                _metrics_counters["wanted_list_hit"] += 1
+            return cached[1]
+        rows = await db_to_thread(fetch_wanted_list_rows_sync)
+        _wanted_list_cache = (now_ts, rows)
+        async with _metrics_lock:
+            _metrics_counters["wanted_list_miss"] += 1
+        return rows
+
+
+async def get_good_citizen_rows_cached() -> typing.List[typing.Tuple]:
+    global _good_citizen_cache
+    now_ts = time.time()
+    cached = _good_citizen_cache
+    if cached and (now_ts - cached[0]) < GOOD_CITIZEN_CACHE_SECONDS:
+        async with _metrics_lock:
+            _metrics_counters["good_citizen_hit"] += 1
+        return cached[1]
+    async with _wanted_cache_lock:
+        now_ts = time.time()
+        cached = _good_citizen_cache
+        if cached and (now_ts - cached[0]) < GOOD_CITIZEN_CACHE_SECONDS:
+            async with _metrics_lock:
+                _metrics_counters["good_citizen_hit"] += 1
+            return cached[1]
+        rows = await db_to_thread(fetch_good_citizen_rows_sync)
+        _good_citizen_cache = (now_ts, rows)
+        async with _metrics_lock:
+            _metrics_counters["good_citizen_miss"] += 1
+        return rows
+
+
+async def get_wanted_status_cached(user_id: int):
+    key = str(user_id)
+    now_ts = time.time()
+    cached = _wanted_status_cache.get(key)
+    if cached and (now_ts - cached[0]) < WANTED_CACHE_SECONDS:
+        async with _metrics_lock:
+            _metrics_counters["wanted_status_hit"] += 1
+        return cached[1]
+    async with _wanted_cache_lock:
+        now_ts = time.time()
+        cached = _wanted_status_cache.get(key)
+        if cached and (now_ts - cached[0]) < WANTED_CACHE_SECONDS:
+            async with _metrics_lock:
+                _metrics_counters["wanted_status_hit"] += 1
+            return cached[1]
+        row = await db_to_thread(fetch_wanted_status_row_sync, user_id)
+        _wanted_status_cache[key] = (now_ts, row)
+        async with _metrics_lock:
+            _metrics_counters["wanted_status_miss"] += 1
+        return row
+
+
+def cleanup_local_caches() -> None:
+    """清理過期快取，避免無界成長。"""
+    now_ts = time.time()
+    for store, ttl in (
+        (_guild_member_cache, GUILD_MEMBER_CACHE_SECONDS),
+        (_wanted_status_cache, WANTED_CACHE_SECONDS),
+    ):
+        expired_keys = [k for k, (ts, _v) in store.items() if (now_ts - ts) >= ttl]
+        for k in expired_keys:
+            store.pop(k, None)
+
+
+async def emit_cache_metrics_log_task():
+    """每段時間輸出快取命中率，方便觀察優化成效。"""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        await asyncio.sleep(METRICS_LOG_INTERVAL_SECONDS)
+        async with _metrics_lock:
+            snap = dict(_metrics_counters)
+            for k in _metrics_counters.keys():
+                _metrics_counters[k] = 0
+
+        def _ratio(hit_key: str, miss_key: str) -> str:
+            hit = int(snap.get(hit_key, 0))
+            miss = int(snap.get(miss_key, 0))
+            total = hit + miss
+            if total <= 0:
+                return "n/a"
+            return f"{(hit * 100.0 / total):.1f}% ({hit}/{total})"
+
+        logger.info(
+            "cache-metrics 120s | wanted_status=%s | wanted_list=%s | good_citizen=%s | guild_member=%s",
+            _ratio("wanted_status_hit", "wanted_status_miss"),
+            _ratio("wanted_list_hit", "wanted_list_miss"),
+            _ratio("good_citizen_hit", "good_citizen_miss"),
+            _ratio("guild_member_hit", "guild_member_miss"),
+        )
 
 
 @bot.tree.command(name="leaderboard", description="前 10 名")
@@ -5732,6 +3642,68 @@ async def lvleaderboard(interaction: discord.Interaction):
 
 # 相關指令區段已精簡
 
+register_admin_commands(
+    bot,
+    {
+        "ALLOWED_HOST_IDS": ALLOWED_HOST_IDS,
+        "MAX_LEVEL": MAX_LEVEL,
+        "LEVEL_MILE_TIERS": LEVEL_MILE_TIERS,
+        "FEATURE_TOGGLES": FEATURE_TOGGLES,
+        "resolve_slash_target": resolve_slash_target,
+        "ensure_user_exists": ensure_user_exists,
+        "ensure_user_exists_async": ensure_user_exists_async,
+        "get_level_stats": get_level_stats,
+        "exp_required_for_level": exp_required_for_level,
+        "process_level_ups": process_level_ups,
+        "get_db_connection": get_db_connection,
+        "logger": logger,
+        "log_transaction": log_transaction,
+        "credit_balance_with_log_async": credit_balance_with_log_async,
+        "try_deduct_balance_async": try_deduct_balance_async,
+        "calc_level_from_exp": calc_level_from_exp,
+        "TW_TZ": TW_TZ,
+        "get_is_event_active": get_is_event_active,
+        "set_is_event_active": set_is_event_active,
+        "get_share_enabled": get_share_enabled,
+        "set_share_enabled": set_share_enabled,
+    },
+)
+
+register_blackjack_commands(
+    bot,
+    {
+        "logger": logger,
+        "FEATURE_TOGGLES": FEATURE_TOGGLES,
+        "get_is_event_active": get_is_event_active,
+        "SIDE_BET_RATIO": SIDE_BET_RATIO,
+        "LEVEL_MILE_TIERS": LEVEL_MILE_TIERS,
+        "ensure_user_exists": ensure_user_exists,
+        "ensure_user_exists_async": ensure_user_exists_async,
+        "get_user_stats": get_user_stats,
+        "get_user_stats_async": get_user_stats_async,
+        "try_deduct_balance_async": try_deduct_balance_async,
+        "update_game_result_async": update_game_result_async,
+        "add_user_exp_async": add_user_exp_async,
+        "process_level_ups": process_level_ups,
+        "roll_gamble_exp_from_bet": roll_gamble_exp_from_bet,
+        "interaction_send": interaction_send,
+        "interaction_defer_if_needed": interaction_defer_if_needed,
+    },
+)
+
+register_duel_commands(
+    bot,
+    {
+        "interaction_send": interaction_send,
+        "interaction_defer_if_needed": interaction_defer_if_needed,
+        "ensure_user_exists_async": ensure_user_exists_async,
+        "try_deduct_balance_async": try_deduct_balance_async,
+        "credit_balance_with_log_async": credit_balance_with_log_async,
+        "settle_duel_payouts_with_log_async": settle_duel_payouts_with_log_async,
+        "FEATURE_TOGGLES": FEATURE_TOGGLES,
+    },
+)
+
 # ··············································································
 # [H · 主機後台與程式進入點]
 # ··············································································
@@ -5741,10 +3713,6 @@ async def lvleaderboard(interaction: discord.Interaction):
 # 限 ALLOWED_HOST_IDS 的 /give、/ban、全服重置等；_chunk_text_lines 供多則訊息列表
 # 排版；最後以 DISCORD_TOKEN 啟動 bot。
 # ==============================================================================
-
-
-def is_slash_host(interaction: discord.Interaction):
-    return interaction.user.id in ALLOWED_HOST_IDS
 
 
 def _chunk_text_lines(lines: typing.List[str], max_len: int = 1900) -> typing.List[str]:
@@ -5767,562 +3735,5 @@ def _chunk_text_lines(lines: typing.List[str], max_len: int = 1900) -> typing.Li
     return chunks
 
 
-@bot.tree.command(name="setlevel", description="[管理員] 直接設定玩家等級")
-@app_commands.describe(
-    level="要設定到幾等（1~100）",
-    member="玩家（選人）",
-    user_id="或填使用者 ID／貼提及",
-)
-async def setlevel_slash(
-    interaction: discord.Interaction,
-    level: int,
-    member: typing.Optional[discord.Member] = None,
-    user_id: typing.Optional[str] = None,
-):
-    if not is_slash_host(interaction):
-        return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
-    if level < 1 or level > MAX_LEVEL:
-        return await interaction.response.send_message(f"等級需介於 1~{MAX_LEVEL}。", ephemeral=True)
-    m_user, err = await resolve_slash_target(
-        interaction, member, user_id, required=True, in_guild_only=False
-    )
-    if err:
-        return await interaction.response.send_message(err, ephemeral=True)
-    member = m_user
-
-    ensure_user_exists(member.id, 0)
-    lv_row = get_level_stats(member.id)
-    old_exp = int(lv_row[0] or 0) if lv_row else 0
-    old_level = int(lv_row[1] or 1) if lv_row else 1
-    target_exp = exp_required_for_level(level)
-
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("UPDATE users SET level=%s, exp=%s WHERE user_id=%s", (int(level), int(target_exp), str(member.id)))
-    conn.commit()
-    conn.close()
-
-    milestone_note = ""
-    if level > old_level:
-        crossed = [m for m in LEVEL_MILE_TIERS if old_level < m <= level]
-        if crossed:
-            await process_level_ups(member, old_level, level)
-            milestone_note = f"\n🎯 已同步觸發里程碑流程：Lv.{', '.join(map(str, crossed))}"
-
-    await interaction.response.send_message(
-        f"✅ 已將 {member.mention} 設定為 **Lv.{level}**\n"
-        f"原本：Lv.{old_level} / EXP `{old_exp:,}`\n"
-        f"現在：Lv.{level} / EXP `{target_exp:,}`"
-        f"{milestone_note}"
-    )
-
-@bot.tree.command(name="give", description="[管理員] 發放東雲幣給玩家")
-@app_commands.describe(
-    amount="發放數量",
-    member="玩家（選人）",
-    user_id="或填使用者 ID／貼提及",
-    note="備註（選填）",
-)
-async def give_slash(
-    interaction: discord.Interaction,
-    amount: int,
-    member: typing.Optional[discord.Member] = None,
-    user_id: typing.Optional[str] = None,
-    note: str = "",
-):
-    if not is_slash_host(interaction):
-        return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
-    if amount <= 0:
-        return await interaction.response.send_message("數量必須大於 0", ephemeral=True)
-    m_user, err = await resolve_slash_target(
-        interaction, member, user_id, required=True, in_guild_only=False
-    )
-    if err:
-        return await interaction.response.send_message(err, ephemeral=True)
-    member = m_user
-    ensure_user_exists(member.id, 0)
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT balance FROM users WHERE user_id=%s", (str(member.id),))
-    before_row = c.fetchone()
-    before_bal = int((before_row[0] if before_row else 0) or 0)
-    c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (amount, str(member.id)))
-    after_bal = before_bal + amount
-    conn.commit()
-    conn.close()
-    note_text = (note or "").strip()
-    if len(note_text) > 100:
-        note_text = note_text[:100]
-    reason = f"管理員發放（備註: {note_text}）" if note_text else "管理員發放"
-    log_transaction(member.id, amount, reason)
-    embed = discord.Embed(title="✅ 發放成功", color=discord.Color.green())
-    embed.add_field(name="對象", value=member.mention, inline=False)
-    embed.add_field(name="發放金額", value=f"`{amount:,}` 東雲幣", inline=False)
-    embed.add_field(name="餘額變化", value=f"`{before_bal:,}` → `{after_bal:,}`", inline=False)
-    embed.add_field(name="備註", value=note_text if note_text else "（無）", inline=False)
-    embed.set_footer(text=f"操作人：{interaction.user.display_name}")
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="take", description="[管理員] 扣除玩家東雲幣")
-@app_commands.describe(
-    amount="扣除數量",
-    member="玩家（選人）",
-    user_id="或填使用者 ID／貼提及",
-    note="備註（選填）",
-)
-async def take_slash(
-    interaction: discord.Interaction,
-    amount: int,
-    member: typing.Optional[discord.Member] = None,
-    user_id: typing.Optional[str] = None,
-    note: str = "",
-):
-    if not is_slash_host(interaction):
-        return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
-    if amount <= 0:
-        return await interaction.response.send_message("數量必須大於 0", ephemeral=True)
-    m_user, err = await resolve_slash_target(
-        interaction, member, user_id, required=True, in_guild_only=False
-    )
-    if err:
-        return await interaction.response.send_message(err, ephemeral=True)
-    member = m_user
-    ensure_user_exists(member.id, 0)
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT balance FROM users WHERE user_id=%s", (str(member.id),))
-    before_row = c.fetchone()
-    before_bal = int((before_row[0] if before_row else 0) or 0)
-    c.execute("UPDATE users SET balance=GREATEST(0, balance-%s) WHERE user_id=%s", (amount, str(member.id)))
-    after_bal = max(0, before_bal - amount)
-    conn.commit()
-    conn.close()
-    note_text = (note or "").strip()
-    if len(note_text) > 100:
-        note_text = note_text[:100]
-    reason = f"管理員扣除（備註: {note_text}）" if note_text else "管理員扣除"
-    log_transaction(member.id, -amount, reason)
-    embed = discord.Embed(title="✅ 扣款成功", color=discord.Color.green())
-    embed.add_field(name="對象", value=member.mention, inline=False)
-    embed.add_field(name="扣除金額", value=f"`{amount:,}` 東雲幣", inline=False)
-    embed.add_field(name="餘額變化", value=f"`{before_bal:,}` → `{after_bal:,}`", inline=False)
-    embed.add_field(name="備註", value=note_text if note_text else "（無）", inline=False)
-    embed.set_footer(text=f"操作人：{interaction.user.display_name}")
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="ban", description="[管理員] 將玩家加入黑名單")
-@app_commands.describe(member="玩家（選人）", user_id="或填使用者 ID／貼提及")
-async def ban_slash(
-    interaction: discord.Interaction,
-    member: typing.Optional[discord.Member] = None,
-    user_id: typing.Optional[str] = None,
-):
-    if not is_slash_host(interaction):
-        return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
-    m_user, err = await resolve_slash_target(
-        interaction, member, user_id, required=True, in_guild_only=False
-    )
-    if err:
-        return await interaction.response.send_message(err, ephemeral=True)
-    member = m_user
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("INSERT IGNORE INTO blacklist (user_id) VALUES (%s)", (str(member.id),))
-    conn.commit()
-    conn.close()
-    await interaction.response.send_message(f"{member.mention} 已加入黑名單。")
-
-@bot.tree.command(name="unban", description="[管理員] 將玩家移出黑名單")
-@app_commands.describe(member="玩家（選人，未必在伺服器）", user_id="或填使用者 ID／貼提及")
-async def unban_slash(
-    interaction: discord.Interaction,
-    member: typing.Optional[discord.Member] = None,
-    user_id: typing.Optional[str] = None,
-):
-    if not is_slash_host(interaction):
-        return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
-    m_user, err = await resolve_slash_target(
-        interaction, member, user_id, required=True, in_guild_only=False
-    )
-    if err:
-        return await interaction.response.send_message(err, ephemeral=True)
-    member = m_user
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("DELETE FROM blacklist WHERE user_id=%s", (str(member.id),))
-    conn.commit()
-    conn.close()
-    await interaction.response.send_message(f"{member.mention} 已解除黑名單。")
-
-@bot.tree.command(name="resetall_zero", description="[管理員] 全伺服器餘額清零")
-async def resetall_zero_slash(interaction: discord.Interaction):
-    if not is_slash_host(interaction):
-        return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("UPDATE users SET balance=0")
-    conn.commit()
-    conn.close()
-    await interaction.response.send_message("💥 全伺服器帳戶餘額已清零。")
-
-@bot.tree.command(name="resetall_default", description="[管理員] 全伺服器重置為 50,000")
-async def resetall_default_slash(interaction: discord.Interaction):
-    if not is_slash_host(interaction):
-        return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("UPDATE users SET balance=50000, rescue_count=0, total_games=0, wins=0, total_profit=0")
-    conn.commit()
-    conn.close()
-    await interaction.response.send_message("🔄 全服已重置為 50,000，並重置統計。")
-
-@bot.tree.command(name="lock", description="[管理員] 開關賭場營業狀態")
-async def lock_slash(interaction: discord.Interaction):
-    if not is_slash_host(interaction):
-        return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
-    global IS_EVENT_ACTIVE
-    IS_EVENT_ACTIVE = not IS_EVENT_ACTIVE
-    await interaction.response.send_message(f"賭場狀態已切換：`{IS_EVENT_ACTIVE}`")
-
-@bot.tree.command(name="adminhelp", description="[管理員] 查看管理指令清單")
-async def adminhelp_slash(interaction: discord.Interaction):
-    if not is_slash_host(interaction):
-        return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
-    help_text = """**👑 管理員 Slash 指令清單（主機白名單）**
-一般玩家說明請用：`/help`
-
-`/setlevel` - 直接設定玩家等級（1~100）
-`/give` - 發放東雲幣給玩家
-`/take` - 扣除玩家東雲幣（最低到 0）
-`/ban` - 將玩家加入黑名單
-`/unban` - 將玩家移出黑名單
-`/lock` - 開關賭場營業狀態
-`/resetall_zero` - 全服餘額清零（含統計重置）
-`/resetall_default` - 全服重置為 50,000（含統計重置）
-`/say` - 指定機器人到頻道發言
-`/share_stats` - 查看賭場回收分潤統計
-`/admin_balance_set` - 直接設定玩家餘額
-`/admin_user_flags` - 查看玩家關鍵狀態（通緝/監獄/良民證/黑名單等）
-`/admin_unjail` - 強制釋放玩家（可選清債/清通緝）
-`/admin_revert_tx` - 依流水 ID 進行反向沖正
-`/admin_logs` - 查詢含流水 ID 的最近帳務紀錄
-`/admin_feature_toggle` - 線上開關功能（rob/bj/duel/redpacket/share）"""
-    await interaction.response.send_message(help_text, ephemeral=True)
-
-
-@bot.tree.command(name="admin_balance_set", description="[管理員] 直接設定玩家餘額")
-@app_commands.describe(
-    amount="要設定成的餘額（不可小於 0）",
-    member="玩家（選人）",
-    user_id="或填使用者 ID／貼提及",
-    note="備註（選填）",
-)
-async def admin_balance_set_slash(
-    interaction: discord.Interaction,
-    amount: int,
-    member: typing.Optional[discord.Member] = None,
-    user_id: typing.Optional[str] = None,
-    note: str = "",
-):
-    if not is_slash_host(interaction):
-        return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
-    if amount < 0:
-        return await interaction.response.send_message("餘額不可小於 0。", ephemeral=True)
-    target_user, err = await resolve_slash_target(
-        interaction, member, user_id, required=True, in_guild_only=False
-    )
-    if err:
-        return await interaction.response.send_message(err, ephemeral=True)
-    await ensure_user_exists_async(target_user.id, 0)
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT COALESCE(balance,0) FROM users WHERE user_id=%s", (str(target_user.id),))
-    row = c.fetchone()
-    before_bal = int((row[0] if row else 0) or 0)
-    c.execute("UPDATE users SET balance=%s WHERE user_id=%s", (int(amount), str(target_user.id)))
-    conn.commit()
-    conn.close()
-
-    delta = int(amount) - before_bal
-    note_text = (note or "").strip()[:100]
-    reason = f"管理員設定餘額（{before_bal:,}→{int(amount):,}）"
-    if note_text:
-        reason += f"（備註: {note_text}）"
-    if delta != 0:
-        log_transaction(target_user.id, delta, reason)
-
-    embed = discord.Embed(title="✅ 餘額已設定", color=discord.Color.green())
-    embed.add_field(name="對象", value=target_user.mention, inline=False)
-    embed.add_field(name="原餘額", value=f"`{before_bal:,}`", inline=True)
-    embed.add_field(name="新餘額", value=f"`{int(amount):,}`", inline=True)
-    embed.add_field(name="變動", value=f"`{delta:+,}`", inline=True)
-    embed.add_field(name="備註", value=note_text if note_text else "（無）", inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-@bot.tree.command(name="admin_user_flags", description="[管理員] 查看玩家關鍵狀態")
-@app_commands.describe(member="玩家（選人）", user_id="或填使用者 ID／貼提及")
-async def admin_user_flags_slash(
-    interaction: discord.Interaction,
-    member: typing.Optional[discord.Member] = None,
-    user_id: typing.Optional[str] = None,
-):
-    if not is_slash_host(interaction):
-        return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
-    target_user, err = await resolve_slash_target(
-        interaction, member, user_id, required=True, in_guild_only=False
-    )
-    if err:
-        return await interaction.response.send_message(err, ephemeral=True)
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute(
-        "SELECT COALESCE(balance,0), COALESCE(role,'civilian'), COALESCE(wanted_stars,0), COALESCE(wanted_hunted_count,0), "
-        "COALESCE(in_prison,0), prison_start, COALESCE(bail_debt,0), COALESCE(good_citizen_cert_active,0), "
-        "good_citizen_cert_broken_until, last_five_robs "
-        "FROM users WHERE user_id=%s",
-        (str(target_user.id),),
-    )
-    row = c.fetchone()
-    c.execute("SELECT 1 FROM blacklist WHERE user_id=%s", (str(target_user.id),))
-    blacklisted = c.fetchone() is not None
-    conn.close()
-    if not row:
-        return await interaction.response.send_message("找不到玩家資料。", ephemeral=True)
-
-    bal, role, stars, hunted, in_pr, prison_start, bail_debt, cert_active, cert_broken_until, raw_hist = row
-    role_disp = {"cop": "🚔 警察", "criminal": "🔪 搶匪"}.get(str(role or "civilian"), "👤 平民")
-    hist_count = 0
-    hist_total = 0
-    if raw_hist:
-        try:
-            h = json.loads(raw_hist)
-            if isinstance(h, list):
-                hist_count = len(h)
-                hist_total = sum(int((it or {}).get("amount", 0) or 0) for it in h if isinstance(it, dict))
-        except Exception:
-            pass
-
-    emb = discord.Embed(title="🛠️ 玩家狀態總覽", color=0x5865F2)
-    emb.add_field(name="對象", value=f"{target_user.mention} (`{target_user.id}`)", inline=False)
-    emb.add_field(name="餘額", value=f"`{int(bal or 0):,}`", inline=True)
-    emb.add_field(name="身分", value=role_disp, inline=True)
-    emb.add_field(name="黑名單", value="是" if blacklisted else "否", inline=True)
-    emb.add_field(name="通緝", value=f"{int(stars or 0)}★｜本輪已追捕: {'是' if int(hunted or 0) else '否'}", inline=True)
-    emb.add_field(name="監獄", value="在押" if int(in_pr or 0) else "否", inline=True)
-    emb.add_field(name="假釋欠款", value=f"`{int(bail_debt or 0):,}`", inline=True)
-    broken_text = ""
-    if cert_broken_until:
-        try:
-            broken_ts = int(cert_broken_until.replace(tzinfo=TW_TZ).timestamp())
-            broken_text = f"\n禁用至: <t:{broken_ts}:F>"
-        except Exception:
-            broken_text = f"\n禁用至: {cert_broken_until}"
-    emb.add_field(
-        name="良民證",
-        value=("啟用中" if int(cert_active or 0) else "未啟用") + broken_text,
-        inline=False,
-    )
-    emb.add_field(name="最近搶劫紀錄", value=f"{hist_count} 筆｜總額 `{hist_total:,}`", inline=False)
-    if prison_start:
-        emb.set_footer(text=f"prison_start: {prison_start}")
-    await interaction.response.send_message(embed=emb, ephemeral=True)
-
-
-@bot.tree.command(name="admin_unjail", description="[管理員] 強制釋放玩家")
-@app_commands.describe(
-    member="玩家（選人）",
-    user_id="或填使用者 ID／貼提及",
-    clear_debt="是否一併清除假釋欠款",
-    clear_wanted="是否一併清除通緝星",
-)
-async def admin_unjail_slash(
-    interaction: discord.Interaction,
-    member: typing.Optional[discord.Member] = None,
-    user_id: typing.Optional[str] = None,
-    clear_debt: bool = False,
-    clear_wanted: bool = True,
-):
-    if not is_slash_host(interaction):
-        return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
-    target_user, err = await resolve_slash_target(
-        interaction, member, user_id, required=True, in_guild_only=False
-    )
-    if err:
-        return await interaction.response.send_message(err, ephemeral=True)
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT COALESCE(in_prison,0), COALESCE(bail_debt,0), COALESCE(wanted_stars,0) FROM users WHERE user_id=%s", (str(target_user.id),))
-    row = c.fetchone()
-    if not row:
-        conn.close()
-        return await interaction.response.send_message("找不到玩家資料。", ephemeral=True)
-    was_in_prison, debt_before, stars_before = int(row[0] or 0), int(row[1] or 0), int(row[2] or 0)
-    if not was_in_prison:
-        conn.close()
-        return await interaction.response.send_message("該玩家目前不在監獄。", ephemeral=True)
-    if clear_debt and clear_wanted:
-        c.execute(
-            "UPDATE users SET in_prison=0, prison_start=NULL, bail_debt=0, wanted_stars=0, wanted_hunted_count=0 WHERE user_id=%s",
-            (str(target_user.id),),
-        )
-    elif clear_debt:
-        c.execute(
-            "UPDATE users SET in_prison=0, prison_start=NULL, bail_debt=0 WHERE user_id=%s",
-            (str(target_user.id),),
-        )
-    elif clear_wanted:
-        c.execute(
-            "UPDATE users SET in_prison=0, prison_start=NULL, wanted_stars=0, wanted_hunted_count=0 WHERE user_id=%s",
-            (str(target_user.id),),
-        )
-    else:
-        c.execute(
-            "UPDATE users SET in_prison=0, prison_start=NULL WHERE user_id=%s",
-            (str(target_user.id),),
-        )
-    conn.commit()
-    conn.close()
-    await interaction.response.send_message(
-        f"✅ 已釋放 {target_user.mention}。\n"
-        f"清債: {'是' if clear_debt else '否'}（原 `{debt_before:,}`）｜"
-        f"清通緝: {'是' if clear_wanted else '否'}（原 {stars_before}★）",
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name="admin_revert_tx", description="[管理員] 依流水 ID 做反向沖正")
-@app_commands.describe(tx_id="logs 的流水 ID", note="備註（選填）")
-async def admin_revert_tx_slash(interaction: discord.Interaction, tx_id: int, note: str = ""):
-    if not is_slash_host(interaction):
-        return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
-    if tx_id <= 0:
-        return await interaction.response.send_message("tx_id 必須大於 0。", ephemeral=True)
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT id, user_id, amount, reason FROM logs WHERE id=%s", (int(tx_id),))
-    row = c.fetchone()
-    if not row:
-        conn.close()
-        return await interaction.response.send_message("找不到該流水 ID。", ephemeral=True)
-    _id, uid, amt, rs = int(row[0]), str(row[1]), int(row[2] or 0), str(row[3] or "")
-    c.execute(
-        "SELECT 1 FROM logs WHERE user_id=%s AND reason LIKE %s LIMIT 1",
-        (uid, f"管理員沖正 tx#{_id}%"),
-    )
-    already = c.fetchone() is not None
-    conn.close()
-    if already:
-        return await interaction.response.send_message("這筆流水看起來已經沖正過了。", ephemeral=True)
-    reverse = -amt
-    if reverse > 0:
-        await credit_balance_with_log_async(uid, reverse, f"管理員沖正 tx#{_id}（原: {rs}）")
-    else:
-        ok = await try_deduct_balance_async(uid, abs(reverse), f"管理員沖正 tx#{_id}（原: {rs}）")
-        if not ok:
-            return await interaction.response.send_message(
-                "沖正需要扣款，但目標餘額不足，已中止。可先手動調整餘額後再沖正。",
-                ephemeral=True,
-            )
-    note_text = (note or "").strip()
-    await interaction.response.send_message(
-        f"✅ 已沖正 tx#{_id}\n對象：<@{int(uid)}>\n原金額：`{amt:+,}` → 沖正：`{reverse:+,}`"
-        + (f"\n備註：{note_text}" if note_text else ""),
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name="admin_logs", description="[管理員] 查詢含流水 ID 的最近帳務紀錄")
-@app_commands.describe(
-    member="要篩選的玩家（選填）",
-    user_id="或填使用者 ID／貼提及（選填）",
-    limit="顯示筆數（1~50，預設 20）",
-)
-async def admin_logs_slash(
-    interaction: discord.Interaction,
-    member: typing.Optional[discord.Member] = None,
-    user_id: typing.Optional[str] = None,
-    limit: int = 20,
-):
-    if not is_slash_host(interaction):
-        return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
-    limit = max(1, min(50, int(limit)))
-    target_user, err = await resolve_slash_target(
-        interaction, member, user_id, required=False, in_guild_only=False
-    )
-    if err:
-        return await interaction.response.send_message(err, ephemeral=True)
-
-    conn = get_db_connection()
-    c = conn.cursor()
-    if target_user is not None:
-        c.execute(
-            "SELECT id, user_id, amount, reason, created_at FROM logs WHERE user_id=%s ORDER BY id DESC LIMIT %s",
-            (str(target_user.id), limit),
-        )
-    else:
-        c.execute(
-            "SELECT id, user_id, amount, reason, created_at FROM logs ORDER BY id DESC LIMIT %s",
-            (limit,),
-        )
-    rows = c.fetchall()
-    conn.close()
-    if not rows:
-        return await interaction.response.send_message("查無流水資料。", ephemeral=True)
-
-    lines: typing.List[str] = []
-    for rid, uid, amt, reason, created_at in rows:
-        try:
-            t = created_at.strftime("%m/%d %H:%M:%S") if created_at else "N/A"
-        except Exception:
-            t = "N/A"
-        lines.append(
-            f"`#{int(rid)}` [{t}] <@{int(uid)}> `{int(amt):+,}` | {str(reason or '')[:80]}"
-        )
-
-    header = (
-        f"📒 最近流水（{len(rows)} 筆）"
-        + (f"｜對象：<@{target_user.id}>" if target_user is not None else "")
-    )
-    chunks = _chunk_text_lines([header, ""] + lines, 1900)
-    await interaction.response.send_message(chunks[0], ephemeral=True)
-    for ch in chunks[1:]:
-        await interaction.followup.send(ch, ephemeral=True)
-
-
-@bot.tree.command(name="admin_feature_toggle", description="[管理員] 線上開關功能（免重啟）")
-@app_commands.describe(feature="功能名稱", enabled="是否啟用")
-@app_commands.choices(
-    feature=[
-        app_commands.Choice(name="rob", value="rob"),
-        app_commands.Choice(name="bj", value="bj"),
-        app_commands.Choice(name="duel", value="duel"),
-        app_commands.Choice(name="redpacket", value="redpacket"),
-        app_commands.Choice(name="share", value="share"),
-    ]
-)
-async def admin_feature_toggle_slash(interaction: discord.Interaction, feature: str, enabled: bool):
-    if not is_slash_host(interaction):
-        return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
-    feature = (feature or "").strip().lower()
-    if feature == "share":
-        global CASINO_RECOVERY_SHARE_ENABLED
-        CASINO_RECOVERY_SHARE_ENABLED = bool(enabled)
-    else:
-        if feature not in FEATURE_TOGGLES:
-            return await interaction.response.send_message("不支援的功能名稱。", ephemeral=True)
-        FEATURE_TOGGLES[feature] = bool(enabled)
-    status = "啟用" if enabled else "停用"
-    state_lines = [
-        f"rob: {'on' if FEATURE_TOGGLES.get('rob', True) else 'off'}",
-        f"bj: {'on' if FEATURE_TOGGLES.get('bj', True) else 'off'}",
-        f"duel: {'on' if FEATURE_TOGGLES.get('duel', True) else 'off'}",
-        f"redpacket: {'on' if FEATURE_TOGGLES.get('redpacket', True) else 'off'}",
-        f"share: {'on' if CASINO_RECOVERY_SHARE_ENABLED else 'off'}",
-    ]
-    await interaction.response.send_message(
-        f"✅ 功能 `{feature}` 已設為 **{status}**\n目前狀態：\n" + "\n".join(state_lines),
-        ephemeral=True,
-    )
 
 bot.run(os.getenv('DISCORD_TOKEN'))
