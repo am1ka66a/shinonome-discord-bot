@@ -54,6 +54,24 @@ def fetch_casino_stats_rows():
     )
 
 
+def fetch_balance_leaderboard_snapshot():
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT user_id, balance FROM users ORDER BY balance DESC")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def fetch_level_leaderboard_snapshot():
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT user_id, level, exp FROM users ORDER BY level DESC, exp DESC")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
 def fetch_casino_share_stats_rows(days: int = 7):
     days = max(1, int(days))
     conn = get_db_connection()

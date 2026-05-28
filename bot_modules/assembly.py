@@ -1,0 +1,185 @@
+import typing
+
+from bot_modules.admin_commands import register_admin_commands
+from bot_modules.commands import (
+    register_blackjack_commands,
+    register_duel_commands,
+    register_economy_commands,
+    register_fun_commands,
+    register_stats_commands,
+    register_wanted_commands,
+)
+
+
+def register_all_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
+    """集中註冊 admin / economy / fun / stats / wanted / 賭場指令。"""
+    register_admin_commands(
+        bot,
+        {
+            "ALLOWED_HOST_IDS": ctx["ALLOWED_HOST_IDS"],
+            "MAX_LEVEL": ctx["MAX_LEVEL"],
+            "LEVEL_MILE_TIERS": ctx["LEVEL_MILE_TIERS"],
+            "FEATURE_TOGGLES": ctx["FEATURE_TOGGLES"],
+            "resolve_slash_target": ctx["resolve_slash_target"],
+            "ensure_user_exists": ctx["ensure_user_exists"],
+            "ensure_user_exists_async": ctx["ensure_user_exists_async"],
+            "get_level_stats": ctx["get_level_stats"],
+            "exp_required_for_level": ctx["exp_required_for_level"],
+            "process_level_ups": ctx["process_level_ups"],
+            "get_db_connection": ctx["get_db_connection"],
+            "logger": ctx["logger"],
+            "log_transaction": ctx["log_transaction"],
+            "credit_balance_with_log_async": ctx["credit_balance_with_log_async"],
+            "try_deduct_balance_async": ctx["try_deduct_balance_async"],
+            "calc_level_from_exp": ctx["calc_level_from_exp"],
+            "TW_TZ": ctx["TW_TZ"],
+            "get_is_event_active": ctx["get_is_event_active"],
+            "set_is_event_active": ctx["set_is_event_active"],
+            "get_share_enabled": ctx["get_share_enabled"],
+            "set_share_enabled": ctx["set_share_enabled"],
+        },
+    )
+
+    register_economy_commands(
+        bot,
+        {
+            "FEATURE_TOGGLES": ctx["FEATURE_TOGGLES"],
+            "MAX_LEVEL": ctx["MAX_LEVEL"],
+            "LEVEL_MILESTONE_COINS": ctx["LEVEL_MILESTONE_COINS"],
+            "RED_PACKET_MIN_SECONDS": ctx["RED_PACKET_MIN_SECONDS"],
+            "red_packet_seq_ref": ctx["red_packet_seq_ref"],
+            "resolve_slash_target": ctx["resolve_slash_target"],
+            "ensure_user_exists_async": ctx["ensure_user_exists_async"],
+            "interaction_send": ctx["interaction_send"],
+            "interaction_defer_if_needed": ctx["interaction_defer_if_needed"],
+            "claim_daily_reward_async": ctx["claim_daily_reward_async"],
+            "claim_hourly_reward_async": ctx["claim_hourly_reward_async"],
+            "claim_beg_sync_async": ctx["claim_beg_sync_async"],
+            "claim_rescue_sync_async": ctx["claim_rescue_sync_async"],
+            "get_user_stats_async": ctx["get_user_stats_async"],
+            "get_level_stats_async": ctx["get_level_stats_async"],
+            "calc_level_from_exp": ctx["calc_level_from_exp"],
+            "get_claimed_milestones_async": ctx["get_claimed_milestones_async"],
+            "build_exp_progress_bar": ctx["build_exp_progress_bar"],
+            "transfer_sync_async": ctx["transfer_sync_async"],
+            "try_deduct_balance_async": ctx["try_deduct_balance_async"],
+            "credit_balance_with_log_async": ctx["credit_balance_with_log_async"],
+            "fetch_record_rows_async": ctx["fetch_record_rows_async"],
+            "now_tw_naive": ctx["now_tw_naive"],
+            "logger": ctx["logger"],
+        },
+    )
+
+    register_fun_commands(
+        bot,
+        {
+            "ALLOWED_HOST_IDS": ctx["ALLOWED_HOST_IDS"],
+            "ROB_BASE_SUCCESS_RATE": ctx["ROB_BASE_SUCCESS_RATE"],
+            "COP_HUNT_CAPTURE_BASE_PCT": ctx["COP_HUNT_CAPTURE_BASE_PCT"],
+            "COP_HUNT_CAPTURE_PER_STAR_PCT": ctx["COP_HUNT_CAPTURE_PER_STAR_PCT"],
+            "COP_HUNT_FEE": ctx["COP_HUNT_FEE"],
+            "WANTED_BUYOUT_COST": ctx["WANTED_BUYOUT_COST"],
+            "GOOD_CITIZEN_CERT_COST": ctx["GOOD_CITIZEN_CERT_COST"],
+            "GOOD_CITIZEN_DESTROY_COST": ctx["GOOD_CITIZEN_DESTROY_COST"],
+            "BAIL_COST": ctx["BAIL_COST"],
+            "COUNTER_ROB_BASE_SUCCESS_RATE": ctx["COUNTER_ROB_BASE_SUCCESS_RATE"],
+            "MINECRAFT_DEATH_MESSAGES": ctx["MINECRAFT_DEATH_MESSAGES"],
+            "MINECRAFT_ITEMS": ctx["MINECRAFT_ITEMS"],
+            "BICYCLE_COOLDOWN_SECONDS": ctx["BICYCLE_COOLDOWN_SECONDS"],
+            "TW_TZ": ctx["TW_TZ"],
+            "resolve_slash_target": ctx["resolve_slash_target"],
+            "ensure_user_exists_async": ctx["ensure_user_exists_async"],
+            "now_tw_naive": ctx["now_tw_naive"],
+            "get_db_connection": ctx["get_db_connection"],
+            "lock_user_rows": ctx["lock_user_rows"],
+            "log_transaction_in_tx": ctx["log_transaction_in_tx"],
+        },
+    )
+
+    register_stats_commands(
+        bot,
+        {
+            "ALLOWED_HOST_IDS": ctx["ALLOWED_HOST_IDS"],
+            "CASINO_RECOVERY_SHARE_ENABLED": ctx["CASINO_RECOVERY_SHARE_ENABLED"],
+            "CASINO_RECOVERY_SHARE_RATE": ctx["CASINO_RECOVERY_SHARE_RATE"],
+            "CASINO_RECOVERY_SHARE_TARGET_ID": ctx["CASINO_RECOVERY_SHARE_TARGET_ID"],
+            "ensure_user_exists_async": ctx["ensure_user_exists_async"],
+            "interaction_send": ctx["interaction_send"],
+            "interaction_defer_if_needed": ctx["interaction_defer_if_needed"],
+            "fetch_casino_share_stats_rows_async": ctx["fetch_casino_share_stats_rows_async"],
+        },
+    )
+
+    register_wanted_commands(
+        bot,
+        {
+            "FEATURE_TOGGLES": ctx["FEATURE_TOGGLES"],
+            "ROB_COOLDOWN_SECONDS": ctx["ROB_COOLDOWN_SECONDS"],
+            "ROB_VICTIM_PROTECT_SECONDS": ctx["ROB_VICTIM_PROTECT_SECONDS"],
+            "ROB_BASE_SUCCESS_RATE": ctx["ROB_BASE_SUCCESS_RATE"],
+            "COP_HUNT_FEE": ctx["COP_HUNT_FEE"],
+            "COP_HUNT_CAPTURE_BASE_PCT": ctx["COP_HUNT_CAPTURE_BASE_PCT"],
+            "COP_HUNT_CAPTURE_PER_STAR_PCT": ctx["COP_HUNT_CAPTURE_PER_STAR_PCT"],
+            "BAIL_COST": ctx["BAIL_COST"],
+            "WANTED_BUYOUT_COST": ctx["WANTED_BUYOUT_COST"],
+            "GOOD_CITIZEN_CERT_COST": ctx["GOOD_CITIZEN_CERT_COST"],
+            "GOOD_CITIZEN_DESTROY_COST": ctx["GOOD_CITIZEN_DESTROY_COST"],
+            "resolve_slash_target": ctx["resolve_slash_target"],
+            "ensure_user_exists_async": ctx["ensure_user_exists_async"],
+            "load_rob_context_async": ctx["load_rob_context_async"],
+            "apply_rob_success_db_async": ctx["apply_rob_success_db_async"],
+            "apply_rob_fail_db_async": ctx["apply_rob_fail_db_async"],
+            "db_to_thread": ctx["db_to_thread"],
+            "log_transaction": ctx["log_transaction"],
+            "interaction_send": ctx["interaction_send"],
+            "interaction_defer_if_needed": ctx["interaction_defer_if_needed"],
+            "choose_role_sync_async": ctx["choose_role_sync_async"],
+            "now_tw_naive": ctx["now_tw_naive"],
+            "tw_naive_to_discord_ts": ctx["tw_naive_to_discord_ts"],
+            "wanted_buyout_sync_async": ctx["wanted_buyout_sync_async"],
+            "toggle_good_citizen_sync_async": ctx["toggle_good_citizen_sync_async"],
+            "fetch_good_citizen_rows_sync_async": ctx["fetch_good_citizen_rows_sync_async"],
+            "break_citizen_sync_async": ctx["break_citizen_sync_async"],
+            "fetch_wanted_status_row_sync_async": ctx["fetch_wanted_status_row_sync_async"],
+            "fetch_wanted_list_rows_sync_async": ctx["fetch_wanted_list_rows_sync_async"],
+            "rob_history_total_from_raw": ctx["rob_history_total_from_raw"],
+            "get_last_five_robs_total": ctx["get_last_five_robs_total"],
+            "pay_bail_sync_async": ctx["pay_bail_sync_async"],
+            "get_db_connection": ctx["get_db_connection"],
+            "lock_user_rows": ctx["lock_user_rows"],
+            "log_transaction_in_tx": ctx["log_transaction_in_tx"],
+        },
+    )
+
+    register_blackjack_commands(
+        bot,
+        {
+            "logger": ctx["logger"],
+            "FEATURE_TOGGLES": ctx["FEATURE_TOGGLES"],
+            "get_is_event_active": ctx["get_is_event_active"],
+            "SIDE_BET_RATIO": ctx["SIDE_BET_RATIO"],
+            "LEVEL_MILE_TIERS": ctx["LEVEL_MILE_TIERS"],
+            "ensure_user_exists_async": ctx["ensure_user_exists_async"],
+            "get_user_stats_async": ctx["get_user_stats_async"],
+            "try_deduct_balance_async": ctx["try_deduct_balance_async"],
+            "update_game_result_async": ctx["update_game_result_async"],
+            "add_user_exp_async": ctx["add_user_exp_async"],
+            "process_level_ups": ctx["process_level_ups"],
+            "roll_gamble_exp_from_bet": ctx["roll_gamble_exp_from_bet"],
+            "interaction_send": ctx["interaction_send"],
+            "interaction_defer_if_needed": ctx["interaction_defer_if_needed"],
+        },
+    )
+
+    register_duel_commands(
+        bot,
+        {
+            "interaction_send": ctx["interaction_send"],
+            "interaction_defer_if_needed": ctx["interaction_defer_if_needed"],
+            "ensure_user_exists_async": ctx["ensure_user_exists_async"],
+            "try_deduct_balance_async": ctx["try_deduct_balance_async"],
+            "credit_balance_with_log_async": ctx["credit_balance_with_log_async"],
+            "settle_duel_payouts_with_log_async": ctx["settle_duel_payouts_with_log_async"],
+            "FEATURE_TOGGLES": ctx["FEATURE_TOGGLES"],
+        },
+    )
