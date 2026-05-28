@@ -12,9 +12,7 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
     get_is_event_active = ctx["get_is_event_active"]
     side_bet_ratio = float(ctx["SIDE_BET_RATIO"])
     level_mile_tiers = tuple(ctx["LEVEL_MILE_TIERS"])
-    ensure_user_exists = ctx["ensure_user_exists"]
     ensure_user_exists_async = ctx["ensure_user_exists_async"]
-    get_user_stats = ctx["get_user_stats"]
     get_user_stats_async = ctx["get_user_stats_async"]
     try_deduct_balance_async = ctx["try_deduct_balance_async"]
     update_game_result_async = ctx["update_game_result_async"]
@@ -247,16 +245,6 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             self.last_action = now
             return True
 
-        def build_embed(self, err=""):
-            ensure_user_exists(self.user.id, 50000)
-            stats = get_user_stats(self.user.id)
-            embed = discord.Embed(title="🃏 21點 — 下注設定", color=0x2B2D31)
-            err_prefix = f"❌ {err}\n" if err else ""
-            embed.description = f"{err_prefix}主注：`{self.base_bet}`\n旁注剩餘額度：**`{self.max_side - (self.p_bet + self.s_bet)}`**\n你的餘額：`{stats[0]}`"
-            embed.add_field(name="🧧 對子旁注", value=f"下注金額：`{self.p_bet}`\n**同花對子**: 30倍\n**混合對子**: 5倍", inline=True)
-            embed.add_field(name="🎯 21+3旁注", value=f"下注金額：`{self.s_bet}`\n**同花三條**: 50倍\n**同花順**: 25倍\n**三條**: 25倍\n**順子**: 10倍\n**同花**: 5倍", inline=True)
-            return embed
-
         @discord.ui.button(label="開始遊戲 (再來一局)", style=discord.ButtonStyle.success)
         async def start(self, inter, btn):
             if inter.user.id != self.user.id:
@@ -381,45 +369,6 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                     c.disabled = len(self.p_hand) > 2 or len(self.hands) > 1
                 elif c.label == "要牌":
                     c.disabled = calculate_score(self.p_hand) > 21
-
-        def build_embed(self, done=False, res="", profit=0, animating=False, extra_msg="", guild_id=None):
-            stats = get_user_stats(self.user.id)
-            if stats:
-                bal, total, wins, t_prof = stats
-            else:
-                bal, total, wins, t_prof = 0, 0, 0, 0
-            wr = (wins / total * 100) if total > 0 else 0
-            embed = discord.Embed(title="🃏 21點大賽", color=0x2B2D31)
-            main_ui = f"💰 餘額：{bal} | 🏆 勝場：{wins} | 🎲 總局數：{total} | 📈 勝率：{wr:.1f}% | 💸 總盈虧：{t_prof}\n"
-            if extra_msg:
-                main_ui += f"**{extra_msg}**\n"
-            for i, hand in enumerate(self.hands):
-                indicator = "👉 " if i == self.current_hand and not done else ""
-                title_text = f"{indicator}👤 {self.user.display_name} 的手牌"
-                if len(self.hands) > 1:
-                    title_text += f" (第 {i+1} 手)"
-                p_cards = " ".join([card_to_emoji(c, guild_id) for c in hand])
-                main_ui += f"### {title_text}\n### {p_cards} (點數: **{calculate_score(hand)}**)\n"
-            if done or animating:
-                d_cards = " ".join([card_to_emoji(c, guild_id) for c in self.d_hand])
-                main_ui += f"### 🤖 莊家手牌\n### {d_cards} (點數: **{calculate_score(self.d_hand)}**)\n"
-                if done:
-                    side_profit = self.side_p
-                    total_profit = profit + side_profit
-                    res_line = f"### 🏆 {res}\n{self.side_m}\n"
-                    side_text = f"+{side_profit}" if side_profit > 0 else str(side_profit)
-                    res_line += f"🧾 主局淨損益：`{profit:+d}` | 旁注淨損益：`{side_text}`\n"
-                    if total_profit > 0:
-                        res_line += f"📈 本局淨損益：`+{total_profit}` | 💰 餘額：`{bal}`\n"
-                    elif total_profit < 0:
-                        res_line += f"📉 本局淨損益：`{total_profit}` | 💰 餘額：`{bal}`\n"
-                    else:
-                        res_line += f"➖ 本局淨損益：`0` | 💰 餘額：`{bal}`\n"
-                    main_ui += res_line
-            else:
-                main_ui += f"### 🤖 莊家手牌\n### {card_to_emoji(self.d_hand[0], guild_id)} {card_back_emoji(guild_id)} (點數: **❓**)\n"
-            embed.description = main_ui
-            return embed
 
         async def check_auto_bj(self, message):
             if len(self.p_hand) == 2 and calculate_score(self.p_hand) == 21:
@@ -730,7 +679,7 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             except Exception:
                 pass
             setup = SetupView(self.user, self.last_bet, self.last_p_bet, self.last_s_bet)
-            await inter.channel.send(embed=setup.build_embed(), view=setup)
+            await inter.channel.send(embed=await setup._build_embed_async(), view=setup)
 
         @discord.ui.button(label="All In (全押)", style=discord.ButtonStyle.danger)
         async def all_in(self, inter, btn):

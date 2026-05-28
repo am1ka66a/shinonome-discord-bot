@@ -44,6 +44,7 @@ from bot_modules.tx_ops import (
 )
 from bot_modules import rob_repo
 from bot_modules import economy_repo
+from bot_modules import economy_service
 from bot_modules import wanted_repo
 from bot_modules import game_repo
 from bot_modules.runtime import register_events
@@ -487,7 +488,7 @@ async def fetch_record_rows_async(user_id, limit: int = 50):
 
 
 async def fetch_casino_stats_rows_async():
-    return await db_to_thread(fetch_casino_stats_rows)
+    return await get_casino_stats_rows_cached()
 
 
 async def fetch_casino_share_stats_rows_async(days: int = 7):
@@ -970,38 +971,23 @@ def break_citizen_sync(attacker_id: int, target_id: int, now: datetime.datetime)
 def transfer_sync(sender_id: int, receiver_id: int, amount: int, note_text: str) -> typing.Dict[str, typing.Any]:
     ensure_user_exists(sender_id, 50000)
     ensure_user_exists(receiver_id, 0)
-    conn = get_db_connection()
-    c = conn.cursor()
-    # 固定順序鎖住雙方列，避免互轉造成死鎖／讀寫交錯
-    sid, rid = str(sender_id), str(receiver_id)
-    lock_user_rows(c, [sid, rid])
-    sender_before = get_locked_user_balance(c, sid)
-    receiver_before = get_locked_user_balance(c, rid)
-    c.execute(
-        "UPDATE users SET balance=balance-%s WHERE user_id=%s AND balance >= %s",
-        (amount, sid, amount),
-    )
-    if c.rowcount == 0:
-        conn.close()
-        return {"ok": False, "reason": "insufficient"}
-    c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (amount, rid))
-    sender_after = sender_before - amount
-    receiver_after = receiver_before + amount
     if note_text:
         out_reason = f"轉帳給 {receiver_id}（備註: {note_text}）"
         in_reason = f"收到 {sender_id} 的轉帳（備註: {note_text}）"
     else:
         out_reason = f"轉帳給 {receiver_id}"
         in_reason = f"收到 {sender_id} 的轉帳"
-    log_transaction_in_tx(c, sender_id, -amount, out_reason)
-    log_transaction_in_tx(c, receiver_id, amount, in_reason)
-    conn.commit()
-    conn.close()
-    return {
-        "ok": True,
-        "sender_after": sender_after,
-        "receiver_after": receiver_after,
-    }
+    return economy_service.transfer_users(
+        get_db_connection,
+        lock_user_rows,
+        get_locked_user_balance,
+        log_transaction_in_tx,
+        sender_id,
+        receiver_id,
+        amount,
+        out_reason,
+        in_reason,
+    )
 
 
 def fetch_balance_leaderboard_snapshot():
@@ -1023,7 +1009,7 @@ def fetch_level_leaderboard_snapshot():
 
 
 def try_deduct_balance(user_id, amount, reason):
-    return economy_repo.try_deduct_balance(
+    return economy_service.debit_user(
         get_db_connection,
         get_locked_user_balance,
         log_transaction_in_tx,
@@ -1034,7 +1020,7 @@ def try_deduct_balance(user_id, amount, reason):
 
 
 def credit_balance_with_log(user_id, amount, reason):
-    return economy_repo.credit_balance_with_log(
+    return economy_service.credit_user(
         get_db_connection,
         log_transaction_in_tx,
         user_id,
@@ -1560,8 +1546,24 @@ class ShinonomeBot(commands.Bot):
 
 bot = ShinonomeBot(command_prefix="!", intents=intents)
 
-# 同一使用者的 Slash 指令互斥鎖：上一個指令未結束前，暫時不可再開新指令。
-_active_app_command_locks: typing.Dict[int, float] = {}
+# 同一使用者的 Slash 指令互斥鎖：查詢類放行；會改狀態/金流的指令才互斥。
+READ_ONLY_APP_COMMANDS: typing.Set[str] = {
+    "help",
+    "balance",
+    "level",
+    "record",
+    "leaderboard",
+    "lvleaderboard",
+    "casino_stats",
+    "share_stats",
+    "wanted_status",
+    "wanted_list",
+    "good_citizen_list",
+    "admin_user_flags",
+    "admin_logs",
+    "dev_list_guilds",
+}
+_active_app_command_locks: typing.Dict[int, typing.Tuple[str, float]] = {}
 _active_app_command_lock_guard = asyncio.Lock()
 APP_COMMAND_LOCK_TIMEOUT_SECONDS = 180.0
 
@@ -1571,17 +1573,22 @@ async def enforce_single_active_app_command(interaction: discord.Interaction) ->
     user = getattr(interaction, "user", None)
     if user is None:
         return True
+    command_name = getattr(getattr(interaction, "command", None), "name", "") or ""
+    if command_name in READ_ONLY_APP_COMMANDS:
+        return True
     uid = int(user.id)
     now_ts = time.time()
+    lock_group = "mutating"
     async with _active_app_command_lock_guard:
-        started_ts = _active_app_command_locks.get(uid)
+        active = _active_app_command_locks.get(uid)
+        started_ts = active[1] if active else None
         if started_ts is not None and (now_ts - started_ts) < APP_COMMAND_LOCK_TIMEOUT_SECONDS:
             await interaction.response.send_message(
-                "⏳ 你有一個指令仍在執行中，請稍候再試。",
+                "⏳ 你有一個會變更資料的指令仍在執行中，請稍候再試。",
                 ephemeral=True,
             )
             return False
-        _active_app_command_locks[uid] = now_ts
+        _active_app_command_locks[uid] = (lock_group, now_ts)
     return True
 
 
@@ -1938,6 +1945,8 @@ async def on_ready():
     bot.loop.create_task(_event_tasks["logs_retention_task"]())
     bot.loop.create_task(_event_tasks["cache_cleanup_task"]())
     bot.loop.create_task(emit_cache_metrics_log_task())
+    bot.loop.create_task(refresh_leaderboard_snapshots_task())
+    bot.loop.create_task(refresh_casino_stats_snapshot_task())
     logger.info("機器人已啟動: %s（伺服器數 %s）", bot.user, len(bot.guilds))
 
 # ··············································································
@@ -3270,13 +3279,20 @@ async def _is_user_in_guild(guild: discord.Guild, user_id: int) -> bool:
 LEADERBOARD_POOL = 400
 LEADERBOARD_RANK_SCAN = 800
 LEADERBOARD_CACHE_SECONDS = 30.0
+LEADERBOARD_SNAPSHOT_SECONDS = 30.0
 WANTED_CACHE_SECONDS = 10.0
 GOOD_CITIZEN_CACHE_SECONDS = 15.0
 GUILD_MEMBER_CACHE_SECONDS = 20.0
+CASINO_STATS_CACHE_SECONDS = 60.0
+CASINO_STATS_SNAPSHOT_SECONDS = 60.0
 METRICS_LOG_INTERVAL_SECONDS = 120
 _lb_balance_cache: typing.Optional[typing.Tuple[float, typing.List[typing.Tuple]]] = None
 _lb_level_cache: typing.Optional[typing.Tuple[float, typing.List[typing.Tuple]]] = None
 _lb_cache_lock = asyncio.Lock()
+_casino_stats_cache: typing.Optional[typing.Tuple[float, typing.Tuple[int, int, int]]] = None
+_casino_stats_cache_lock = asyncio.Lock()
+_leaderboard_snapshot_ready = asyncio.Event()
+_casino_stats_snapshot_ready = asyncio.Event()
 _guild_member_cache: typing.Dict[typing.Tuple[int, int], typing.Tuple[float, bool]] = {}
 _guild_member_cache_lock = asyncio.Lock()
 _wanted_list_cache: typing.Optional[typing.Tuple[float, typing.List[typing.Tuple]]] = None
@@ -3300,15 +3316,24 @@ async def get_balance_leaderboard_rows_cached() -> typing.List[typing.Tuple]:
     global _lb_balance_cache
     now_ts = time.time()
     cached = _lb_balance_cache
-    if cached and (now_ts - cached[0]) < LEADERBOARD_CACHE_SECONDS:
+    if cached:
         return cached[1]
+    if not _leaderboard_snapshot_ready.is_set():
+        try:
+            await asyncio.wait_for(_leaderboard_snapshot_ready.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass
+        cached = _lb_balance_cache
+        if cached:
+            return cached[1]
     async with _lb_cache_lock:
         now_ts = time.time()
         cached = _lb_balance_cache
-        if cached and (now_ts - cached[0]) < LEADERBOARD_CACHE_SECONDS:
+        if cached:
             return cached[1]
         rows = await db_to_thread(fetch_balance_leaderboard_snapshot)
         _lb_balance_cache = (now_ts, rows)
+        _leaderboard_snapshot_ready.set()
         return rows
 
 
@@ -3316,16 +3341,86 @@ async def get_level_leaderboard_rows_cached() -> typing.List[typing.Tuple]:
     global _lb_level_cache
     now_ts = time.time()
     cached = _lb_level_cache
-    if cached and (now_ts - cached[0]) < LEADERBOARD_CACHE_SECONDS:
+    if cached:
         return cached[1]
+    if not _leaderboard_snapshot_ready.is_set():
+        try:
+            await asyncio.wait_for(_leaderboard_snapshot_ready.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass
+        cached = _lb_level_cache
+        if cached:
+            return cached[1]
     async with _lb_cache_lock:
         now_ts = time.time()
         cached = _lb_level_cache
-        if cached and (now_ts - cached[0]) < LEADERBOARD_CACHE_SECONDS:
+        if cached:
             return cached[1]
         rows = await db_to_thread(fetch_level_leaderboard_snapshot)
         _lb_level_cache = (now_ts, rows)
+        if _lb_balance_cache is not None:
+            _leaderboard_snapshot_ready.set()
         return rows
+
+
+async def get_casino_stats_rows_cached() -> typing.Tuple[int, int, int]:
+    global _casino_stats_cache
+    now_ts = time.time()
+    cached = _casino_stats_cache
+    if cached:
+        return cached[1]
+    if not _casino_stats_snapshot_ready.is_set():
+        try:
+            await asyncio.wait_for(_casino_stats_snapshot_ready.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass
+        cached = _casino_stats_cache
+        if cached:
+            return cached[1]
+    async with _casino_stats_cache_lock:
+        now_ts = time.time()
+        cached = _casino_stats_cache
+        if cached:
+            return cached[1]
+        rows = await db_to_thread(fetch_casino_stats_rows)
+        _casino_stats_cache = (now_ts, rows)
+        _casino_stats_snapshot_ready.set()
+        return rows
+
+
+async def refresh_leaderboard_snapshots_task():
+    """背景更新排行榜，讓 /leaderboard 與 /lvleaderboard 只讀記憶體快照。"""
+    global _lb_balance_cache, _lb_level_cache
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            now_ts = time.time()
+            balance_rows, level_rows = await asyncio.gather(
+                db_to_thread(fetch_balance_leaderboard_snapshot),
+                db_to_thread(fetch_level_leaderboard_snapshot),
+            )
+            async with _lb_cache_lock:
+                _lb_balance_cache = (now_ts, balance_rows)
+                _lb_level_cache = (now_ts, level_rows)
+                _leaderboard_snapshot_ready.set()
+        except Exception as e:
+            logger.exception("刷新排行榜背景快照失敗: %s", e)
+        await asyncio.sleep(LEADERBOARD_SNAPSHOT_SECONDS)
+
+
+async def refresh_casino_stats_snapshot_task():
+    """背景更新經濟總金流統計，避免查詢指令直接掃大表。"""
+    global _casino_stats_cache
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            rows = await db_to_thread(fetch_casino_stats_rows)
+            async with _casino_stats_cache_lock:
+                _casino_stats_cache = (time.time(), rows)
+                _casino_stats_snapshot_ready.set()
+        except Exception as e:
+            logger.exception("刷新 casino_stats 背景快照失敗: %s", e)
+        await asyncio.sleep(CASINO_STATS_SNAPSHOT_SECONDS)
 
 
 async def get_wanted_list_rows_cached() -> typing.List[typing.Tuple]:
@@ -3437,45 +3532,26 @@ async def emit_cache_metrics_log_task():
 async def leaderboard(interaction: discord.Interaction):
     await interaction_defer_if_needed(interaction)
     await ensure_user_exists_async(interaction.user.id, 50000)
-    guild = interaction.guild
     my_bal, pool, richer, top10, global_rank = await fetch_balance_leaderboard_core_async(interaction.user.id)
-
-    if guild:
-        data: typing.List[typing.Tuple] = []
-        for row in pool:
-            if len(data) >= 10:
-                break
-            uid = int(row[0])
-            if await _is_user_in_guild(guild, uid):
-                data.append(row)
-        ahead = 0
-        for (uid_str,) in richer:
-            if await _is_user_in_guild(guild, int(uid_str)):
-                ahead += 1
-        my_rank: typing.Union[str, int] = ahead + 1
-        title = "🏆 排行榜（本伺服器）"
-        note = "\n\n※ 僅列出**目前仍在本伺服器**的成員（已退群者不含在內）。"
-        if len(richer) >= LEADERBOARD_RANK_SCAN:
-            note += f"\n※ 你的名次僅掃描「餘額較高」累計前 {LEADERBOARD_RANK_SCAN} 人中的本群成員；極端情況下為參考值。"
-    else:
-        data = top10
-        my_rank = global_rank
-        title = "🏆 排行榜（全站）"
-        note = "\n\n※ 在伺服器頻道使用時，榜單會改為**僅本伺服器成員**。"
+    snapshot_age = time.time() - _lb_balance_cache[0] if _lb_balance_cache else None
+    data = top10
+    my_rank = global_rank
+    title = "🏆 排行榜（全站）"
+    note = "\n\n※ 已改為全站榜單，不再限制當前伺服器成員。"
 
     lines = [f"{i+1}. <@{uid}>: {int(bal):,}" for i, (uid, bal) in enumerate(data)]
     msg = "\n".join(lines) if lines else "（尚無符合條件的成員）"
     msg += f"\n\n📍 你的目前名次：**#{my_rank}**（餘額 `{my_bal:,}`）{note}"
     emb = discord.Embed(title=title, description=msg)
-    if guild:
-        await interaction.followup.send(embed=emb)
-    else:
-        await interaction_send(interaction, embed=emb)
+    if snapshot_age is not None:
+        emb.set_footer(text=f"背景快照約 {int(snapshot_age)} 秒前更新")
+    await interaction_send(interaction, embed=emb)
 
 @bot.tree.command(name="casino_stats", description="查看經濟總金流統計（回收率/總發幣量/流通量）")
 async def casino_stats(interaction: discord.Interaction):
     await interaction_defer_if_needed(interaction)
-    total_issued, total_recovered, circulation = await fetch_casino_stats_rows_async()
+    total_issued, total_recovered, circulation = await get_casino_stats_rows_cached()
+    snapshot_age = time.time() - _casino_stats_cache[0] if _casino_stats_cache else None
 
     recovery_rate = (total_recovered / total_issued * 100) if total_issued > 0 else 0.0
     net_issued = total_issued - total_recovered
@@ -3485,7 +3561,10 @@ async def casino_stats(interaction: discord.Interaction):
     embed.add_field(name="總回收量", value=f"`{total_recovered:,}` 東雲幣", inline=False)
     embed.add_field(name="淨發行量", value=f"`{net_issued:,}` 東雲幣", inline=False)
     embed.add_field(name="目前流通量", value=f"`{circulation:,}` 東雲幣", inline=False)
-    embed.set_footer(text="計算基準：casino_logs（logs 全期鏡像總帳）與 users.balance")
+    footer = "計算基準：casino_logs（logs 全期鏡像總帳）與 users.balance"
+    if snapshot_age is not None:
+        footer += f"｜背景快照約 {int(snapshot_age)} 秒前更新"
+    embed.set_footer(text=footer)
     await interaction_send(interaction, embed=embed)
 
 
@@ -3515,31 +3594,12 @@ async def share_stats(interaction: discord.Interaction, days: int = 7):
 async def lvleaderboard(interaction: discord.Interaction):
     await interaction_defer_if_needed(interaction)
     await ensure_user_exists_async(interaction.user.id, 50000)
-    guild = interaction.guild
     my_level, my_exp, pool, richer_lv, top10, global_rank = await fetch_level_leaderboard_core_async(interaction.user.id)
-
-    if guild:
-        data: typing.List[typing.Tuple] = []
-        for row in pool:
-            if len(data) >= 10:
-                break
-            uid = int(row[0])
-            if await _is_user_in_guild(guild, uid):
-                data.append(row)
-        ahead = 0
-        for (uid_str,) in richer_lv:
-            if await _is_user_in_guild(guild, int(uid_str)):
-                ahead += 1
-        my_rank: typing.Union[str, int] = ahead + 1
-        title = "🧠 Lv 排行榜（本伺服器）"
-        note = "\n\n※ 僅列出**目前仍在本伺服器**的成員。"
-        if len(richer_lv) >= LEADERBOARD_RANK_SCAN:
-            note += f"\n※ 你的名次僅掃描等級／EXP 較高者累計前 {LEADERBOARD_RANK_SCAN} 人中的本群成員；極端情況下為參考值。"
-    else:
-        data = top10
-        my_rank = global_rank
-        title = "🧠 Lv 排行榜（全站）"
-        note = "\n\n※ 在伺服器頻道使用時，榜單會改為**僅本伺服器成員**。"
+    snapshot_age = time.time() - _lb_level_cache[0] if _lb_level_cache else None
+    data = top10
+    my_rank = global_rank
+    title = "🧠 Lv 排行榜（全站）"
+    note = "\n\n※ 已改為全站榜單，不再限制當前伺服器成員。"
 
     if not data:
         return await interaction_send(interaction, "目前沒有符合條件的等級資料。", ephemeral=True)
@@ -3549,10 +3609,9 @@ async def lvleaderboard(interaction: discord.Interaction):
     )
     msg += f"\n\n📍 你的目前名次：**#{my_rank}**（Lv.{my_level} | EXP {my_exp:,}）{note}"
     emb = discord.Embed(title=title, description=msg)
-    if guild:
-        await interaction.followup.send(embed=emb)
-    else:
-        await interaction_send(interaction, embed=emb)
+    if snapshot_age is not None:
+        emb.set_footer(text=f"背景快照約 {int(snapshot_age)} 秒前更新")
+    await interaction_send(interaction, embed=emb)
 
 # 相關指令區段已精簡
 
@@ -3591,9 +3650,7 @@ register_blackjack_commands(
         "get_is_event_active": get_is_event_active,
         "SIDE_BET_RATIO": SIDE_BET_RATIO,
         "LEVEL_MILE_TIERS": LEVEL_MILE_TIERS,
-        "ensure_user_exists": ensure_user_exists,
         "ensure_user_exists_async": ensure_user_exists_async,
-        "get_user_stats": get_user_stats,
         "get_user_stats_async": get_user_stats_async,
         "try_deduct_balance_async": try_deduct_balance_async,
         "update_game_result_async": update_game_result_async,
