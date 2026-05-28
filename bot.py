@@ -1978,7 +1978,7 @@ async def help_slash(interaction: discord.Interaction):
             "`/daily` — 每日簽到領幣\n"
             "`/hourly` — 每小時簽到（依等級累積）\n"
             "`/beg` — 乞討\n"
-            f"`/rob` — 搶劫（**僅搶匪**；約 **{int(round(ROB_BASE_SUCCESS_RATE * 100))}%** 基礎成功率、每級差 ±1%；成功累積通緝）\n"
+            f"`/rob` — 搶劫（**僅搶匪**；約 **{int(round(ROB_BASE_SUCCESS_RATE * 100))}%** 基礎成功率、每級差 ±1%；**30 分鐘**冷卻；成功累積通緝）\n"
             "`/rescue` — 破產救濟（餘額 0 時）\n"
             "`/transfer` — 轉帳給其他玩家\n"
             "`/redpacket` — 發紅包\n"
