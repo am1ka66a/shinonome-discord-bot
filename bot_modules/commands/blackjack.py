@@ -295,6 +295,7 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             self.current_hand = 0
             self.hand_results = [None]
             self._action_lock = asyncio.Lock()
+            self._auto_settling = False
             self.side_p, self.side_m = check_sidebets(self.hands[0], self.d_hand[0], p_bet, s_bet)
             self.update_buttons()
 
@@ -304,6 +305,9 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                 return False
             if self._action_lock.locked():
                 await interaction.response.send_message("⏳ 上一個操作仍在處理中，請稍候。", ephemeral=True)
+                return False
+            if self._auto_settling:
+                await interaction.response.send_message("⏳ 起手 BlackJack 結算中，請稍候。", ephemeral=True)
                 return False
             now = asyncio.get_running_loop().time()
             if hasattr(self, "last_action") and now - self.last_action < 1.0:
@@ -419,11 +423,17 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
 
         async def check_auto_bj(self, message):
             if len(self.p_hand) == 2 and calculate_score(self.p_hand) == 21:
+                self._auto_settling = True
+                for c in self.children:
+                    c.disabled = True
+                await self._edit(message=message, extra_msg="🌟 起手 BlackJack，正在自動結算...")
                 await asyncio.sleep(1.5)
                 try:
                     await self.advance_hand(message_obj=message)
                 except Exception:
                     logger.exception("21點 check_auto_bj 自動結算失敗 user=%s", self.user.id)
+                finally:
+                    self._auto_settling = False
 
         async def end(self, res, prof, win=False, is_push=False, message_obj=None, interaction=None, exp_gain=0, exp_detail=""):
             if getattr(self, "_game_over", False):
@@ -648,15 +658,18 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             if not feature_toggles.get("bj", True) or not get_is_event_active():
                 return await inter.response.send_message("打烊", ephemeral=True)
             stats = await get_user_stats_async(self.user.id)
-            if not stats or stats[0] < 100:
+            all_in_amount = int((stats[0] if stats else 0) or 0)
+            if all_in_amount < 100:
                 return await inter.response.send_message("去乞討吧雜魚", ephemeral=True)
+            if not await try_deduct_balance_async(self.user.id, all_in_amount, "21點 All In 開局扣款"):
+                return await inter.response.send_message("餘額不足（可能剛轉帳/變動），請重新開局。", ephemeral=True)
             self.stop()
             await inter.response.edit_message(content="🔥 All In 已確認！正在為你開牌...", view=None)
             try:
                 await self.parent_msg.delete()
             except Exception:
                 pass
-            gv = BlackjackGame(self.user, stats[0], 0, 0)
+            gv = BlackjackGame(self.user, all_in_amount, 0, 0, upfront_cost=all_in_amount)
             msg = await send_game(inter.channel, gv)
             if msg is not None:
                 await gv.check_auto_bj(msg)

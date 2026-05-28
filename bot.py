@@ -1560,6 +1560,49 @@ class ShinonomeBot(commands.Bot):
 
 bot = ShinonomeBot(command_prefix="!", intents=intents)
 
+# 同一使用者的 Slash 指令互斥鎖：上一個指令未結束前，暫時不可再開新指令。
+_active_app_command_locks: typing.Dict[int, float] = {}
+_active_app_command_lock_guard = asyncio.Lock()
+APP_COMMAND_LOCK_TIMEOUT_SECONDS = 180.0
+
+
+@bot.tree.interaction_check
+async def enforce_single_active_app_command(interaction: discord.Interaction) -> bool:
+    user = getattr(interaction, "user", None)
+    if user is None:
+        return True
+    uid = int(user.id)
+    now_ts = time.time()
+    async with _active_app_command_lock_guard:
+        started_ts = _active_app_command_locks.get(uid)
+        if started_ts is not None and (now_ts - started_ts) < APP_COMMAND_LOCK_TIMEOUT_SECONDS:
+            await interaction.response.send_message(
+                "⏳ 你有一個指令仍在執行中，請稍候再試。",
+                ephemeral=True,
+            )
+            return False
+        _active_app_command_locks[uid] = now_ts
+    return True
+
+
+@bot.event
+async def on_app_command_completion(interaction: discord.Interaction, command: app_commands.Command):
+    user = getattr(interaction, "user", None)
+    if user is None:
+        return
+    async with _active_app_command_lock_guard:
+        _active_app_command_locks.pop(int(user.id), None)
+
+
+@bot.event
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    user = getattr(interaction, "user", None)
+    if user is not None:
+        async with _active_app_command_lock_guard:
+            _active_app_command_locks.pop(int(user.id), None)
+    # 保留既有錯誤輸出，避免吞掉實際問題。
+    logger.exception("app command 錯誤: %s", error)
+
 # ==============================================================================
 # 【十一】私訊／群組 @ ↔ 管理頻道轉接（Relay）
 # 將使用者私訊或群組 @ 機器人轉到固定管理頻道；工作人員在該頻道回覆時，依來源
@@ -2507,7 +2550,8 @@ async def cop_hunt_slash(
 async def wanted_buyout_slash(interaction: discord.Interaction):
     if not interaction.guild:
         return await interaction.response.send_message("請在伺服器頻道使用。", ephemeral=True)
-    await interaction_defer_if_needed(interaction)
+    # 先以個人可見 defer，避免冷卻/錯誤提示被公開。
+    await interaction_defer_if_needed(interaction, ephemeral=True)
     now = now_tw_naive()
     result = await wanted_buyout_sync_async(interaction.user.id, now)
     if not result.get("ok"):
