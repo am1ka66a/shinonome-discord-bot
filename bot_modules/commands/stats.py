@@ -43,7 +43,7 @@ async def _fetch_level_leaderboard_core(user_id):
 
 def register_stats_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
     ALLOWED_HOST_IDS = ctx["ALLOWED_HOST_IDS"]
-    CASINO_RECOVERY_SHARE_ENABLED = ctx["CASINO_RECOVERY_SHARE_ENABLED"]
+    get_share_enabled = ctx["get_share_enabled"]
     CASINO_RECOVERY_SHARE_RATE = ctx["CASINO_RECOVERY_SHARE_RATE"]
     CASINO_RECOVERY_SHARE_TARGET_ID = ctx["CASINO_RECOVERY_SHARE_TARGET_ID"]
     ensure_user_exists_async = ctx["ensure_user_exists_async"]
@@ -56,7 +56,6 @@ def register_stats_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         await interaction_defer_if_needed(interaction)
         await ensure_user_exists_async(interaction.user.id, 50000)
         my_bal, pool, richer, top10, global_rank = await _fetch_balance_leaderboard_core(interaction.user.id)
-        snapshot_age = snapshot_cache.get_lb_balance_snapshot_age()
         data = top10
         my_rank = global_rank
         title = "🏆 排行榜（全站）"
@@ -66,15 +65,12 @@ def register_stats_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         msg = "\n".join(lines) if lines else "（尚無符合條件的成員）"
         msg += f"\n\n📍 你的目前名次：**#{my_rank}**（餘額 `{my_bal:,}`）{note}"
         emb = discord.Embed(title=title, description=msg)
-        if snapshot_age is not None:
-            emb.set_footer(text=f"背景快照約 {int(snapshot_age)} 秒前更新")
         await interaction_send(interaction, embed=emb)
 
     @bot.tree.command(name="casino_stats", description="查看經濟總金流統計（回收率/總發幣量/流通量）")
     async def casino_stats(interaction: discord.Interaction):
         await interaction_defer_if_needed(interaction)
         total_issued, total_recovered, circulation = await snapshot_cache.get_casino_stats_rows_cached()
-        snapshot_age = snapshot_cache.get_casino_stats_snapshot_age()
 
         recovery_rate = (total_recovered / total_issued * 100) if total_issued > 0 else 0.0
         net_issued = total_issued - total_recovered
@@ -84,10 +80,7 @@ def register_stats_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         embed.add_field(name="總回收量", value=f"`{total_recovered:,}` 東雲幣", inline=False)
         embed.add_field(name="淨發行量", value=f"`{net_issued:,}` 東雲幣", inline=False)
         embed.add_field(name="目前流通量", value=f"`{circulation:,}` 東雲幣", inline=False)
-        footer = "計算基準：casino_logs（logs 全期鏡像總帳）與 users.balance"
-        if snapshot_age is not None:
-            footer += f"｜背景快照約 {int(snapshot_age)} 秒前更新"
-        embed.set_footer(text=footer)
+        embed.set_footer(text="計算基準：casino_logs（logs 全期鏡像總帳）與 users.balance")
         await interaction_send(interaction, embed=embed)
 
     @bot.tree.command(name="share_stats", description="查看賭場回收分潤統計（管理）")
@@ -98,7 +91,7 @@ def register_stats_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         await interaction_defer_if_needed(interaction, ephemeral=True)
         total, recent, by_reason = await fetch_casino_share_stats_rows_async(days)
         embed = discord.Embed(title="📊 賭場回收分潤統計", color=0x5865F2)
-        embed.add_field(name="分潤功能", value="啟用" if CASINO_RECOVERY_SHARE_ENABLED else "停用", inline=True)
+        embed.add_field(name="分潤功能", value="啟用" if get_share_enabled() else "停用", inline=True)
         embed.add_field(name="分潤比例", value=f"`{CASINO_RECOVERY_SHARE_RATE * 100:.2f}%`", inline=True)
         embed.add_field(name="分潤目標", value=f"<@{CASINO_RECOVERY_SHARE_TARGET_ID}>", inline=True)
         embed.add_field(name="累計分潤總額", value=f"`{total:,}` 東雲幣", inline=False)
@@ -117,7 +110,6 @@ def register_stats_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         await interaction_defer_if_needed(interaction)
         await ensure_user_exists_async(interaction.user.id, 50000)
         my_level, my_exp, pool, richer_lv, top10, global_rank = await _fetch_level_leaderboard_core(interaction.user.id)
-        snapshot_age = snapshot_cache.get_lb_level_snapshot_age()
         data = top10
         my_rank = global_rank
         title = "🧠 Lv 排行榜（全站）"
@@ -131,6 +123,4 @@ def register_stats_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         )
         msg += f"\n\n📍 你的目前名次：**#{my_rank}**（Lv.{my_level} | EXP {my_exp:,}）{note}"
         emb = discord.Embed(title=title, description=msg)
-        if snapshot_age is not None:
-            emb.set_footer(text=f"背景快照約 {int(snapshot_age)} 秒前更新")
         await interaction_send(interaction, embed=emb)

@@ -21,6 +21,7 @@ cleanup_local_caches: typing.Optional[typing.Callable] = None
 get_lb_balance_snapshot_age: typing.Optional[typing.Callable] = None
 get_lb_level_snapshot_age: typing.Optional[typing.Callable] = None
 get_casino_stats_snapshot_age: typing.Optional[typing.Callable] = None
+invalidate_wanted_caches: typing.Optional[typing.Callable[..., None]] = None
 
 
 def register_snapshot_cache(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Dict[str, typing.Any]:
@@ -235,6 +236,13 @@ def register_snapshot_cache(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Di
             for k in expired_keys:
                 store.pop(k, None)
 
+    def _invalidate_wanted_caches(*user_ids: int) -> None:
+        nonlocal _wanted_list_cache, _good_citizen_cache
+        _wanted_list_cache = None
+        _good_citizen_cache = None
+        for uid in user_ids:
+            _wanted_status_cache.pop(str(uid), None)
+
     async def emit_cache_metrics_log_task():
         await bot.wait_until_ready()
         while not bot.is_closed():
@@ -285,6 +293,7 @@ def register_snapshot_cache(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Di
     global get_lb_balance_snapshot_age
     global get_lb_level_snapshot_age
     global get_casino_stats_snapshot_age
+    global invalidate_wanted_caches
 
     get_balance_leaderboard_rows_cached = _get_balance_leaderboard_rows_cached
     get_level_leaderboard_rows_cached = _get_level_leaderboard_rows_cached
@@ -296,6 +305,7 @@ def register_snapshot_cache(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Di
     get_lb_balance_snapshot_age = _get_lb_balance_snapshot_age
     get_lb_level_snapshot_age = _get_lb_level_snapshot_age
     get_casino_stats_snapshot_age = _get_casino_stats_snapshot_age
+    invalidate_wanted_caches = _invalidate_wanted_caches
 
     return {
         "emit_cache_metrics_log_task": emit_cache_metrics_log_task,

@@ -5,6 +5,14 @@ import typing
 import discord
 from discord import app_commands
 
+from bot_modules.runtime import snapshot_cache
+
+
+def _invalidate_wanted_caches(*user_ids: int) -> None:
+    fn = snapshot_cache.invalidate_wanted_caches
+    if fn is not None:
+        fn(*user_ids)
+
 
 def register_wanted_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
     FEATURE_TOGGLES = ctx["FEATURE_TOGGLES"]
@@ -127,6 +135,7 @@ def register_wanted_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             )
             if not success_result.get("ok"):
                 return await interaction_send(interaction, "對方及時把錢藏好了，這次搶劫失敗。", ephemeral=True)
+            _invalidate_wanted_caches(interaction.user.id, member.id)
             steal_amount = int(success_result["steal_amount"])
             wanted_info = success_result["wanted_info"]
             counter_note = success_result.get("counter_note", "")
@@ -242,6 +251,7 @@ def register_wanted_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                 ),
                 inline=False,
             )
+        _invalidate_wanted_caches(interaction.user.id)
         await interaction_send(interaction, embed=emb)
 
 
@@ -409,6 +419,7 @@ def register_wanted_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             )
             conn.commit()
             conn.close()
+            _invalidate_wanted_caches(int(criminal_id))
 
             rob_detail = ""
             if rob_history:
@@ -475,6 +486,7 @@ def register_wanted_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         )
         conn.commit()
         conn.close()
+        _invalidate_wanted_caches(int(criminal_id))
 
         last_five_total, rob_count, rob_history = get_last_five_robs_total(criminal_id)
         rob_detail = ""
@@ -547,6 +559,7 @@ def register_wanted_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                     ephemeral=True,
                 )
             return await interaction_send(interaction, "扣款失敗（餘額不足）。", ephemeral=True)
+        _invalidate_wanted_caches(interaction.user.id)
         new_bal = int(result["new_balance"])
         stars_was = int(result["stars_was"])
         cost = int(WANTED_BUYOUT_COST)
@@ -598,6 +611,7 @@ def register_wanted_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                 return await interaction.response.send_message("扣款失敗（餘額不足）。", ephemeral=True)
             return await interaction.response.send_message("❌ 良民證操作失敗，請稍後再試。", ephemeral=True)
 
+        _invalidate_wanted_caches(interaction.user.id)
         next_active = int(result["next_active"])
         new_bal = int(result["new_balance"])
         title = "✅ 良民證已啟用" if next_active else "✅ 良民證已解除"
@@ -681,6 +695,7 @@ def register_wanted_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                     )
                 return await interaction.response.send_message("ℹ️ 目標目前沒有啟用良民證。", ephemeral=True)
             return await interaction.response.send_message("扣款失敗（餘額不足）。", ephemeral=True)
+        _invalidate_wanted_caches(target_user.id)
         broken_until = result["broken_until"]
         ts = tw_naive_to_discord_ts(broken_until)
         emb = discord.Embed(
@@ -845,6 +860,7 @@ def register_wanted_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                     ephemeral=True,
                 )
             return await interaction.response.send_message("扣款失敗（餘額不足）。", ephemeral=True)
+        _invalidate_wanted_caches(interaction.user.id)
         debt = int(result["debt"])
         total_bail = int(result["total_bail"])
         await interaction.response.send_message(

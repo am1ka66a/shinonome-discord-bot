@@ -100,7 +100,7 @@ def register_all_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         bot,
         {
             "ALLOWED_HOST_IDS": ctx["ALLOWED_HOST_IDS"],
-            "CASINO_RECOVERY_SHARE_ENABLED": ctx["CASINO_RECOVERY_SHARE_ENABLED"],
+            "get_share_enabled": ctx["get_share_enabled"],
             "CASINO_RECOVERY_SHARE_RATE": ctx["CASINO_RECOVERY_SHARE_RATE"],
             "CASINO_RECOVERY_SHARE_TARGET_ID": ctx["CASINO_RECOVERY_SHARE_TARGET_ID"],
             "ensure_user_exists_async": ctx["ensure_user_exists_async"],
