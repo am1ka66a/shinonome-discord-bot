@@ -7,6 +7,7 @@ from bot_modules.commands import (
     register_duel_commands,
     register_economy_commands,
     register_fun_commands,
+    register_russian_roulette_commands,
     register_social_commands,
     register_stats_commands,
     register_wanted_commands,
@@ -132,6 +133,23 @@ def register_all_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             "settle_coinflip_async": ctx["settle_coinflip_async"],
             "buy_lottery_tickets_async": ctx["buy_lottery_tickets_async"],
             "fetch_lottery_status_async": ctx["fetch_lottery_status_async"],
+        },
+    )
+
+    register_russian_roulette_commands(
+        bot,
+        {
+            "FEATURE_TOGGLES": ctx["FEATURE_TOGGLES"],
+            "get_is_event_active": ctx["get_is_event_active"],
+            "COINFLIP_MIN_BET": ctx["COINFLIP_MIN_BET"],
+            "COINFLIP_MAX_BET": ctx["COINFLIP_MAX_BET"],
+            "RUSSIAN_ROULETTE_CHAMBERS": ctx["RUSSIAN_ROULETTE_CHAMBERS"],
+            "ensure_user_exists_async": ctx["ensure_user_exists_async"],
+            "interaction_send": ctx["interaction_send"],
+            "interaction_defer_if_needed": ctx["interaction_defer_if_needed"],
+            "try_deduct_balance_async": ctx["try_deduct_balance_async"],
+            "credit_balance_with_log_async": ctx["credit_balance_with_log_async"],
+            "update_game_result_async": ctx["update_game_result_async"],
         },
     )
 

@@ -53,6 +53,7 @@ FEATURE_TOGGLES: typing.Dict[str, bool] = {
     "redpacket": True,
     "coinflip": True,
     "lottery": True,
+    "russian_roulette": True,
 }
 BICYCLE_COOLDOWN_SECONDS = config.BICYCLE_COOLDOWN_SECONDS
 COINFLIP_MIN_BET = config.COINFLIP_MIN_BET
@@ -60,6 +61,7 @@ COINFLIP_MAX_BET = config.COINFLIP_MAX_BET
 LOTTERY_TICKET_COST = config.LOTTERY_TICKET_COST
 LOTTERY_MAX_TICKETS_PER_BUY = config.LOTTERY_MAX_TICKETS_PER_BUY
 LOTTERY_DRAW_CHECK_SECONDS = config.LOTTERY_DRAW_CHECK_SECONDS
+RUSSIAN_ROULETTE_CHAMBERS = config.RUSSIAN_ROULETTE_CHAMBERS
 red_packet_seq_ref = [0]
 MSG_DB_FLUSH_EVERY_SECONDS = config.MSG_DB_FLUSH_EVERY_SECONDS
 MSG_DB_FLUSH_COUNT = config.MSG_DB_FLUSH_COUNT
@@ -255,6 +257,7 @@ assembly.register_all_commands(
         "COINFLIP_MAX_BET": COINFLIP_MAX_BET,
         "LOTTERY_TICKET_COST": LOTTERY_TICKET_COST,
         "LOTTERY_MAX_TICKETS_PER_BUY": LOTTERY_MAX_TICKETS_PER_BUY,
+        "RUSSIAN_ROULETTE_CHAMBERS": RUSSIAN_ROULETTE_CHAMBERS,
         "TW_TZ": TW_TZ,
         "resolve_slash_target": resolve_slash_target,
         "ensure_user_exists": ensure_user_exists,

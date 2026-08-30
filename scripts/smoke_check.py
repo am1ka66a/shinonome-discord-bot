@@ -38,6 +38,7 @@ def import_modules() -> None:
         register_duel_commands,
         register_economy_commands,
         register_fun_commands,
+        register_russian_roulette_commands,
         register_social_commands,
         register_stats_commands,
         register_wanted_commands,

@@ -724,6 +724,7 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
             app_commands.Choice(name="redpacket", value="redpacket"),
             app_commands.Choice(name="coinflip", value="coinflip"),
             app_commands.Choice(name="lottery", value="lottery"),
+            app_commands.Choice(name="russian_roulette", value="russian_roulette"),
             app_commands.Choice(name="share", value="share"),
         ]
     )
@@ -745,6 +746,7 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
             f"redpacket: {'on' if feature_toggles.get('redpacket', True) else 'off'}",
             f"coinflip: {'on' if feature_toggles.get('coinflip', True) else 'off'}",
             f"lottery: {'on' if feature_toggles.get('lottery', True) else 'off'}",
+            f"russian_roulette: {'on' if feature_toggles.get('russian_roulette', True) else 'off'}",
             f"share: {'on' if get_share_enabled() else 'off'}",
         ]
         await interaction.response.send_message(
