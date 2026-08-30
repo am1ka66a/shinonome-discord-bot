@@ -28,6 +28,44 @@ def register_fun_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
     lock_user_rows = ctx["lock_user_rows"]
     log_transaction_in_tx = ctx["log_transaction_in_tx"]
 
+    def _kill_message_label(template: str) -> str:
+        label = template.replace("{target} ", "").replace("{target}", "").strip()
+        return label[:100]
+
+    def _build_kill_message(
+        template: str,
+        target_member: discord.Member,
+        killer: discord.abc.User,
+        item: str,
+    ) -> str:
+        target_text = target_member.mention
+        return (
+            template.format(target=target_text)
+            .replace("<死者>", target_text)
+            .replace("死者", target_text)
+            .replace("擊殺者", killer.mention)
+            .replace("击杀者", killer.mention)
+            .replace("物品", item)
+        )
+
+    def _resolve_kill_template(death: typing.Optional[str]) -> str:
+        if not death:
+            return random.choice(MINECRAFT_DEATH_MESSAGES)
+        if death.isdigit():
+            idx = int(death)
+            if 0 <= idx < len(MINECRAFT_DEATH_MESSAGES):
+                return MINECRAFT_DEATH_MESSAGES[idx]
+        for template in MINECRAFT_DEATH_MESSAGES:
+            if death == template or death == _kill_message_label(template):
+                return template
+        death_lower = death.lower()
+        for template in MINECRAFT_DEATH_MESSAGES:
+            if death_lower in _kill_message_label(template).lower():
+                return template
+        if "{target}" not in death and "死者" not in death:
+            return f"{{target}} {death}"
+        return death
+
     @bot.tree.command(name="help", description="機器人指令總覽（一般玩家）")
     async def help_slash(interaction: discord.Interaction):
         """東雲幣、賭場、通緝／警察、等級等 Slash 說明（不含主機／管理員專用指令）。"""
@@ -86,7 +124,7 @@ def register_fun_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         )
         emb.add_field(
             name="🎮 其他",
-            value="`/kill` — Minecraft 風格隨機死法（需選本群成員）\n"
+            value="`/kill` — Minecraft 風格隨機死法（可選指定死亡方式）\n"
             "`/跳蛋` — 悼念早安同學\n"
             "`/bicycle` — 嘗試偷走奈音的腳踏車",
             inline=False,
@@ -95,11 +133,16 @@ def register_fun_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         await interaction.response.send_message(embed=emb, ephemeral=True)
 
     @bot.tree.command(name="kill", description="在目前頻道送出 Minecraft 風格隨機死法")
-    @app_commands.describe(target="目標（選人）", user_id="或填使用者 ID／貼提及")
+    @app_commands.describe(
+        target="目標（選人）",
+        user_id="或填使用者 ID／貼提及",
+        death="死亡方式（選填；可輸入或從建議選單挑選）",
+    )
     async def kill(
         interaction: discord.Interaction,
         target: typing.Optional[discord.Member] = None,
         user_id: typing.Optional[str] = None,
+        death: typing.Optional[str] = None,
     ):
         m_user, err = await resolve_slash_target(
             interaction, target, user_id, required=True, in_guild_only=True
@@ -109,18 +152,26 @@ def register_fun_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         if not isinstance(m_user, discord.Member):
             return await interaction.response.send_message("目標必須是此伺服器成員。", ephemeral=True)
         target = m_user
-        template = random.choice(MINECRAFT_DEATH_MESSAGES)
+        template = _resolve_kill_template(death)
         item = random.choice(MINECRAFT_ITEMS)
-        target_text = target.mention
-        msg = (
-            template.format(target=target_text)
-            .replace("<死者>", target_text)
-            .replace("死者", target_text)
-            .replace("擊殺者", interaction.user.mention)
-            .replace("击杀者", interaction.user.mention)
-            .replace("物品", item)
-        )
+        msg = _build_kill_message(template, target, interaction.user, item)
         await interaction.response.send_message(msg)
+
+    @kill.autocomplete("death")
+    async def kill_death_autocomplete(
+        interaction: discord.Interaction,
+        current: typing.Optional[str],
+    ):
+        needle = (current or "").strip().lower()
+        choices: typing.List[app_commands.Choice[str]] = []
+        for idx, template in enumerate(MINECRAFT_DEATH_MESSAGES):
+            label = _kill_message_label(template)
+            if needle and needle not in label.lower() and needle not in template.lower():
+                continue
+            choices.append(app_commands.Choice(name=label, value=str(idx)))
+            if len(choices) >= 25:
+                break
+        return choices
 
     @bot.tree.command(name="跳蛋", description="悼念早安同學")
     async def tiaodan_slash(interaction: discord.Interaction):
