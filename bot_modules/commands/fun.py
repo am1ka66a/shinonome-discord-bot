@@ -86,7 +86,9 @@ def register_fun_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         )
         emb.add_field(
             name="🎮 其他",
-            value="`/kill` — Minecraft 風格隨機死法（需選本群成員）",
+            value="`/kill` — Minecraft 風格隨機死法（需選本群成員）\n"
+            "`/跳蛋` — 悼念早安同學\n"
+            "`/bicycle` — 嘗試偷走奈音的腳踏車",
             inline=False,
         )
         emb.set_footer(text="私訊轉接、群組 @ 機器人可聯繫管理員｜管理員請用 /adminhelp（僅主機）")
@@ -117,6 +119,16 @@ def register_fun_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             .replace("擊殺者", interaction.user.mention)
             .replace("击杀者", interaction.user.mention)
             .replace("物品", item)
+        )
+        await interaction.response.send_message(msg)
+
+    @bot.tree.command(name="跳蛋", description="悼念早安同學")
+    async def tiaodan_slash(interaction: discord.Interaction):
+        now_text = now_tw_naive().strftime("%Y/%m/%d %H:%M:%S")
+        msg = (
+            f"早安同學已於{now_text}因使用了便宜的跳蛋被電而不幸逝世，"
+            "感謝大家在他的生命中出現過，並給予了他光和溫暖，也謝謝大家曾給過他幫助和愛。"
+            "斯人已逝，惟願他早登極樂，往生淨土。"
         )
         await interaction.response.send_message(msg)
 
