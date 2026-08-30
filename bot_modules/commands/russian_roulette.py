@@ -44,13 +44,18 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
             finished: bool = False,
             loser_uid: typing.Optional[int] = None,
             awaiting_choice: bool = False,
+            timeout_loss: bool = False,
         ) -> discord.Embed:
             if finished and loser_uid is not None:
                 winner_uid = self.other_uid(loser_uid)
+                if timeout_loss:
+                    loss_line = f"{self.member_for(loser_uid).mention} 逾時未扣扳機，視同落敗。"
+                else:
+                    loss_line = f"{self.member_for(loser_uid).mention} 扣下扳機，當場出局。"
                 emb = discord.Embed(
                     title="💥 俄羅斯輪盤 — 對決結束",
                     description=(
-                        f"{self.member_for(loser_uid).mention} 扣下扳機，當場出局。\n"
+                        f"{loss_line}\n"
                         f"🏆 勝者 {self.member_for(winner_uid).mention} 贏得 **`{self.bet * 2:,}`** 東雲幣！"
                     ),
                     color=0xED4245,
@@ -90,6 +95,31 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
             self.settled = True
             await credit_balance_with_log_async(self.challenger.id, self.bet, reason)
             await credit_balance_with_log_async(self.opponent.id, self.bet, reason)
+
+        async def settle_turn_timeout(self, reason: str) -> int:
+            loser_uid = self.turn_uid
+            actor = self.member_for(loser_uid)
+            self.history.append(f"⌛ {actor.display_name} {reason}")
+            await self.settle(loser_uid)
+            return loser_uid
+
+    async def _finish_turn_timeout(view: discord.ui.View, *, reason: str) -> None:
+        m = view.match  # type: ignore[attr-defined]
+        if m.settled:
+            return
+        loser_uid = await m.settle_turn_timeout(reason)
+        for child in view.children:
+            child.disabled = True
+        try:
+            if m.message:
+                await m.message.edit(
+                    content=None,
+                    embed=m.build_embed(finished=True, loser_uid=loser_uid, timeout_loss=True),
+                    view=view,
+                )
+        except Exception:
+            pass
+        view.stop()
 
     class RrInviteView(discord.ui.View):
         def __init__(self, match: RrMatch):
@@ -215,21 +245,7 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
             await self._fire(interaction)
 
         async def on_timeout(self):
-            m = self.match
-            if m.settled:
-                return
-            await m.refund_both("俄羅斯輪盤逾時退款")
-            for child in self.children:
-                child.disabled = True
-            try:
-                if m.message:
-                    await m.message.edit(
-                        content="⌛ 對決逾時，雙方注金已退回。",
-                        embed=None,
-                        view=self,
-                    )
-            except Exception:
-                pass
+            await _finish_turn_timeout(self, reason="逾時未扣扳機")
 
     class RrChoiceView(discord.ui.View):
         def __init__(self, match: RrMatch):
@@ -249,6 +265,7 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
                 )
             shoot_view = RrShootView(m)
             m.view = shoot_view
+            self.stop()
             await shoot_view._fire(interaction)
 
         @discord.ui.button(label="🛑 停手換人", style=discord.ButtonStyle.secondary)
@@ -274,25 +291,11 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
             self.stop()
 
         async def on_timeout(self):
-            m = self.match
-            if m.settled:
-                return
-            await m.refund_both("俄羅斯輪盤逾時退款")
-            for child in self.children:
-                child.disabled = True
-            try:
-                if m.message:
-                    await m.message.edit(
-                        content="⌛ 對決逾時，雙方注金已退回。",
-                        embed=None,
-                        view=self,
-                    )
-            except Exception:
-                pass
+            await _finish_turn_timeout(self, reason="逾時未選擇（視同落敗）")
 
     @bot.tree.command(
         name="russian_roulette",
-        description="俄羅斯輪盤對決：六膛一彈，空膛可選擇繼續射或停手換人",
+        description="俄羅斯輪盤對決：六膛一彈，空膛可選擇繼續射或停手換人；逾時未行動判負",
     )
     @app_commands.describe(member="對手", bet="雙方下注金額（相同）")
     async def russian_roulette_slash(
@@ -329,7 +332,7 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
             content=(
                 f"🔫 {interaction.user.mention} 向 {member.mention} 發起 **俄羅斯輪盤對決**！\n"
                 f"注額：各 `{amount:,}` 東雲幣｜**{RUSSIAN_ROULETTE_CHAMBERS} 膛 1 彈**\n"
-                f"規則：輪流 **扣扳機**；**空膛**可 **繼續射** 或 **停手換人**，中彈者輸\n"
+                f"規則：輪流 **扣扳機**；**空膛**可 **繼續射** 或 **停手換人**，中彈者輸；**180 秒**未行動視同落敗\n"
                 f"{member.mention} 請於 **120 秒** 內 **接受** 或 **拒絕**。"
             ),
             view=view,

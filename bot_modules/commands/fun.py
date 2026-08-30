@@ -117,7 +117,7 @@ def register_fun_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             value=(
                 "`/bj` — 二十一點\n"
                 "`/coinflip` — 拋硬幣（50% 勝率）\n"
-                "`/russian_roulette` — 俄羅斯輪盤（空膛可繼續射或換人）\n"
+                "`/russian_roulette` — 俄羅斯輪盤（空膛可繼續射或換人；逾時未行動判負）\n"
                 "`/lottery status` — 日彩池狀態\n"
                 "`/lottery buy` — 購買日彩券\n"
                 "`/duel` — E 卡決鬥（兩大局；第二大局交換陣營；奴贏王 +3、其餘決勝 +1；依積分分配彩池）\n"
