@@ -318,6 +318,9 @@ assembly.register_all_commands(
         "buy_lottery_tickets_async": buy_lottery_tickets_async,
         "fetch_lottery_status_async": fetch_lottery_status_async,
         "finalize_due_lottery_rounds_async": finalize_due_lottery_rounds_async,
+        "record_rr_result_async": record_rr_result_async,
+        "fetch_rr_stats_async": fetch_rr_stats_async,
+        "fetch_rr_leaderboard_async": fetch_rr_leaderboard_async,
     },
 )
 

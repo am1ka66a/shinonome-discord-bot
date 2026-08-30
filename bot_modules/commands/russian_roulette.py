@@ -17,6 +17,10 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
     try_deduct_balance_async = ctx["try_deduct_balance_async"]
     credit_balance_with_log_async = ctx["credit_balance_with_log_async"]
     update_game_result_async = ctx["update_game_result_async"]
+    record_rr_result_async = ctx["record_rr_result_async"]
+    fetch_rr_stats_async = ctx["fetch_rr_stats_async"]
+    fetch_rr_leaderboard_async = ctx["fetch_rr_leaderboard_async"]
+    resolve_slash_target = ctx["resolve_slash_target"]
 
     class RrMatch:
         def __init__(self, challenger: discord.Member, opponent: discord.Member, bet: int):
@@ -88,6 +92,8 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
             await credit_balance_with_log_async(winner_uid, pot, "俄羅斯輪盤勝利")
             await update_game_result_async(winner_uid, self.bet, self.bet, True)
             await update_game_result_async(loser_uid, 0, -self.bet, False)
+            await record_rr_result_async(winner_uid, is_win=True, profit_delta=self.bet)
+            await record_rr_result_async(loser_uid, is_win=False, profit_delta=-self.bet)
 
         async def refund_both(self, reason: str) -> None:
             if self.settled:
@@ -293,12 +299,14 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
         async def on_timeout(self):
             await _finish_turn_timeout(self, reason="逾時未選擇（視同落敗）")
 
-    @bot.tree.command(
-        name="russian_roulette",
-        description="俄羅斯輪盤對決：六膛一彈，空膛可選擇繼續射或停手換人；逾時未行動判負",
+    rr_group = app_commands.Group(name="russian_roulette", description="俄羅斯輪盤對決與戰績")
+
+    @rr_group.command(
+        name="duel",
+        description="發起俄羅斯輪盤對決：六膛一彈，空膛可繼續射或停手換人；逾時未行動判負",
     )
     @app_commands.describe(member="對手", bet="雙方下注金額（相同）")
-    async def russian_roulette_slash(
+    async def russian_roulette_duel_slash(
         interaction: discord.Interaction,
         member: discord.Member,
         bet: app_commands.Range[int, 1, 10_000_000],
@@ -342,6 +350,62 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
             match.message = view.message
         except Exception:
             pass
+
+    @rr_group.command(name="stats", description="查看俄羅斯輪盤勝率與排行榜")
+    @app_commands.describe(member="要查看的玩家（留空看自己）", user_id="或填使用者 ID／貼提及")
+    async def russian_roulette_stats_slash(
+        interaction: discord.Interaction,
+        member: typing.Optional[discord.Member] = None,
+        user_id: typing.Optional[str] = None,
+    ):
+        target_user, err = await resolve_slash_target(
+            interaction, member, user_id, required=False, in_guild_only=False
+        )
+        if err:
+            return await interaction_send(interaction, err, ephemeral=True)
+        target = target_user or interaction.user
+        await ensure_user_exists_async(target.id, 50000)
+        await interaction_defer_if_needed(interaction)
+        stats = await fetch_rr_stats_async(target.id)
+        board = await fetch_rr_leaderboard_async(10)
+
+        emb = discord.Embed(
+            title=f"🔫 {target.display_name} 的俄羅斯輪盤戰績",
+            color=0x5865F2,
+        )
+        emb.set_thumbnail(url=target.display_avatar.url)
+        if stats["games"] <= 0:
+            personal = "尚未完成任何對決。"
+        else:
+            personal = (
+                f"局數 `{stats['games']}`｜勝 `{stats['wins']}`｜負 `{stats['losses']}`\n"
+                f"勝率 **`{stats['win_rate']:.1f}%`**｜累計 **`{stats['profit']:+,}`** 東雲幣"
+            )
+            if stats.get("win_rank"):
+                personal += f"\n勝場榜 `# {stats['win_rank']}`"
+            if stats.get("rate_rank"):
+                personal += f"｜勝率榜 `# {stats['rate_rank']}`（至少 3 局）"
+        emb.add_field(name="個人戰績", value=personal, inline=False)
+
+        if board:
+            lines = []
+            for i, row in enumerate(board, start=1):
+                lines.append(
+                    f"{i}. <@{row['user_id']}> — "
+                    f"`{row['wins']}` 勝 / `{row['games']}` 局 "
+                    f"（`{row['win_rate']:.1f}%`）"
+                )
+            emb.add_field(
+                name="🏆 勝場榜 Top 10（至少 3 局）",
+                value="\n".join(lines)[:1024],
+                inline=False,
+            )
+        else:
+            emb.add_field(name="🏆 勝場榜", value="（尚無足夠戰績）", inline=False)
+        emb.set_footer(text="僅統計已完成對決；邀請逾時／拒絕不計入")
+        await interaction_send(interaction, embed=emb)
+
+    bot.tree.add_command(rr_group)
 
 
 __all__ = ["register_russian_roulette_commands"]

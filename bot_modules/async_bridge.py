@@ -130,6 +130,15 @@ def build_async_wrappers(domain) -> typing.Dict[str, typing.Any]:
     async def finalize_due_lottery_rounds_async():
         return await db_to_thread(domain.finalize_due_lottery_rounds_sync)
 
+    async def record_rr_result_async(user_id, *, is_win, profit_delta):
+        return await db_to_thread(domain.record_rr_result_sync, user_id, is_win=is_win, profit_delta=profit_delta)
+
+    async def fetch_rr_stats_async(user_id):
+        return await db_to_thread(domain.fetch_rr_stats_sync, user_id)
+
+    async def fetch_rr_leaderboard_async(limit: int = 10):
+        return await db_to_thread(domain.fetch_rr_leaderboard_sync, limit)
+
     async def transfer_sync_async(sender_id, receiver_id, amount, note_text):
         return await db_to_thread(domain.transfer_sync, sender_id, receiver_id, amount, note_text)
 
@@ -170,5 +179,8 @@ def build_async_wrappers(domain) -> typing.Dict[str, typing.Any]:
         "buy_lottery_tickets_async": buy_lottery_tickets_async,
         "fetch_lottery_status_async": fetch_lottery_status_async,
         "finalize_due_lottery_rounds_async": finalize_due_lottery_rounds_async,
+        "record_rr_result_async": record_rr_result_async,
+        "fetch_rr_stats_async": fetch_rr_stats_async,
+        "fetch_rr_leaderboard_async": fetch_rr_leaderboard_async,
         "transfer_sync_async": transfer_sync_async,
     }

@@ -290,8 +290,10 @@ def init_db():
     except Exception:
         pass
     from bot_modules.lottery_repo import init_lottery_tables
+    from bot_modules.rr_repo import init_rr_stats_table
 
     init_lottery_tables(c)
+    init_rr_stats_table(c)
     conn.commit()
     conn.close()
 

@@ -150,6 +150,10 @@ def register_all_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             "try_deduct_balance_async": ctx["try_deduct_balance_async"],
             "credit_balance_with_log_async": ctx["credit_balance_with_log_async"],
             "update_game_result_async": ctx["update_game_result_async"],
+            "record_rr_result_async": ctx["record_rr_result_async"],
+            "fetch_rr_stats_async": ctx["fetch_rr_stats_async"],
+            "fetch_rr_leaderboard_async": ctx["fetch_rr_leaderboard_async"],
+            "resolve_slash_target": ctx["resolve_slash_target"],
         },
     )
 

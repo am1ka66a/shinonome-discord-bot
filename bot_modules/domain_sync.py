@@ -7,6 +7,7 @@ from bot_modules import economy_repo
 from bot_modules import economy_service
 from bot_modules import game_repo
 from bot_modules import lottery_repo
+from bot_modules import rr_repo
 from bot_modules import rob_repo
 from bot_modules import social_repo
 from bot_modules import wanted_repo
@@ -612,3 +613,15 @@ def fetch_lottery_status_sync(user_id: int):
 
 def finalize_due_lottery_rounds_sync():
     return lottery_repo.finalize_due_rounds_sync()
+
+
+def record_rr_result_sync(user_id: int, *, is_win: bool, profit_delta: int):
+    return rr_repo.record_rr_result_sync(user_id, is_win=is_win, profit_delta=profit_delta)
+
+
+def fetch_rr_stats_sync(user_id: int):
+    return rr_repo.fetch_rr_stats_sync(user_id)
+
+
+def fetch_rr_leaderboard_sync(limit: int = 10):
+    return rr_repo.fetch_rr_leaderboard_sync(limit=limit)
