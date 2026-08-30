@@ -105,7 +105,10 @@ def register_fun_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                 "`/transfer` — 轉帳給其他玩家\n"
                 "`/redpacket` — 發紅包\n"
                 "`/record` — 最近帳務紀錄（翻頁）\n"
-                "`/balance` — 餘額與戰績"
+                "`/balance` — 餘額與戰績\n"
+                "`/cooldowns` — 查看各指令冷卻\n"
+                "`/profile` — 玩家名片\n"
+                "`/rank` — 我的全站名次"
             ),
             inline=False,
         )
@@ -113,6 +116,9 @@ def register_fun_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             name="🃏 賭場與等級",
             value=(
                 "`/bj` — 二十一點\n"
+                "`/coinflip` — 拋硬幣（50% 勝率）\n"
+                "`/lottery status` — 日彩池狀態\n"
+                "`/lottery buy` — 購買日彩券\n"
                 "`/duel` — E 卡決鬥（兩大局；第二大局交換陣營；奴贏王 +3、其餘決勝 +1；依積分分配彩池）\n"
                 "`/level` — 等級與 EXP\n"
                 "`/leaderboard` — 餘額榜前 10\n"
@@ -141,7 +147,10 @@ def register_fun_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         emb.add_field(
             name="🎮 其他",
             value="`/kill` — Minecraft 風格隨機死法（可選指定死亡方式與物品）\n"
-            "`/bicycle` — 嘗試偷走奈音的腳踏車",
+            "`/bicycle` — 嘗試偷走奈音的腳踏車\n"
+            "`/compare` — 比較兩位玩家\n"
+            "`/8ball` — 魔法八號球\n"
+            "`/choose` — 隨機選一項",
             inline=False,
         )
         emb.set_footer(text="私訊轉接、群組 @ 機器人可聯繫管理員｜管理員請用 /adminhelp（僅主機）")

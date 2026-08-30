@@ -6,7 +6,9 @@ from bot_modules import config
 from bot_modules import economy_repo
 from bot_modules import economy_service
 from bot_modules import game_repo
+from bot_modules import lottery_repo
 from bot_modules import rob_repo
+from bot_modules import social_repo
 from bot_modules import wanted_repo
 from bot_modules.db import get_db_connection
 from bot_modules.tx_ops import get_locked_user_balance, lock_user_rows, log_transaction_in_tx
@@ -561,3 +563,52 @@ def tw_naive_to_discord_ts(dt):
     if not dt:
         return None
     return int(dt.replace(tzinfo=TW_TZ).timestamp())
+
+
+def fetch_user_cooldowns_sync(user_id: int):
+    return social_repo.fetch_user_cooldowns_sync(user_id)
+
+
+def fetch_user_profile_sync(user_id: int):
+    return social_repo.fetch_user_profile_sync(user_id)
+
+
+def fetch_user_ranks_sync(user_id: int):
+    return social_repo.fetch_user_ranks_sync(user_id)
+
+
+def fetch_compare_sync(user_a: int, user_b: int):
+    return social_repo.fetch_compare_sync(user_a, user_b)
+
+
+def settle_coinflip_sync(user_id: int, bet: int, picked_side: str):
+    return game_repo.settle_coinflip_sync(
+        get_db_connection,
+        log_transaction_in_tx,
+        apply_casino_recovery_share,
+        CASINO_RECOVERY_SHARE_ENABLED,
+        CASINO_RECOVERY_SHARE_RATE,
+        CASINO_RECOVERY_SHARE_TARGET_ID,
+        user_id,
+        bet,
+        picked_side,
+        config.COINFLIP_MIN_BET,
+        config.COINFLIP_MAX_BET,
+    )
+
+
+def buy_lottery_tickets_sync(user_id: int, tickets: int):
+    return lottery_repo.buy_lottery_tickets_sync(
+        user_id,
+        tickets,
+        config.LOTTERY_TICKET_COST,
+        config.LOTTERY_MAX_TICKETS_PER_BUY,
+    )
+
+
+def fetch_lottery_status_sync(user_id: int):
+    return lottery_repo.fetch_lottery_status_sync(user_id)
+
+
+def finalize_due_lottery_rounds_sync():
+    return lottery_repo.finalize_due_rounds_sync()

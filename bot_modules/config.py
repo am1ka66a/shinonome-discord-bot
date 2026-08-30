@@ -40,6 +40,11 @@ CASINO_RECOVERY_SHARE_RATE = max(0.0, min(1.0, CASINO_RECOVERY_SHARE_RATE))
 CASINO_RECOVERY_SHARE_REASON_PREFIX = "賭場回收分潤"
 
 BICYCLE_COOLDOWN_SECONDS = 10 * 60
+COINFLIP_MIN_BET = 1_000
+COINFLIP_MAX_BET = 10_000_000
+LOTTERY_TICKET_COST = 10_000
+LOTTERY_MAX_TICKETS_PER_BUY = 50
+LOTTERY_DRAW_CHECK_SECONDS = 3600
 MSG_DB_FLUSH_EVERY_SECONDS = 8
 MSG_DB_FLUSH_COUNT = 3
 LOG_RETENTION_DAYS = int(os.getenv("LOG_RETENTION_DAYS", "14"))
@@ -62,6 +67,16 @@ MINECRAFT_ITEMS_PATH = os.path.join(
     os.path.dirname(os.path.dirname(__file__)),
     "data",
     "minecraft_items_zh_tw.json",
+)
+CUSTOM_DEATH_MESSAGES_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)),
+    "data",
+    "custom_death_messages_zh_tw.json",
+)
+CUSTOM_ITEMS_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)),
+    "data",
+    "custom_items_zh_tw.json",
 )
 DEFAULT_MINECRAFT_DEATH_MESSAGES = [
     "{target} 死了",
@@ -102,30 +117,48 @@ DEFAULT_MINECRAFT_ITEMS = [
 ]
 
 
-def load_minecraft_death_messages() -> typing.List[str]:
+def _load_string_list_from_json(path: str, key: str, default: typing.List[str]) -> typing.List[str]:
     try:
-        with open(MINECRAFT_DEATH_MESSAGES_PATH, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        msgs = data.get("messages") if isinstance(data, dict) else None
-        if not isinstance(msgs, list):
-            return DEFAULT_MINECRAFT_DEATH_MESSAGES[:]
-        cleaned = [str(x).strip() for x in msgs if isinstance(x, str) and x.strip()]
-        return cleaned if cleaned else DEFAULT_MINECRAFT_DEATH_MESSAGES[:]
+        items = data.get(key) if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            return default[:]
+        cleaned = [str(x).strip() for x in items if isinstance(x, str) and x.strip()]
+        return cleaned if cleaned else default[:]
     except Exception:
-        return DEFAULT_MINECRAFT_DEATH_MESSAGES[:]
+        return default[:]
+
+
+def _merge_unique_lists(primary: typing.List[str], extra: typing.List[str]) -> typing.List[str]:
+    seen = set()
+    merged: typing.List[str] = []
+    for item in primary + extra:
+        if item in seen:
+            continue
+        seen.add(item)
+        merged.append(item)
+    return merged
+
+
+def load_minecraft_death_messages() -> typing.List[str]:
+    base = _load_string_list_from_json(
+        MINECRAFT_DEATH_MESSAGES_PATH,
+        "messages",
+        DEFAULT_MINECRAFT_DEATH_MESSAGES,
+    )
+    custom = _load_string_list_from_json(CUSTOM_DEATH_MESSAGES_PATH, "messages", [])
+    return _merge_unique_lists(base, custom)
 
 
 def load_minecraft_items() -> typing.List[str]:
-    try:
-        with open(MINECRAFT_ITEMS_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        items = data.get("items") if isinstance(data, dict) else None
-        if not isinstance(items, list):
-            return DEFAULT_MINECRAFT_ITEMS[:]
-        cleaned = [str(x).strip() for x in items if isinstance(x, str) and x.strip()]
-        return cleaned if cleaned else DEFAULT_MINECRAFT_ITEMS[:]
-    except Exception:
-        return DEFAULT_MINECRAFT_ITEMS[:]
+    base = _load_string_list_from_json(
+        MINECRAFT_ITEMS_PATH,
+        "items",
+        DEFAULT_MINECRAFT_ITEMS,
+    )
+    custom = _load_string_list_from_json(CUSTOM_ITEMS_PATH, "items", [])
+    return _merge_unique_lists(base, custom)
 
 
 MINECRAFT_DEATH_MESSAGES = load_minecraft_death_messages()

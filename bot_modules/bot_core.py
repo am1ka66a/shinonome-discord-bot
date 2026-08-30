@@ -171,6 +171,7 @@ def register_on_ready(
         bot.loop.create_task(event_tasks["vc_reward_task"]())
         bot.loop.create_task(event_tasks["logs_retention_task"]())
         bot.loop.create_task(event_tasks["cache_cleanup_task"]())
+        bot.loop.create_task(event_tasks["lottery_draw_task"]())
         bot.loop.create_task(snapshot_cache_tasks["refresh_leaderboard_snapshots_task"]())
         bot.loop.create_task(snapshot_cache_tasks["refresh_casino_stats_snapshot_task"]())
         logger.info("機器人已啟動: %s（伺服器數 %s）", bot.user, len(bot.guilds))

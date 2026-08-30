@@ -106,6 +106,30 @@ def build_async_wrappers(domain) -> typing.Dict[str, typing.Any]:
     async def break_citizen_sync_async(attacker_id, target_id, now):
         return await db_to_thread(domain.break_citizen_sync, attacker_id, target_id, now)
 
+    async def fetch_user_cooldowns_async(user_id):
+        return await db_to_thread(domain.fetch_user_cooldowns_sync, user_id)
+
+    async def fetch_user_profile_async(user_id):
+        return await db_to_thread(domain.fetch_user_profile_sync, user_id)
+
+    async def fetch_user_ranks_async(user_id):
+        return await db_to_thread(domain.fetch_user_ranks_sync, user_id)
+
+    async def fetch_compare_async(user_a, user_b):
+        return await db_to_thread(domain.fetch_compare_sync, user_a, user_b)
+
+    async def settle_coinflip_async(user_id, bet, picked_side):
+        return await db_to_thread(domain.settle_coinflip_sync, user_id, bet, picked_side)
+
+    async def buy_lottery_tickets_async(user_id, tickets):
+        return await db_to_thread(domain.buy_lottery_tickets_sync, user_id, tickets)
+
+    async def fetch_lottery_status_async(user_id):
+        return await db_to_thread(domain.fetch_lottery_status_sync, user_id)
+
+    async def finalize_due_lottery_rounds_async():
+        return await db_to_thread(domain.finalize_due_lottery_rounds_sync)
+
     async def transfer_sync_async(sender_id, receiver_id, amount, note_text):
         return await db_to_thread(domain.transfer_sync, sender_id, receiver_id, amount, note_text)
 
@@ -138,5 +162,13 @@ def build_async_wrappers(domain) -> typing.Dict[str, typing.Any]:
         "claim_rescue_sync_async": claim_rescue_sync_async,
         "wanted_buyout_sync_async": wanted_buyout_sync_async,
         "break_citizen_sync_async": break_citizen_sync_async,
+        "fetch_user_cooldowns_async": fetch_user_cooldowns_async,
+        "fetch_user_profile_async": fetch_user_profile_async,
+        "fetch_user_ranks_async": fetch_user_ranks_async,
+        "fetch_compare_async": fetch_compare_async,
+        "settle_coinflip_async": settle_coinflip_async,
+        "buy_lottery_tickets_async": buy_lottery_tickets_async,
+        "fetch_lottery_status_async": fetch_lottery_status_async,
+        "finalize_due_lottery_rounds_async": finalize_due_lottery_rounds_async,
         "transfer_sync_async": transfer_sync_async,
     }

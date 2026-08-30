@@ -289,6 +289,9 @@ def init_db():
         c.execute("DELETE FROM level_milestone_claims WHERE milestone IN (10, 25, 50)")
     except Exception:
         pass
+    from bot_modules.lottery_repo import init_lottery_tables
+
+    init_lottery_tables(c)
     conn.commit()
     conn.close()
 

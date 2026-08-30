@@ -34,9 +34,11 @@ def import_modules() -> None:
     from bot_modules.runtime import app_lock, relay, snapshot_cache, events
     from bot_modules.commands import (
         register_blackjack_commands,
+        register_casino_light_commands,
         register_duel_commands,
         register_economy_commands,
         register_fun_commands,
+        register_social_commands,
         register_stats_commands,
         register_wanted_commands,
     )

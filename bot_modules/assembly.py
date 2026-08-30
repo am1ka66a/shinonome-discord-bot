@@ -3,9 +3,11 @@ import typing
 from bot_modules.admin_commands import register_admin_commands
 from bot_modules.commands import (
     register_blackjack_commands,
+    register_casino_light_commands,
     register_duel_commands,
     register_economy_commands,
     register_fun_commands,
+    register_social_commands,
     register_stats_commands,
     register_wanted_commands,
 )
@@ -93,6 +95,43 @@ def register_all_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             "get_db_connection": ctx["get_db_connection"],
             "lock_user_rows": ctx["lock_user_rows"],
             "log_transaction_in_tx": ctx["log_transaction_in_tx"],
+        },
+    )
+
+    register_social_commands(
+        bot,
+        {
+            "ensure_user_exists_async": ctx["ensure_user_exists_async"],
+            "interaction_send": ctx["interaction_send"],
+            "interaction_defer_if_needed": ctx["interaction_defer_if_needed"],
+            "resolve_slash_target": ctx["resolve_slash_target"],
+            "tw_naive_to_discord_ts": ctx["tw_naive_to_discord_ts"],
+            "build_exp_progress_bar": ctx["build_exp_progress_bar"],
+            "calc_level_from_exp": ctx["calc_level_from_exp"],
+            "MAX_LEVEL": ctx["MAX_LEVEL"],
+            "fetch_user_cooldowns_async": ctx["fetch_user_cooldowns_async"],
+            "fetch_user_profile_async": ctx["fetch_user_profile_async"],
+            "fetch_user_ranks_async": ctx["fetch_user_ranks_async"],
+            "fetch_compare_async": ctx["fetch_compare_async"],
+        },
+    )
+
+    register_casino_light_commands(
+        bot,
+        {
+            "FEATURE_TOGGLES": ctx["FEATURE_TOGGLES"],
+            "get_is_event_active": ctx["get_is_event_active"],
+            "COINFLIP_MIN_BET": ctx["COINFLIP_MIN_BET"],
+            "COINFLIP_MAX_BET": ctx["COINFLIP_MAX_BET"],
+            "LOTTERY_TICKET_COST": ctx["LOTTERY_TICKET_COST"],
+            "LOTTERY_MAX_TICKETS_PER_BUY": ctx["LOTTERY_MAX_TICKETS_PER_BUY"],
+            "ensure_user_exists_async": ctx["ensure_user_exists_async"],
+            "interaction_send": ctx["interaction_send"],
+            "interaction_defer_if_needed": ctx["interaction_defer_if_needed"],
+            "tw_naive_to_discord_ts": ctx["tw_naive_to_discord_ts"],
+            "settle_coinflip_async": ctx["settle_coinflip_async"],
+            "buy_lottery_tickets_async": ctx["buy_lottery_tickets_async"],
+            "fetch_lottery_status_async": ctx["fetch_lottery_status_async"],
         },
     )
 

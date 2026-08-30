@@ -46,8 +46,20 @@ COUNTER_ROB_BASE_SUCCESS_RATE = config.COUNTER_ROB_BASE_SUCCESS_RATE
 CASINO_RECOVERY_SHARE_ENABLED = config.CASINO_RECOVERY_SHARE_ENABLED
 CASINO_RECOVERY_SHARE_TARGET_ID = config.CASINO_RECOVERY_SHARE_TARGET_ID
 CASINO_RECOVERY_SHARE_RATE = config.CASINO_RECOVERY_SHARE_RATE
-FEATURE_TOGGLES: typing.Dict[str, bool] = {"rob": True, "bj": True, "duel": True, "redpacket": True}
+FEATURE_TOGGLES: typing.Dict[str, bool] = {
+    "rob": True,
+    "bj": True,
+    "duel": True,
+    "redpacket": True,
+    "coinflip": True,
+    "lottery": True,
+}
 BICYCLE_COOLDOWN_SECONDS = config.BICYCLE_COOLDOWN_SECONDS
+COINFLIP_MIN_BET = config.COINFLIP_MIN_BET
+COINFLIP_MAX_BET = config.COINFLIP_MAX_BET
+LOTTERY_TICKET_COST = config.LOTTERY_TICKET_COST
+LOTTERY_MAX_TICKETS_PER_BUY = config.LOTTERY_MAX_TICKETS_PER_BUY
+LOTTERY_DRAW_CHECK_SECONDS = config.LOTTERY_DRAW_CHECK_SECONDS
 red_packet_seq_ref = [0]
 MSG_DB_FLUSH_EVERY_SECONDS = config.MSG_DB_FLUSH_EVERY_SECONDS
 MSG_DB_FLUSH_COUNT = config.MSG_DB_FLUSH_COUNT
@@ -196,6 +208,8 @@ _event_tasks = register_events(
         "_pending_msg_counts": _pending_msg_counts,
         "_last_msg_flush_ts": _last_msg_flush_ts,
         "_last_exp_award_ts": _last_exp_award_ts,
+        "finalize_due_lottery_rounds_async": finalize_due_lottery_rounds_async,
+        "LOTTERY_DRAW_CHECK_SECONDS": LOTTERY_DRAW_CHECK_SECONDS,
     },
 )
 
@@ -237,6 +251,10 @@ assembly.register_all_commands(
         "MINECRAFT_DEATH_MESSAGES": MINECRAFT_DEATH_MESSAGES,
         "MINECRAFT_ITEMS": MINECRAFT_ITEMS,
         "BICYCLE_COOLDOWN_SECONDS": BICYCLE_COOLDOWN_SECONDS,
+        "COINFLIP_MIN_BET": COINFLIP_MIN_BET,
+        "COINFLIP_MAX_BET": COINFLIP_MAX_BET,
+        "LOTTERY_TICKET_COST": LOTTERY_TICKET_COST,
+        "LOTTERY_MAX_TICKETS_PER_BUY": LOTTERY_MAX_TICKETS_PER_BUY,
         "TW_TZ": TW_TZ,
         "resolve_slash_target": resolve_slash_target,
         "ensure_user_exists": ensure_user_exists,
@@ -289,6 +307,14 @@ assembly.register_all_commands(
         "add_user_exp_async": add_user_exp_async,
         "roll_gamble_exp_from_bet": roll_gamble_exp_from_bet,
         "settle_duel_payouts_with_log_async": settle_duel_payouts_with_log_async,
+        "fetch_user_cooldowns_async": fetch_user_cooldowns_async,
+        "fetch_user_profile_async": fetch_user_profile_async,
+        "fetch_user_ranks_async": fetch_user_ranks_async,
+        "fetch_compare_async": fetch_compare_async,
+        "settle_coinflip_async": settle_coinflip_async,
+        "buy_lottery_tickets_async": buy_lottery_tickets_async,
+        "fetch_lottery_status_async": fetch_lottery_status_async,
+        "finalize_due_lottery_rounds_async": finalize_due_lottery_rounds_async,
     },
 )
 

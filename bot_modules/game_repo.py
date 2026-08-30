@@ -138,3 +138,73 @@ def update_game_result(
     ):
         recovered_amount = int(-profit_delta)
         apply_casino_recovery_share_func(recovered_amount, "21點回收切割")
+
+
+def settle_coinflip_sync(
+    get_db_connection,
+    log_transaction_in_tx,
+    apply_casino_recovery_share_func,
+    share_enabled: bool,
+    share_rate: float,
+    share_target_id: str,
+    user_id: int,
+    bet: int,
+    picked_side: str,
+    min_bet: int,
+    max_bet: int,
+) -> typing.Dict[str, typing.Any]:
+    bet = int(bet)
+    if bet < int(min_bet) or bet > int(max_bet):
+        return {"ok": False, "reason": "bad_amount", "min_bet": min_bet, "max_bet": max_bet}
+    sides = ("正面", "反面")
+    if picked_side not in sides:
+        return {"ok": False, "reason": "bad_side"}
+    uid = str(user_id)
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT balance FROM users WHERE user_id=%s FOR UPDATE", (uid,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return {"ok": False, "reason": "not_found"}
+    balance = int(row[0] or 0)
+    if balance < bet:
+        conn.close()
+        return {"ok": False, "reason": "insufficient", "balance": balance}
+
+    outcome = random.choice(sides)
+    win = picked_side == outcome
+    c.execute("UPDATE users SET balance=balance-%s WHERE user_id=%s", (bet, uid))
+    log_transaction_in_tx(c, uid, -bet, "拋硬幣下注")
+    profit_delta = -bet
+    if win:
+        payout = bet * 2
+        c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (payout, uid))
+        log_transaction_in_tx(c, uid, payout, "拋硬幣獲勝")
+        profit_delta = bet
+        c.execute(
+            "UPDATE users SET total_games=total_games+1, wins=wins+1, total_profit=total_profit+%s WHERE user_id=%s",
+            (profit_delta, uid),
+        )
+    else:
+        c.execute(
+            "UPDATE users SET total_games=total_games+1, total_profit=total_profit-%s WHERE user_id=%s",
+            (bet, uid),
+        )
+    c.execute("SELECT balance FROM users WHERE user_id=%s", (uid,))
+    new_balance = int((c.fetchone() or [0])[0] or 0)
+    conn.commit()
+    conn.close()
+
+    if bool(share_enabled) and float(share_rate) > 0 and not win and str(share_target_id or "").strip():
+        apply_casino_recovery_share_func(bet, "拋硬幣回收切割")
+
+    return {
+        "ok": True,
+        "win": win,
+        "outcome": outcome,
+        "picked": picked_side,
+        "bet": bet,
+        "profit": profit_delta,
+        "balance": new_balance,
+    }

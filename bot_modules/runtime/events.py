@@ -19,6 +19,8 @@ def register_events(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Dict[str, 
     process_on_message_activity_sync = ctx["process_on_message_activity_sync"]
     process_level_ups = ctx["process_level_ups"]
     cleanup_local_caches = ctx.get("cleanup_local_caches")
+    finalize_due_lottery_rounds_async = ctx.get("finalize_due_lottery_rounds_async")
+    lottery_draw_check_seconds = float(ctx.get("LOTTERY_DRAW_CHECK_SECONDS", 3600))
 
     dm_relay_channel_id = int(ctx["DM_RELAY_CHANNEL_ID"])
     delete_log_channel_id = int(ctx["DELETE_LOG_CHANNEL_ID"])
@@ -85,6 +87,26 @@ def register_events(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Dict[str, 
                 await asyncio.to_thread(cleanup_local_caches)
             except Exception as e:
                 logger.exception("快取清理失敗: %s", e)
+
+    async def lottery_draw_task():
+        await bot.wait_until_ready()
+        while not bot.is_closed():
+            await asyncio.sleep(lottery_draw_check_seconds)
+            if finalize_due_lottery_rounds_async is None:
+                continue
+            try:
+                results = await finalize_due_lottery_rounds_async()
+                for item in results or []:
+                    if item.get("winner_id"):
+                        logger.info(
+                            "日彩池開獎 %s：winner=%s pool=%s tickets=%s",
+                            item.get("day_key"),
+                            item.get("winner_id"),
+                            item.get("pool"),
+                            item.get("tickets"),
+                        )
+            except Exception as e:
+                logger.exception("日彩池開獎檢查失敗: %s", e)
 
     def classify_attachment(a: discord.Attachment) -> str:
         ct = (getattr(a, "content_type", None) or "").lower()
@@ -329,4 +351,5 @@ def register_events(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Dict[str, 
         "logs_retention_task": logs_retention_task,
         "vc_reward_task": vc_reward_task,
         "cache_cleanup_task": cache_cleanup_task,
+        "lottery_draw_task": lottery_draw_task,
     }
