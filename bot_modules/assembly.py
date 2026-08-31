@@ -40,6 +40,9 @@ def register_all_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             "set_is_event_active": ctx["set_is_event_active"],
             "get_share_enabled": ctx["get_share_enabled"],
             "set_share_enabled": ctx["set_share_enabled"],
+            "add_milestone_guild_async": ctx["add_milestone_guild_async"],
+            "remove_milestone_guild_async": ctx["remove_milestone_guild_async"],
+            "list_milestone_guilds_async": ctx["list_milestone_guilds_async"],
         },
     )
 

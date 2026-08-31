@@ -7,6 +7,7 @@ from bot_modules import economy_repo
 from bot_modules import economy_service
 from bot_modules import game_repo
 from bot_modules import lottery_repo
+from bot_modules import milestone_guild_repo
 from bot_modules import rr_repo
 from bot_modules import rob_repo
 from bot_modules import social_repo
@@ -625,3 +626,15 @@ def fetch_rr_stats_sync(user_id: int):
 
 def fetch_rr_leaderboard_sync(limit: int = 10):
     return rr_repo.fetch_rr_leaderboard_sync(limit=limit)
+
+
+def add_milestone_guild_sync(guild_id: int, added_by: typing.Optional[int] = None):
+    return milestone_guild_repo.add_milestone_guild_sync(guild_id, added_by)
+
+
+def remove_milestone_guild_sync(guild_id: int):
+    return milestone_guild_repo.remove_milestone_guild_sync(guild_id)
+
+
+def list_milestone_guilds_sync():
+    return milestone_guild_repo.list_milestone_guilds_sync()

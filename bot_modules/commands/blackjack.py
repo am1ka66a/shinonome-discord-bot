@@ -399,7 +399,14 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                 if exp_result and exp_result[1] > exp_result[0]:
                     old_lv, new_lv = exp_result[0], exp_result[1]
                     if any(old_lv < m <= new_lv for m in level_mile_tiers):
-                        asyncio.create_task(process_level_ups(self.user, old_lv, new_lv))
+                        guild_id = None
+                        if message_obj and getattr(message_obj, "guild", None):
+                            guild_id = message_obj.guild.id
+                        elif interaction and interaction.guild:
+                            guild_id = interaction.guild.id
+                        asyncio.create_task(
+                            process_level_ups(self.user, old_lv, new_lv, guild_id=guild_id)
+                        )
                 res = f"{res}\n✨ 經驗值 `+{exp_gain}`"
             else:
                 res = f"{res}\n🧊 本局失利，不獲得 EXP"

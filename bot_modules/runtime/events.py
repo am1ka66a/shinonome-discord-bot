@@ -232,7 +232,9 @@ def register_events(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Dict[str, 
                 o = int(result.get("old_level") or 1)
                 n = int(result.get("new_level") or 1)
                 if n > o and any(o < m <= n for m in level_mile_tiers):
-                    asyncio.create_task(process_level_ups(message.author, o, n))
+                    asyncio.create_task(
+                        process_level_ups(message.author, o, n, guild_id=message.guild.id)
+                    )
         except Exception as e:
             logger.exception("on_message 錯誤: %s", e)
         finally:

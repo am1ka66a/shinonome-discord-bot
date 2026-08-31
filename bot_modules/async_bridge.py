@@ -139,6 +139,15 @@ def build_async_wrappers(domain) -> typing.Dict[str, typing.Any]:
     async def fetch_rr_leaderboard_async(limit: int = 10):
         return await db_to_thread(domain.fetch_rr_leaderboard_sync, limit)
 
+    async def add_milestone_guild_async(guild_id, added_by=None):
+        return await db_to_thread(domain.add_milestone_guild_sync, guild_id, added_by)
+
+    async def remove_milestone_guild_async(guild_id):
+        return await db_to_thread(domain.remove_milestone_guild_sync, guild_id)
+
+    async def list_milestone_guilds_async():
+        return await db_to_thread(domain.list_milestone_guilds_sync)
+
     async def transfer_sync_async(sender_id, receiver_id, amount, note_text):
         return await db_to_thread(domain.transfer_sync, sender_id, receiver_id, amount, note_text)
 
@@ -182,5 +191,8 @@ def build_async_wrappers(domain) -> typing.Dict[str, typing.Any]:
         "record_rr_result_async": record_rr_result_async,
         "fetch_rr_stats_async": fetch_rr_stats_async,
         "fetch_rr_leaderboard_async": fetch_rr_leaderboard_async,
+        "add_milestone_guild_async": add_milestone_guild_async,
+        "remove_milestone_guild_async": remove_milestone_guild_async,
+        "list_milestone_guilds_async": list_milestone_guilds_async,
         "transfer_sync_async": transfer_sync_async,
     }

@@ -6,6 +6,8 @@ import typing
 import discord
 from discord import app_commands
 
+from bot_modules import milestone_guild_repo
+
 
 def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.Any]) -> None:
     allowed_host_ids = ctx["ALLOWED_HOST_IDS"]
@@ -31,6 +33,9 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
     set_is_event_active = ctx["set_is_event_active"]
     get_share_enabled = ctx["get_share_enabled"]
     set_share_enabled = ctx["set_share_enabled"]
+    add_milestone_guild_async = ctx["add_milestone_guild_async"]
+    remove_milestone_guild_async = ctx["remove_milestone_guild_async"]
+    list_milestone_guilds_async = ctx["list_milestone_guilds_async"]
 
     def is_slash_host(interaction: discord.Interaction):
         return interaction.user.id in allowed_host_ids
@@ -188,8 +193,15 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
         if level > old_level:
             crossed = [m for m in level_mile_tiers if old_level < m <= level]
             if crossed:
-                await process_level_ups(member, old_level, level)
-                milestone_note = f"\n🎯 已同步觸發里程碑流程：Lv.{', '.join(map(str, crossed))}"
+                guild_id = interaction.guild.id if interaction.guild else None
+
+                if milestone_guild_repo.is_milestone_guild_allowed(guild_id):
+                    await process_level_ups(member, old_level, level, guild_id=guild_id)
+                    milestone_note = f"\n🎯 已同步觸發里程碑流程：Lv.{', '.join(map(str, crossed))}"
+                elif guild_id is None:
+                    milestone_note = "\n⚠️ 未在伺服器頻道執行，里程碑未觸發。"
+                else:
+                    milestone_note = "\n⚠️ 此伺服器不在里程碑白名單，未觸發。"
 
         await interaction.response.send_message(
             f"✅ 已將 {member.mention} 設定為 **Lv.{level}**\n"
@@ -380,7 +392,10 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
 `/admin_revert_tx` - 依流水 ID 進行反向沖正
 `/admin_logs` - 查詢含流水 ID 的最近帳務紀錄
 `/admin_reward_grant` - 全體活動獎勵（可同時發幣 + 發 EXP）
-`/admin_feature_toggle` - 線上開關功能（rob/bj/duel/redpacket/share）"""
+`/admin_feature_toggle` - 線上開關功能（rob/bj/duel/redpacket/share）
+`/admin_milestone_guild add` - 加入里程碑白名單伺服器
+`/admin_milestone_guild remove` - 移除里程碑白名單伺服器
+`/admin_milestone_guild list` - 查看里程碑白名單伺服器"""
         await interaction.response.send_message(help_text, ephemeral=True)
 
     @bot.tree.command(name="admin_reward_grant", description="[管理員] 全體發放活動獎勵（幣 + EXP）")
@@ -753,3 +768,87 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
             f"✅ 功能 `{feature}` 已設為 **{status}**\n目前狀態：\n" + "\n".join(state_lines),
             ephemeral=True,
         )
+
+    milestone_guild_group = app_commands.Group(
+        name="admin_milestone_guild",
+        description="[管理員] 等級里程碑觸發伺服器白名單",
+    )
+
+    @milestone_guild_group.command(name="add", description="加入里程碑白名單伺服器")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(guild_id="伺服器 ID（留空=目前伺服器）")
+    async def admin_milestone_guild_add_slash(
+        interaction: discord.Interaction,
+        guild_id: typing.Optional[str] = None,
+    ):
+        if not is_slash_host(interaction):
+            return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
+        gid_raw = (guild_id or "").strip()
+        if gid_raw:
+            try:
+                target_gid = int(gid_raw)
+            except ValueError:
+                return await interaction.response.send_message("伺服器 ID 格式不正確。", ephemeral=True)
+        elif interaction.guild:
+            target_gid = interaction.guild.id
+        else:
+            return await interaction.response.send_message("請在伺服器內使用，或提供 guild_id。", ephemeral=True)
+        result = await add_milestone_guild_async(target_gid, interaction.user.id)
+        if not result.get("ok"):
+            return await interaction.response.send_message("加入失敗。", ephemeral=True)
+        if result.get("inserted"):
+            msg = f"✅ 已加入里程碑白名單：`{target_gid}`"
+        else:
+            msg = f"ℹ️ `{target_gid}` 已在白名單中。"
+        await interaction.response.send_message(msg, ephemeral=True)
+
+    @milestone_guild_group.command(name="remove", description="移除里程碑白名單伺服器")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(guild_id="伺服器 ID（留空=目前伺服器）")
+    async def admin_milestone_guild_remove_slash(
+        interaction: discord.Interaction,
+        guild_id: typing.Optional[str] = None,
+    ):
+        if not is_slash_host(interaction):
+            return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
+        gid_raw = (guild_id or "").strip()
+        if gid_raw:
+            try:
+                target_gid = int(gid_raw)
+            except ValueError:
+                return await interaction.response.send_message("伺服器 ID 格式不正確。", ephemeral=True)
+        elif interaction.guild:
+            target_gid = interaction.guild.id
+        else:
+            return await interaction.response.send_message("請在伺服器內使用，或提供 guild_id。", ephemeral=True)
+        result = await remove_milestone_guild_async(target_gid)
+        if not result.get("ok"):
+            return await interaction.response.send_message("移除失敗。", ephemeral=True)
+        if result.get("removed"):
+            msg = f"✅ 已從里程碑白名單移除：`{target_gid}`"
+        else:
+            msg = f"ℹ️ `{target_gid}` 不在白名單中。"
+        await interaction.response.send_message(msg, ephemeral=True)
+
+    @milestone_guild_group.command(name="list", description="查看里程碑白名單伺服器")
+    @app_commands.default_permissions(administrator=True)
+    async def admin_milestone_guild_list_slash(interaction: discord.Interaction):
+        if not is_slash_host(interaction):
+            return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
+        guild_ids = await list_milestone_guilds_async()
+        if not guild_ids:
+            return await interaction.response.send_message(
+                "里程碑白名單為空。等級里程碑目前不會在任何伺服器觸發。",
+                ephemeral=True,
+            )
+        lines = []
+        for gid in guild_ids:
+            guild = bot.get_guild(gid)
+            name = guild.name if guild else "（機器人不在此伺服器）"
+            lines.append(f"• `{gid}` — {name}")
+        await interaction.response.send_message(
+            "🎯 **等級里程碑白名單伺服器**\n" + "\n".join(lines),
+            ephemeral=True,
+        )
+
+    bot.tree.add_command(milestone_guild_group)

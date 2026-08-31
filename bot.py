@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from bot_modules import config
 from bot_modules import domain_sync
 from bot_modules import level_rewards
+from bot_modules import milestone_guild_repo
 from bot_modules import discord_helpers
 from bot_modules import discord_logging
 from bot_modules import assembly
@@ -134,9 +135,19 @@ def is_host():
     return discord_helpers.make_host_check(ALLOWED_HOST_IDS)
 
 
-async def process_level_ups(member: typing.Union[discord.Member, discord.User], old_lv: int, new_lv: int):
+async def process_level_ups(
+    member: typing.Union[discord.Member, discord.User],
+    old_lv: int,
+    new_lv: int,
+    guild_id: typing.Optional[int] = None,
+):
     await level_rewards.process_level_ups(
-        member, old_lv, new_lv, try_claim_milestone=domain_sync.try_claim_milestone
+        member,
+        old_lv,
+        new_lv,
+        guild_id=guild_id,
+        try_claim_milestone=domain_sync.try_claim_milestone,
+        is_milestone_guild_allowed=milestone_guild_repo.is_milestone_guild_allowed,
     )
 
 
@@ -321,6 +332,9 @@ assembly.register_all_commands(
         "record_rr_result_async": record_rr_result_async,
         "fetch_rr_stats_async": fetch_rr_stats_async,
         "fetch_rr_leaderboard_async": fetch_rr_leaderboard_async,
+        "add_milestone_guild_async": add_milestone_guild_async,
+        "remove_milestone_guild_async": remove_milestone_guild_async,
+        "list_milestone_guilds_async": list_milestone_guilds_async,
     },
 )
 

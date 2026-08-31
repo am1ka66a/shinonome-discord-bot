@@ -45,9 +45,13 @@ async def process_level_ups(
     old_lv: int,
     new_lv: int,
     *,
+    guild_id: typing.Optional[int] = None,
     try_claim_milestone,
+    is_milestone_guild_allowed,
 ) -> None:
     if new_lv <= old_lv or getattr(member, "bot", False):
+        return
+    if not is_milestone_guild_allowed(guild_id):
         return
     crossed = [m for m in LEVEL_MILE_TIERS if old_lv < m <= new_lv]
     if not crossed:
@@ -66,13 +70,11 @@ async def process_level_ups(
             if got > 0:
                 reward_lines.append(f"🎁 Lv.{m}：+**{got:,}** 東雲幣")
         rid = level_auto_role_id(m)
-        g_limit = level_milestone_guild_id()
         if (
             rid
             and isinstance(member, discord.Member)
             and member.guild
-            and g_limit is not None
-            and member.guild.id == g_limit
+            and is_milestone_guild_allowed(member.guild.id)
         ):
             role = member.guild.get_role(rid)
             if role:

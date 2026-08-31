@@ -290,12 +290,20 @@ def init_db():
     except Exception:
         pass
     from bot_modules.lottery_repo import init_lottery_tables
+    from bot_modules.milestone_guild_repo import (
+        init_milestone_guild_whitelist_table,
+        reload_milestone_guild_whitelist_cache,
+        seed_milestone_guild_whitelist_from_env,
+    )
     from bot_modules.rr_repo import init_rr_stats_table
 
     init_lottery_tables(c)
     init_rr_stats_table(c)
+    init_milestone_guild_whitelist_table(c)
     conn.commit()
     conn.close()
+    seed_milestone_guild_whitelist_from_env()
+    reload_milestone_guild_whitelist_cache()
 
 
 def log_transaction(user_id, amount, reason):
