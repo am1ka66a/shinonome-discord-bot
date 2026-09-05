@@ -39,18 +39,24 @@ def _payload_participants(payload: typing.Dict[str, typing.Any]) -> typing.List[
     return out
 
 
-def register_users_for_match(match_id: str, user_ids: typing.Iterable[int]) -> None:
-    with _lock:
-        for uid in user_ids:
-            _user_active[int(uid)] = str(match_id)
-
-
 def unregister_match_users(match_id: str, user_ids: typing.Iterable[int]) -> None:
     mid = str(match_id)
     with _lock:
         for uid in user_ids:
             if _user_active.get(int(uid)) == mid:
                 del _user_active[int(uid)]
+
+
+def sync_match_users(match_id: str, user_ids: typing.Iterable[int]) -> None:
+    """讓忙碌名單與這場的名單一致：補上新加入者，並放掉已退賽的人。"""
+    mid = str(match_id)
+    current = {int(uid) for uid in user_ids}
+    with _lock:
+        stale = [uid for uid, held in _user_active.items() if held == mid and uid not in current]
+        for uid in stale:
+            del _user_active[uid]
+        for uid in current:
+            _user_active[uid] = mid
 
 
 def user_active_match_id(user_id: int) -> typing.Optional[str]:
@@ -89,7 +95,7 @@ def save_match_sync(
     payload: typing.Dict[str, typing.Any],
 ) -> None:
     participant_ids = _payload_participants(payload)
-    register_users_for_match(match_id, participant_ids)
+    sync_match_users(match_id, participant_ids)
     with db_cursor(commit=True) as c:
         c.execute(
             """INSERT INTO russian_roulette_active_matches
