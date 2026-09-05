@@ -2,6 +2,7 @@
 
 import datetime
 import os
+import sys
 import typing
 
 import discord
@@ -15,7 +16,13 @@ from bot_modules import discord_helpers
 from bot_modules import discord_logging
 from bot_modules import assembly
 from bot_modules.async_bridge import build_async_wrappers
-from bot_modules.bot_core import configure_stdio_line_buffering, create_shinonome_bot, register_on_ready, setup_bot_logging
+from bot_modules.bot_core import (
+    configure_stdio_line_buffering,
+    create_shinonome_bot,
+    members_intent_enabled,
+    register_on_ready,
+    setup_bot_logging,
+)
 from bot_modules.db import get_db_connection, init_db, log_transaction
 from bot_modules.runtime.events import register_events
 from bot_modules.runtime import snapshot_cache, relay, app_lock
@@ -342,12 +349,28 @@ assembly.register_all_commands(
     },
 )
 
+MEMBERS_INTENT_FALLBACK_FLAG = "MEMBERS_INTENT_FALLBACK_DONE"
+
 try:
     bot.run(os.getenv("DISCORD_TOKEN"))
 except discord.errors.PrivilegedIntentsRequired:
     logger.critical(
         "缺少 SERVER MEMBERS INTENT。請到 Discord Developer Portal → 你的應用程式 → Bot → "
         "Privileged Gateway Intents 開啟「SERVER MEMBERS INTENT」；"
-        "若不打算開啟，請設環境變數 DISCORD_MEMBERS_INTENT=false 後重新啟動。"
+        "若不打算開啟，請設環境變數 DISCORD_MEMBERS_INTENT=false。"
     )
+    # 直接讓程序死掉會在容器環境變成無限重啟，寧可降級上線：重新執行一次並關掉 members intent。
+    if members_intent_enabled() and os.getenv(MEMBERS_INTENT_FALLBACK_FLAG) != "1":
+        logger.critical(
+            "為避免服務中斷，改以停用 members intent 重新啟動（成員查詢會退回逐筆 API，較慢）。"
+            "在 Portal 開啟該 intent 後重新部署即可恢復完整功能。"
+        )
+        os.environ["DISCORD_MEMBERS_INTENT"] = "false"
+        os.environ[MEMBERS_INTENT_FALLBACK_FLAG] = "1"
+        sys.stdout.flush()
+        sys.stderr.flush()
+        try:
+            os.execv(sys.executable, [sys.executable, os.path.abspath(sys.argv[0]), *sys.argv[1:]])
+        except OSError:
+            logger.exception("降級重啟失敗，只能結束程序。")
     raise

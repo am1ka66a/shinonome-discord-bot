@@ -36,7 +36,6 @@ def register_app_command_lock(
     locks: typing.Dict[int, typing.Tuple[str, float]] = {}
     guard = asyncio.Lock()
 
-    @bot.tree.interaction_check
     async def enforce_single_active_app_command(interaction: discord.Interaction) -> bool:
         user = getattr(interaction, "user", None)
         if user is None:
@@ -58,8 +57,11 @@ def register_app_command_lock(
             locks[uid] = ("mutating", now_ts)
         return True
 
-    @bot.event
-    async def on_app_command_completion(interaction: discord.Interaction, command: app_commands.Command):
+    # CommandTree.interaction_check 是一般的 coroutine 方法，不是裝飾器；
+    # 用 @bot.tree.interaction_check 只會產生一個沒人 await 的 coroutine，鎖等於沒裝上。
+    bot.tree.interaction_check = enforce_single_active_app_command
+
+    async def release_lock(interaction: discord.Interaction) -> None:
         user = getattr(interaction, "user", None)
         if user is None:
             return
@@ -67,9 +69,16 @@ def register_app_command_lock(
             locks.pop(int(user.id), None)
 
     @bot.event
-    async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-        user = getattr(interaction, "user", None)
-        if user is not None:
-            async with guard:
-                locks.pop(int(user.id), None)
+    async def on_app_command_completion(interaction: discord.Interaction, command: app_commands.Command):
+        await release_lock(interaction)
+
+    # 指令失敗時 CommandTree 只會呼叫 tree.on_error，不會派送 client 事件，
+    # 所以釋放鎖必須掛在這裡，否則出錯一次就會把使用者鎖到逾時為止。
+    previous_on_error = bot.tree.on_error
+
+    async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
+        await release_lock(interaction)
         logger.exception("app command 錯誤: %s", error)
+        await previous_on_error(interaction, error)
+
+    bot.tree.on_error = on_app_command_error
