@@ -156,6 +156,10 @@ def register_all_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             "record_rr_result_async": ctx["record_rr_result_async"],
             "fetch_rr_stats_async": ctx["fetch_rr_stats_async"],
             "fetch_rr_leaderboard_async": ctx["fetch_rr_leaderboard_async"],
+            "fetch_rr_rate_leaderboard_async": ctx["fetch_rr_rate_leaderboard_async"],
+            "save_rr_match_async": ctx["save_rr_match_async"],
+            "delete_rr_match_async": ctx["delete_rr_match_async"],
+            "fetch_active_rr_matches_async": ctx["fetch_active_rr_matches_async"],
             "resolve_slash_target": ctx["resolve_slash_target"],
         },
     )

@@ -296,9 +296,11 @@ def init_db():
         seed_milestone_guild_whitelist_from_env,
     )
     from bot_modules.rr_repo import init_rr_stats_table
+    from bot_modules.rr_match_repo import init_rr_match_table
 
     init_lottery_tables(c)
     init_rr_stats_table(c)
+    init_rr_match_table(c)
     init_milestone_guild_whitelist_table(c)
     conn.commit()
     conn.close()

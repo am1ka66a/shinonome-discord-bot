@@ -104,6 +104,6 @@ def remove_milestone_guild_sync(guild_id: int) -> typing.Dict[str, typing.Any]:
 
 def list_milestone_guilds_sync() -> typing.List[int]:
     with _cache_lock:
-        if not _milestone_guild_whitelist:
-            reload_milestone_guild_whitelist_cache()
-        return sorted(_milestone_guild_whitelist)
+        if _milestone_guild_whitelist:
+            return sorted(_milestone_guild_whitelist)
+    return sorted(reload_milestone_guild_whitelist_cache())

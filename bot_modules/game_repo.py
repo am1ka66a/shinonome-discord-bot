@@ -111,6 +111,7 @@ def update_game_result(
     profit_delta,
     is_win,
     is_push=False,
+    share_recovery=True,
 ):
     conn = get_db_connection()
     c = conn.cursor()
@@ -131,7 +132,8 @@ def update_game_result(
     conn.close()
 
     if (
-        bool(share_enabled)
+        bool(share_recovery)
+        and bool(share_enabled)
         and float(share_rate) > 0
         and profit_delta < 0
         and str(share_target_id or "").strip()

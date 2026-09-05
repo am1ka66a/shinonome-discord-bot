@@ -43,9 +43,11 @@ def build_async_wrappers(domain) -> typing.Dict[str, typing.Any]:
     async def try_deduct_balance_async(user_id, amount, reason):
         return await db_to_thread(domain.try_deduct_balance, user_id, amount, reason)
 
-    async def update_game_result_async(user_id, balance_delta, profit_delta, is_win, is_push=False):
+    async def update_game_result_async(
+        user_id, balance_delta, profit_delta, is_win, is_push=False, share_recovery=True
+    ):
         return await db_to_thread(
-            domain.update_game_result, user_id, balance_delta, profit_delta, is_win, is_push
+            domain.update_game_result, user_id, balance_delta, profit_delta, is_win, is_push, share_recovery
         )
 
     async def add_user_exp_async(user_id, amount):
@@ -139,6 +141,36 @@ def build_async_wrappers(domain) -> typing.Dict[str, typing.Any]:
     async def fetch_rr_leaderboard_async(limit: int = 10):
         return await db_to_thread(domain.fetch_rr_leaderboard_sync, limit)
 
+    async def fetch_rr_rate_leaderboard_async(limit: int = 10):
+        return await db_to_thread(domain.fetch_rr_rate_leaderboard_sync, limit)
+
+    async def save_rr_match_async(
+        *,
+        match_id,
+        guild_id,
+        channel_id,
+        message_id,
+        mode,
+        phase,
+        payload,
+    ):
+        return await db_to_thread(
+            domain.save_rr_match_sync,
+            match_id=match_id,
+            guild_id=guild_id,
+            channel_id=channel_id,
+            message_id=message_id,
+            mode=mode,
+            phase=phase,
+            payload=payload,
+        )
+
+    async def delete_rr_match_async(match_id, payload=None):
+        return await db_to_thread(domain.delete_rr_match_sync, match_id, payload)
+
+    async def fetch_active_rr_matches_async():
+        return await db_to_thread(domain.fetch_active_rr_matches_sync)
+
     async def add_milestone_guild_async(guild_id, added_by=None):
         return await db_to_thread(domain.add_milestone_guild_sync, guild_id, added_by)
 
@@ -191,6 +223,10 @@ def build_async_wrappers(domain) -> typing.Dict[str, typing.Any]:
         "record_rr_result_async": record_rr_result_async,
         "fetch_rr_stats_async": fetch_rr_stats_async,
         "fetch_rr_leaderboard_async": fetch_rr_leaderboard_async,
+        "fetch_rr_rate_leaderboard_async": fetch_rr_rate_leaderboard_async,
+        "save_rr_match_async": save_rr_match_async,
+        "delete_rr_match_async": delete_rr_match_async,
+        "fetch_active_rr_matches_async": fetch_active_rr_matches_async,
         "add_milestone_guild_async": add_milestone_guild_async,
         "remove_milestone_guild_async": remove_milestone_guild_async,
         "list_milestone_guilds_async": list_milestone_guilds_async,

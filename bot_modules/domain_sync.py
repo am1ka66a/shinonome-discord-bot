@@ -9,6 +9,7 @@ from bot_modules import game_repo
 from bot_modules import lottery_repo
 from bot_modules import milestone_guild_repo
 from bot_modules import rr_repo
+from bot_modules import rr_match_repo
 from bot_modules import rob_repo
 from bot_modules import social_repo
 from bot_modules import wanted_repo
@@ -427,7 +428,7 @@ def roll_gamble_exp_from_bet(main_bet: int) -> int:
     return game_repo.roll_gamble_exp_from_bet(GAMBLE_EXP_MIN, GAMBLE_EXP_MAX, main_bet)
 
 
-def update_game_result(user_id, balance_delta, profit_delta, is_win, is_push=False):
+def update_game_result(user_id, balance_delta, profit_delta, is_win, is_push=False, share_recovery=True):
     return game_repo.update_game_result(
         get_db_connection,
         log_transaction_in_tx,
@@ -440,6 +441,7 @@ def update_game_result(user_id, balance_delta, profit_delta, is_win, is_push=Fal
         profit_delta,
         is_win,
         is_push,
+        share_recovery,
     )
 
 def exp_for_next_level(level):
@@ -638,3 +640,36 @@ def remove_milestone_guild_sync(guild_id: int):
 
 def list_milestone_guilds_sync():
     return milestone_guild_repo.list_milestone_guilds_sync()
+
+
+def save_rr_match_sync(
+    *,
+    match_id: str,
+    guild_id: int,
+    channel_id: int,
+    message_id: typing.Optional[int],
+    mode: str,
+    phase: str,
+    payload: typing.Dict[str, typing.Any],
+):
+    return rr_match_repo.save_match_sync(
+        match_id=match_id,
+        guild_id=guild_id,
+        channel_id=channel_id,
+        message_id=message_id,
+        mode=mode,
+        phase=phase,
+        payload=payload,
+    )
+
+
+def delete_rr_match_sync(match_id: str, payload: typing.Optional[typing.Dict[str, typing.Any]] = None):
+    return rr_match_repo.delete_match_sync(match_id, payload)
+
+
+def fetch_active_rr_matches_sync():
+    return rr_match_repo.fetch_active_matches_sync()
+
+
+def fetch_rr_rate_leaderboard_sync(limit: int = 10):
+    return rr_repo.fetch_rr_rate_leaderboard_sync(limit=limit)

@@ -119,3 +119,37 @@ def fetch_rr_leaderboard_sync(
             }
         )
     return out
+
+
+def fetch_rr_rate_leaderboard_sync(
+    *,
+    limit: int = 10,
+    min_games: int = RR_LEADERBOARD_MIN_GAMES,
+) -> typing.List[typing.Dict[str, typing.Any]]:
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute(
+        """SELECT user_id, games, wins, profit
+           FROM russian_roulette_stats
+           WHERE games >= %s
+           ORDER BY (wins * 1.0 / games) DESC, wins DESC, profit DESC
+           LIMIT %s""",
+        (int(min_games), int(limit)),
+    )
+    rows = c.fetchall() or []
+    conn.close()
+    out: typing.List[typing.Dict[str, typing.Any]] = []
+    for user_id, games, wins, profit in rows:
+        games_i = int(games or 0)
+        wins_i = int(wins or 0)
+        out.append(
+            {
+                "user_id": str(user_id),
+                "games": games_i,
+                "wins": wins_i,
+                "losses": max(0, games_i - wins_i),
+                "profit": int(profit or 0),
+                "win_rate": (wins_i * 100.0 / games_i) if games_i > 0 else 0.0,
+            }
+        )
+    return out
