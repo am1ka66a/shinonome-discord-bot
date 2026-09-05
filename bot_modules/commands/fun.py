@@ -120,7 +120,7 @@ def register_fun_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                 "`/bj` — 二十一點\n"
                 "`/coinflip` — 拋硬幣（50% 勝率）\n"
                 "`/russian_roulette duel` — 1v1 俄羅斯輪盤（可加注繼續）\n"
-                "`/russian_roulette royale` — 3～6 人淘汰賽（每多 1 人 +3 彈）\n"
+                "`/russian_roulette royale` — 3～6 人淘汰賽（子彈＝人數 − 1，每多 1 人 +3 膛）\n"
                 "`/russian_roulette stats me` — 個人戰績\n"
                 "`/russian_roulette stats wins` — 勝場榜\n"
                 "`/russian_roulette stats rate` — 勝率榜\n"

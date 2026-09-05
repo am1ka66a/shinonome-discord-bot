@@ -8,7 +8,10 @@ from bot_modules import rr_match_repo
 
 RR_ROYALE_MIN_PLAYERS = 3
 RR_ROYALE_MAX_PLAYERS = 6
-RR_ROYALE_BULLETS_PER_EXTRA_PLAYER = 3
+# 子彈數＝玩家人數 − 1（全部擊發後剛好剩一名生還者）；
+# 彈膛以 2 人為基準，每多 1 人 +3 膛（結果等於人數的 3 倍）。
+RR_ROYALE_BASE_PLAYERS = 2
+RR_ROYALE_CHAMBERS_PER_EXTRA_PLAYER = 3
 DECLINE_REASONS = (
     ("不想玩", "今天不想玩。"),
     ("餘額不足", "錢不夠，下次再來。"),
@@ -44,10 +47,13 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
         return remaining_bullets * 100.0 / remaining_chambers
 
     def _royale_bullet_count(player_count: int) -> int:
-        return 1 + max(0, player_count - RR_ROYALE_MIN_PLAYERS) * RR_ROYALE_BULLETS_PER_EXTRA_PLAYER
+        return max(1, int(player_count) - 1)
 
     def _royale_chamber_count(player_count: int, bullet_count: int) -> int:
-        return max(RUSSIAN_ROULETTE_CHAMBERS, bullet_count + player_count * 2)
+        extra_players = max(0, int(player_count) - RR_ROYALE_BASE_PLAYERS)
+        chambers = RUSSIAN_ROULETTE_CHAMBERS + extra_players * RR_ROYALE_CHAMBERS_PER_EXTRA_PLAYER
+        # 膛數不得少於子彈數，否則 random.sample 會炸
+        return max(chambers, bullet_count)
 
     def _busy_msg(uid: int) -> str:
         return f"<@{uid}> 已有進行中的俄羅斯輪盤，請先完成或等待該場結束。"
@@ -278,14 +284,16 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
             elif self.mode == "royale" and not self.lobby_started:
                 n = len(self.participant_ids)
                 bullets = _royale_bullet_count(n)
+                chambers = _royale_chamber_count(n, bullets)
                 emb = discord.Embed(
                     title="👥 俄羅斯輪盤淘汰賽 — 報名中",
                     description=(
                         f"主持人 <@{self.host_id}>｜入場費 **`{self.bet_base:,}`** 東雲幣\n"
                         f"目前 **`{n}` / {RR_ROYALE_MAX_PLAYERS}** 人"
                         f"（至少 {RR_ROYALE_MIN_PLAYERS} 人開局）\n"
-                        f"開局子彈：**`{bullets}`** 發"
-                        f"（{RR_ROYALE_MIN_PLAYERS} 人 1 發，每多 1 人 +{RR_ROYALE_BULLETS_PER_EXTRA_PLAYER} 發）\n"
+                        f"開局配置：**`{chambers}`** 膛 **`{bullets}`** 彈"
+                        f"（子彈＝人數 − 1；{RR_ROYALE_BASE_PLAYERS} 人 {RUSSIAN_ROULETTE_CHAMBERS} 膛，"
+                        f"每多 1 人 +{RR_ROYALE_CHAMBERS_PER_EXTRA_PLAYER} 膛）\n"
                         f"參加者：{self.mention_line()}"
                     ),
                     color=0xFEE75C,
@@ -893,7 +901,10 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
 
     @rr_group.command(
         name="royale",
-        description=f"淘汰賽：{RR_ROYALE_MIN_PLAYERS}～{RR_ROYALE_MAX_PLAYERS} 人；3 人 1 彈，每多 1 人 +3 彈",
+        description=(
+            f"淘汰賽：{RR_ROYALE_MIN_PLAYERS}～{RR_ROYALE_MAX_PLAYERS} 人；"
+            f"子彈＝人數 − 1，{RR_ROYALE_BASE_PLAYERS} 人 {RUSSIAN_ROULETTE_CHAMBERS} 膛、每多 1 人 +{RR_ROYALE_CHAMBERS_PER_EXTRA_PLAYER} 膛"
+        ),
     )
     @app_commands.describe(bet="每位玩家入場費（相同）")
     async def russian_roulette_royale_slash(
@@ -933,7 +944,8 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
             content=(
                 f"👥 <@{interaction.user.id}> 開了 **俄羅斯輪盤淘汰賽**！\n"
                 f"入場費各 `{amount:,}` 東雲幣｜**{RR_ROYALE_MIN_PLAYERS}～{RR_ROYALE_MAX_PLAYERS}** 人\n"
-                f"子彈：**3 人 1 發**，每多 1 人 **+{RR_ROYALE_BULLETS_PER_EXTRA_PLAYER} 發**\n"
+                f"子彈：**人數 − 1 發**｜彈膛：**{RR_ROYALE_BASE_PLAYERS} 人 {RUSSIAN_ROULETTE_CHAMBERS} 膛**，"
+                f"每多 1 人 **+{RR_ROYALE_CHAMBERS_PER_EXTRA_PLAYER} 膛**\n"
                 f"按 **✅ 加入** 參賽，主持人湊滿人後按 **🚀 開始**。"
             ),
             embed=match.build_embed(interaction),
