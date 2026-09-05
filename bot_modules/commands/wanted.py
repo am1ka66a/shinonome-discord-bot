@@ -1,3 +1,4 @@
+import asyncio
 import json
 import random
 import typing
@@ -5,13 +6,47 @@ import typing
 import discord
 from discord import app_commands
 
+from bot_modules.db import db_cursor
 from bot_modules.runtime import snapshot_cache
+
+
+class _AbortWithMessage(Exception):
+    """在持有 DB 連線期間中止流程；訊息等連線歸還之後才回覆，避免佔著連線 await。"""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
 
 
 def _invalidate_wanted_caches(*user_ids: int) -> None:
     fn = snapshot_cache.invalidate_wanted_caches
     if fn is not None:
         fn(*user_ids)
+
+
+async def _resolve_display_names(
+    guild: discord.Guild,
+    user_ids: typing.Sequence[int],
+) -> typing.Dict[int, str]:
+    """併發解析多位成員的顯示名稱；查不到的一律回「未知成員」。"""
+    resolver = snapshot_cache.resolve_guild_member_cached
+
+    async def _one(uid: int):
+        if resolver is not None:
+            return await resolver(guild, uid)
+        member = guild.get_member(uid)
+        if member is not None:
+            return member
+        try:
+            return await guild.fetch_member(uid)
+        except Exception:
+            return None
+
+    members = await asyncio.gather(*(_one(uid) for uid in user_ids), return_exceptions=True)
+    out: typing.Dict[int, str] = {}
+    for uid, member in zip(user_ids, members):
+        out[uid] = member.display_name if isinstance(member, discord.Member) else "未知成員"
+    return out
 
 
 def register_wanted_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
@@ -280,146 +315,129 @@ def register_wanted_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         criminal_id = str(criminal_user.id)
         cop_id = str(interaction.user.id)
 
-        conn = get_db_connection()
-        c = conn.cursor()
-        # 固定順序鎖定警察/罪犯兩列，避免多人同時追捕造成讀寫交錯
-        lock_user_rows(c, [cop_id, criminal_id])
+        try:
+            with db_cursor(commit=True, connect=get_db_connection) as c:
+                # 固定順序鎖定警察/罪犯兩列，避免多人同時追捕造成讀寫交錯
+                lock_user_rows(c, [cop_id, criminal_id])
 
-        c.execute(
-            "SELECT COALESCE(role,'civilian'), COALESCE(level,1), COALESCE(balance,0) "
-            "FROM users WHERE user_id=%s FOR UPDATE",
-            (cop_id,),
-        )
-        cop_row = c.fetchone()
-        if not cop_row or cop_row[0] != "cop":
-            conn.close()
-            return await interaction_send(
-                interaction,
-                "❌ 只有**警察**可以追捕。請先用 `/role_choose` 選擇警察。",
-                ephemeral=True,
-            )
-        cop_level = int(cop_row[1] or 1)
-        cop_balance = int(cop_row[2] or 0)
+                c.execute(
+                    "SELECT COALESCE(role,'civilian'), COALESCE(level,1), COALESCE(balance,0) "
+                    "FROM users WHERE user_id=%s FOR UPDATE",
+                    (cop_id,),
+                )
+                cop_row = c.fetchone()
+                if not cop_row or cop_row[0] != "cop":
+                    raise _AbortWithMessage("❌ 只有**警察**可以追捕。請先用 `/role_choose` 選擇警察。")
+                cop_level = int(cop_row[1] or 1)
+                cop_balance = int(cop_row[2] or 0)
 
-        c.execute(
-            "SELECT COALESCE(wanted_stars,0), COALESCE(wanted_hunted_count,0), COALESCE(balance,0), "
-            "COALESCE(in_prison,0), COALESCE(level,1), last_five_robs, COALESCE(bail_debt,0) "
-            "FROM users WHERE user_id=%s FOR UPDATE",
-            (criminal_id,),
-        )
-        criminal_row = c.fetchone()
-        if not criminal_row:
-            conn.close()
-            return await interaction_send(interaction, "❌ 找不到該玩家資料。", ephemeral=True)
+                c.execute(
+                    "SELECT COALESCE(wanted_stars,0), COALESCE(wanted_hunted_count,0), COALESCE(balance,0), "
+                    "COALESCE(in_prison,0), COALESCE(level,1), last_five_robs, COALESCE(bail_debt,0) "
+                    "FROM users WHERE user_id=%s FOR UPDATE",
+                    (criminal_id,),
+                )
+                criminal_row = c.fetchone()
+                if not criminal_row:
+                    raise _AbortWithMessage("❌ 找不到該玩家資料。")
 
-        wanted_stars = int(criminal_row[0] or 0)
-        hunted_count = int(criminal_row[1] or 0)
-        criminal_balance = int(criminal_row[2] or 0)
-        in_prison = int(criminal_row[3] or 0)
-        criminal_level = int(criminal_row[4] or 1)
-        criminal_last_five_raw = criminal_row[5]
-        bail_debt_before = int(criminal_row[6] or 0)
+                wanted_stars = int(criminal_row[0] or 0)
+                hunted_count = int(criminal_row[1] or 0)
+                criminal_balance = int(criminal_row[2] or 0)
+                in_prison = int(criminal_row[3] or 0)
+                criminal_level = int(criminal_row[4] or 1)
+                criminal_last_five_raw = criminal_row[5]
+                bail_debt_before = int(criminal_row[6] or 0)
 
-        if in_prison:
-            conn.close()
-            return await interaction_send(
-                interaction,
-                f"ℹ️ {criminal_user.mention} 已在監獄中，無法追捕。",
-                ephemeral=True,
-            )
-        if wanted_stars <= 0:
-            conn.close()
-            return await interaction_send(
-                interaction,
-                f"ℹ️ {criminal_user.mention} 目前沒有通緝度。",
-                ephemeral=True,
-            )
-        if criminal_id == cop_id:
-            conn.close()
-            return await interaction_send(interaction, "❌ 不能追捕自己。", ephemeral=True)
+                if in_prison:
+                    raise _AbortWithMessage(f"ℹ️ {criminal_user.mention} 已在監獄中，無法追捕。")
+                if wanted_stars <= 0:
+                    raise _AbortWithMessage(f"ℹ️ {criminal_user.mention} 目前沒有通緝度。")
+                if criminal_id == cop_id:
+                    raise _AbortWithMessage("❌ 不能追捕自己。")
 
-        can_hunt = hunted_count == 0
-        if wanted_stars <= 4:
-            hunt_rule = f"{wanted_stars}★：本星級僅能追捕一次（失敗或成功後需再升星或滿星規則）。"
-        else:
-            hunt_rule = "5★：每次搶劫成功後可追捕一次（本輪若已追捕過則需等對方再搶劫成功）。"
+                can_hunt = hunted_count == 0
+                if wanted_stars <= 4:
+                    hunt_rule = f"{wanted_stars}★：本星級僅能追捕一次（失敗或成功後需再升星或滿星規則）。"
+                else:
+                    hunt_rule = "5★：每次搶劫成功後可追捕一次（本輪若已追捕過則需等對方再搶劫成功）。"
 
-        if not can_hunt:
-            conn.close()
-            return await interaction_send(
-                interaction,
-                f"❌ 目前無法追捕。\n{hunt_rule}",
-                ephemeral=True,
-            )
+                if not can_hunt:
+                    raise _AbortWithMessage(f"❌ 目前無法追捕。\n{hunt_rule}")
 
-        if cop_balance < COP_HUNT_FEE:
-            conn.close()
-            return await interaction_send(
-                interaction,
-                f"❌ 每次追捕須支付 **`{COP_HUNT_FEE:,}`** 東雲幣，你的餘額不足。",
-                ephemeral=True,
-            )
-        c.execute(
-            "UPDATE users SET balance=balance-%s WHERE user_id=%s",
-            (COP_HUNT_FEE, cop_id),
-        )
+                if cop_balance < COP_HUNT_FEE:
+                    raise _AbortWithMessage(
+                        f"❌ 每次追捕須支付 **`{COP_HUNT_FEE:,}`** 東雲幣，你的餘額不足。"
+                    )
+                c.execute(
+                    "UPDATE users SET balance=balance-%s WHERE user_id=%s",
+                    (COP_HUNT_FEE, cop_id),
+                )
 
-        capture_chance_raw = (
-            COP_HUNT_CAPTURE_BASE_PCT
-            + wanted_stars * COP_HUNT_CAPTURE_PER_STAR_PCT
-            + (cop_level - criminal_level)
-        )
-        capture_chance = max(5, min(95, capture_chance_raw))
-        is_caught = random.random() * 100.0 < float(capture_chance)
-        now = now_tw_naive()
+                capture_chance_raw = (
+                    COP_HUNT_CAPTURE_BASE_PCT
+                    + wanted_stars * COP_HUNT_CAPTURE_PER_STAR_PCT
+                    + (cop_level - criminal_level)
+                )
+                capture_chance = max(5, min(95, capture_chance_raw))
+                is_caught = random.random() * 100.0 < float(capture_chance)
+                now = now_tw_naive()
 
-        c.execute(
-            "INSERT INTO wanted_log (criminal_id, cop_id, wanted_stars, caught) VALUES (%s, %s, %s, %s)",
-            (criminal_id, cop_id, wanted_stars, 1 if is_caught else 0),
-        )
-        log_transaction_in_tx(c, cop_id, -COP_HUNT_FEE, "追捕行動費用")
+                c.execute(
+                    "INSERT INTO wanted_log (criminal_id, cop_id, wanted_stars, caught) VALUES (%s, %s, %s, %s)",
+                    (criminal_id, cop_id, wanted_stars, 1 if is_caught else 0),
+                )
+                log_transaction_in_tx(c, cop_id, -COP_HUNT_FEE, "追捕行動費用")
+
+                if is_caught:
+                    last_five_total, rob_count = rob_history_total_from_raw(criminal_last_five_raw)
+                    rob_history: typing.List[typing.Any] = []
+                    if criminal_last_five_raw:
+                        try:
+                            parsed = json.loads(criminal_last_five_raw)
+                            if isinstance(parsed, list):
+                                rob_history = parsed
+                        except Exception:
+                            rob_history = []
+                    cop_reward = int(last_five_total)
+                    confiscated_base = int(last_five_total * 0.6)
+                    confiscated_amount = min(confiscated_base, criminal_balance)
+                    conf_shortfall = max(0, confiscated_base - confiscated_amount)
+                    remaining_bal = max(0, criminal_balance - confiscated_amount)
+                    bail_debt_after = bail_debt_before + conf_shortfall
+                    total_bail_needed = BAIL_COST + bail_debt_after
+
+                    c.execute(
+                        """UPDATE users SET in_prison=1, prison_start=%s,
+                           balance=GREATEST(0, balance-%s), arrest_count=arrest_count+1,
+                           wanted_stars=0, wanted_hunted_count=0, last_five_robs=NULL,
+                           bail_debt=COALESCE(bail_debt,0)+%s
+                           WHERE user_id=%s""",
+                        (now, confiscated_amount, conf_shortfall, criminal_id),
+                    )
+                    c.execute(
+                        "UPDATE users SET balance=balance+%s WHERE user_id=%s",
+                        (cop_reward, cop_id),
+                    )
+                    log_transaction_in_tx(c, criminal_id, -confiscated_amount, f"被警察逮捕沒收 {confiscated_amount:,}")
+                    log_transaction_in_tx(c, cop_id, cop_reward, f"逮捕通緝犯 {criminal_user.id} 贓款")
+                    c.execute(
+                        """INSERT INTO prison_records
+                           (criminal_id, cop_id, wanted_stars, confiscated_amount, cop_reward, bail_cost, arrested_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                        (criminal_id, cop_id, wanted_stars, confiscated_amount, cop_reward, BAIL_COST, now),
+                    )
+                else:
+                    c.execute(
+                        "UPDATE users SET wanted_hunted_count=1 WHERE user_id=%s",
+                        (criminal_id,),
+                    )
+        except _AbortWithMessage as e:
+            return await interaction_send(interaction, e.message, ephemeral=True)
+
+        _invalidate_wanted_caches(int(criminal_id))
 
         if is_caught:
-            last_five_total, rob_count = rob_history_total_from_raw(criminal_last_five_raw)
-            rob_history: typing.List[typing.Any] = []
-            if criminal_last_five_raw:
-                try:
-                    parsed = json.loads(criminal_last_five_raw)
-                    if isinstance(parsed, list):
-                        rob_history = parsed
-                except Exception:
-                    rob_history = []
-            cop_reward = int(last_five_total)
-            confiscated_base = int(last_five_total * 0.6)
-            confiscated_amount = min(confiscated_base, criminal_balance)
-            conf_shortfall = max(0, confiscated_base - confiscated_amount)
-            remaining_bal = max(0, criminal_balance - confiscated_amount)
-            bail_debt_after = bail_debt_before + conf_shortfall
-            total_bail_needed = BAIL_COST + bail_debt_after
-
-            c.execute(
-                """UPDATE users SET in_prison=1, prison_start=%s,
-                   balance=GREATEST(0, balance-%s), arrest_count=arrest_count+1,
-                   wanted_stars=0, wanted_hunted_count=0, last_five_robs=NULL,
-                   bail_debt=COALESCE(bail_debt,0)+%s
-                   WHERE user_id=%s""",
-                (now, confiscated_amount, conf_shortfall, criminal_id),
-            )
-            c.execute(
-                "UPDATE users SET balance=balance+%s WHERE user_id=%s",
-                (cop_reward, cop_id),
-            )
-            log_transaction_in_tx(c, criminal_id, -confiscated_amount, f"被警察逮捕沒收 {confiscated_amount:,}")
-            log_transaction_in_tx(c, cop_id, cop_reward, f"逮捕通緝犯 {criminal_user.id} 贓款")
-            c.execute(
-                """INSERT INTO prison_records
-                   (criminal_id, cop_id, wanted_stars, confiscated_amount, cop_reward, bail_cost, arrested_at)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
-                (criminal_id, cop_id, wanted_stars, confiscated_amount, cop_reward, BAIL_COST, now),
-            )
-            conn.commit()
-            conn.close()
-            _invalidate_wanted_caches(int(criminal_id))
 
             rob_detail = ""
             if rob_history:
@@ -479,14 +497,6 @@ def register_wanted_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             )
             await interaction_send(interaction, embed=emb)
             return
-
-        c.execute(
-            "UPDATE users SET wanted_hunted_count=1 WHERE user_id=%s",
-            (criminal_id,),
-        )
-        conn.commit()
-        conn.close()
-        _invalidate_wanted_caches(int(criminal_id))
 
         last_five_total, rob_count, rob_history = get_last_five_robs_total(criminal_id)
         rob_detail = ""
@@ -632,21 +642,17 @@ def register_wanted_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         if not rows:
             return await interaction.response.send_message("目前沒有啟用良民證的玩家。", ephemeral=True)
         guild = interaction.guild
-        lines: typing.List[str] = []
+        entries: typing.List[typing.Tuple[int, int]] = []
         for uid_str, bal_raw, _last_action in rows:
             try:
                 mid = int(uid_str)
             except (TypeError, ValueError):
                 continue
-            mem = guild.get_member(mid)
-            if mem is None:
-                try:
-                    mem = await guild.fetch_member(mid)
-                except Exception:
-                    mem = None
-            disp = mem.display_name if mem else "未知成員"
-            disp_safe = discord.utils.escape_markdown(disp)
-            bal = int(bal_raw or 0)
+            entries.append((mid, int(bal_raw or 0)))
+        names = await _resolve_display_names(guild, [mid for mid, _bal in entries])
+        lines: typing.List[str] = []
+        for mid, bal in entries:
+            disp_safe = discord.utils.escape_markdown(names[mid])
             lines.append(f"• {disp_safe}（<@{mid}>）｜餘額 `{bal:,}`")
         if not lines:
             return await interaction.response.send_message("目前沒有啟用良民證的玩家。", ephemeral=True)
@@ -787,25 +793,20 @@ def register_wanted_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                 ephemeral=True,
             )
         guild = interaction.guild
-        lines: typing.List[str] = []
+        entries: typing.List[typing.Tuple[int, int, int, int, typing.Any]] = []
         for uid_str, stars, hunted, in_pr, raw_hist in rows:
             stars_i = int(stars or 0)
             if stars_i <= 0:
                 continue
-            hunted_i = int(hunted or 0)
-            in_pr_i = int(in_pr or 0)
             try:
                 mid = int(uid_str)
             except (TypeError, ValueError):
                 continue
-            mem = guild.get_member(mid)
-            if mem is None:
-                try:
-                    mem = await guild.fetch_member(mid)
-                except Exception:
-                    mem = None
-            disp = mem.display_name if mem else "未知成員"
-            disp_safe = discord.utils.escape_markdown(disp)
+            entries.append((mid, stars_i, int(hunted or 0), int(in_pr or 0), raw_hist))
+        names = await _resolve_display_names(guild, [e[0] for e in entries])
+        lines: typing.List[str] = []
+        for mid, stars_i, hunted_i, in_pr_i, raw_hist in entries:
+            disp_safe = discord.utils.escape_markdown(names[mid])
             star_s = "⭐" * min(stars_i, 5)
             bounty, bounty_count = rob_history_total_from_raw(raw_hist)
             bounty_txt = f"`{bounty:,}` 東雲幣（{bounty_count} 筆）"

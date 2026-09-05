@@ -1,6 +1,8 @@
 import typing
 import random
 
+from bot_modules.db import db_conn, db_cursor
+
 
 def roll_gamble_exp_from_bet(gamble_exp_min: int, gamble_exp_max: int, main_bet: int) -> int:
     base = random.randint(int(gamble_exp_min), int(gamble_exp_max))
@@ -34,60 +36,47 @@ def exp_required_for_level(max_level: int, target_level: int) -> int:
 
 
 def get_level_stats(get_db_connection, user_id):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT exp, level FROM users WHERE user_id=%s", (str(user_id),))
-    row = c.fetchone()
-    conn.close()
-    return row
+    with db_cursor(connect=get_db_connection) as c:
+        c.execute("SELECT exp, level FROM users WHERE user_id=%s", (str(user_id),))
+        return c.fetchone()
 
 
 def add_user_exp(get_db_connection, calc_level_from_exp_func, user_id, amount):
     if amount <= 0:
         return None
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT exp, level FROM users WHERE user_id=%s", (str(user_id),))
-    row = c.fetchone()
-    if not row:
-        conn.close()
-        return None
-    old_exp, old_level = int(row[0] or 0), int(row[1] or 1)
-    new_exp = old_exp + int(amount)
-    new_level, _, _ = calc_level_from_exp_func(new_exp)
-    if new_level != old_level:
-        c.execute("UPDATE users SET exp=%s, level=%s WHERE user_id=%s", (new_exp, new_level, str(user_id)))
-    else:
-        c.execute("UPDATE users SET exp=%s WHERE user_id=%s", (new_exp, str(user_id)))
-    conn.commit()
-    conn.close()
+    with db_cursor(commit=True, connect=get_db_connection) as c:
+        c.execute("SELECT exp, level FROM users WHERE user_id=%s", (str(user_id),))
+        row = c.fetchone()
+        if not row:
+            return None
+        old_exp, old_level = int(row[0] or 0), int(row[1] or 1)
+        new_exp = old_exp + int(amount)
+        new_level, _, _ = calc_level_from_exp_func(new_exp)
+        if new_level != old_level:
+            c.execute("UPDATE users SET exp=%s, level=%s WHERE user_id=%s", (new_exp, new_level, str(user_id)))
+        else:
+            c.execute("UPDATE users SET exp=%s WHERE user_id=%s", (new_exp, str(user_id)))
     return old_level, new_level, new_exp
 
 
 def get_claimed_milestones(get_db_connection, user_id) -> set:
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT milestone FROM level_milestone_claims WHERE user_id=%s", (str(user_id),))
-    rows = c.fetchall()
-    conn.close()
+    with db_cursor(connect=get_db_connection) as c:
+        c.execute("SELECT milestone FROM level_milestone_claims WHERE user_id=%s", (str(user_id),))
+        rows = c.fetchall()
     return {int(r[0]) for r in rows} if rows else set()
 
 
 def try_claim_milestone(get_db_connection, log_transaction_in_tx, user_id, milestone, coin_amount) -> int:
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT 1 FROM level_milestone_claims WHERE user_id=%s AND milestone=%s", (str(user_id), milestone))
-    if c.fetchone():
-        conn.close()
-        return -1
-    c.execute("INSERT INTO level_milestone_claims (user_id, milestone) VALUES (%s, %s)", (str(user_id), milestone))
-    added = 0
-    if coin_amount and coin_amount > 0:
-        c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (coin_amount, str(user_id)))
-        log_transaction_in_tx(c, user_id, coin_amount, f"等級里程碑 Lv.{milestone}")
-        added = coin_amount
-    conn.commit()
-    conn.close()
+    with db_cursor(commit=True, connect=get_db_connection) as c:
+        c.execute("SELECT 1 FROM level_milestone_claims WHERE user_id=%s AND milestone=%s", (str(user_id), milestone))
+        if c.fetchone():
+            return -1
+        c.execute("INSERT INTO level_milestone_claims (user_id, milestone) VALUES (%s, %s)", (str(user_id), milestone))
+        added = 0
+        if coin_amount and coin_amount > 0:
+            c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (coin_amount, str(user_id)))
+            log_transaction_in_tx(c, user_id, coin_amount, f"等級里程碑 Lv.{milestone}")
+            added = coin_amount
     return added
 
 
@@ -113,24 +102,22 @@ def update_game_result(
     is_push=False,
     share_recovery=True,
 ):
-    conn = get_db_connection()
-    c = conn.cursor()
-    win_int = 1 if is_win else 0
-    if is_push:
-        c.execute(
-            "UPDATE users SET balance=GREATEST(0, balance+%s), total_profit=total_profit+%s WHERE user_id=%s",
-            (balance_delta, profit_delta, str(user_id)),
-        )
-    else:
-        c.execute(
-            "UPDATE users SET balance=GREATEST(0, balance+%s), total_profit=total_profit+%s, total_games=total_games+1, wins=wins+%s WHERE user_id=%s",
-            (balance_delta, profit_delta, win_int, str(user_id)),
-        )
-    if balance_delta != 0:
-        log_transaction_in_tx(c, user_id, balance_delta, "21點遊戲結算")
-    conn.commit()
-    conn.close()
+    with db_cursor(commit=True, connect=get_db_connection) as c:
+        win_int = 1 if is_win else 0
+        if is_push:
+            c.execute(
+                "UPDATE users SET balance=GREATEST(0, balance+%s), total_profit=total_profit+%s WHERE user_id=%s",
+                (balance_delta, profit_delta, str(user_id)),
+            )
+        else:
+            c.execute(
+                "UPDATE users SET balance=GREATEST(0, balance+%s), total_profit=total_profit+%s, total_games=total_games+1, wins=wins+%s WHERE user_id=%s",
+                (balance_delta, profit_delta, win_int, str(user_id)),
+            )
+        if balance_delta != 0:
+            log_transaction_in_tx(c, user_id, balance_delta, "21點遊戲結算")
 
+    # 分潤會另開連線，必須在歸還連線之後才呼叫，否則可能把連線池佔滿
     if (
         bool(share_recovery)
         and bool(share_enabled)
@@ -162,42 +149,40 @@ def settle_coinflip_sync(
     if picked_side not in sides:
         return {"ok": False, "reason": "bad_side"}
     uid = str(user_id)
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT balance FROM users WHERE user_id=%s FOR UPDATE", (uid,))
-    row = c.fetchone()
-    if not row:
-        conn.close()
-        return {"ok": False, "reason": "not_found"}
-    balance = int(row[0] or 0)
-    if balance < bet:
-        conn.close()
-        return {"ok": False, "reason": "insufficient", "balance": balance}
+    with db_conn(get_db_connection) as conn:
+        c = conn.cursor()
+        c.execute("SELECT balance FROM users WHERE user_id=%s FOR UPDATE", (uid,))
+        row = c.fetchone()
+        if not row:
+            return {"ok": False, "reason": "not_found"}
+        balance = int(row[0] or 0)
+        if balance < bet:
+            return {"ok": False, "reason": "insufficient", "balance": balance}
 
-    outcome = random.choice(sides)
-    win = picked_side == outcome
-    c.execute("UPDATE users SET balance=balance-%s WHERE user_id=%s", (bet, uid))
-    log_transaction_in_tx(c, uid, -bet, "拋硬幣下注")
-    profit_delta = -bet
-    if win:
-        payout = bet * 2
-        c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (payout, uid))
-        log_transaction_in_tx(c, uid, payout, "拋硬幣獲勝")
-        profit_delta = bet
-        c.execute(
-            "UPDATE users SET total_games=total_games+1, wins=wins+1, total_profit=total_profit+%s WHERE user_id=%s",
-            (profit_delta, uid),
-        )
-    else:
-        c.execute(
-            "UPDATE users SET total_games=total_games+1, total_profit=total_profit-%s WHERE user_id=%s",
-            (bet, uid),
-        )
-    c.execute("SELECT balance FROM users WHERE user_id=%s", (uid,))
-    new_balance = int((c.fetchone() or [0])[0] or 0)
-    conn.commit()
-    conn.close()
+        outcome = random.choice(sides)
+        win = picked_side == outcome
+        c.execute("UPDATE users SET balance=balance-%s WHERE user_id=%s", (bet, uid))
+        log_transaction_in_tx(c, uid, -bet, "拋硬幣下注")
+        profit_delta = -bet
+        if win:
+            payout = bet * 2
+            c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (payout, uid))
+            log_transaction_in_tx(c, uid, payout, "拋硬幣獲勝")
+            profit_delta = bet
+            c.execute(
+                "UPDATE users SET total_games=total_games+1, wins=wins+1, total_profit=total_profit+%s WHERE user_id=%s",
+                (profit_delta, uid),
+            )
+        else:
+            c.execute(
+                "UPDATE users SET total_games=total_games+1, total_profit=total_profit-%s WHERE user_id=%s",
+                (bet, uid),
+            )
+        c.execute("SELECT balance FROM users WHERE user_id=%s", (uid,))
+        new_balance = int((c.fetchone() or [0])[0] or 0)
+        conn.commit()
 
+    # 分潤會另開連線，必須在歸還連線之後才呼叫
     if bool(share_enabled) and float(share_rate) > 0 and not win and str(share_target_id or "").strip():
         apply_casino_recovery_share_func(bet, "拋硬幣回收切割")
 

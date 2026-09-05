@@ -342,4 +342,12 @@ assembly.register_all_commands(
     },
 )
 
-bot.run(os.getenv("DISCORD_TOKEN"))
+try:
+    bot.run(os.getenv("DISCORD_TOKEN"))
+except discord.errors.PrivilegedIntentsRequired:
+    logger.critical(
+        "缺少 SERVER MEMBERS INTENT。請到 Discord Developer Portal → 你的應用程式 → Bot → "
+        "Privileged Gateway Intents 開啟「SERVER MEMBERS INTENT」；"
+        "若不打算開啟，請設環境變數 DISCORD_MEMBERS_INTENT=false 後重新啟動。"
+    )
+    raise

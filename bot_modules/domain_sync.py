@@ -13,7 +13,7 @@ from bot_modules import rr_match_repo
 from bot_modules import rob_repo
 from bot_modules import social_repo
 from bot_modules import wanted_repo
-from bot_modules.db import get_db_connection
+from bot_modules.db import db_cursor, get_db_connection
 from bot_modules.tx_ops import get_locked_user_balance, lock_user_rows, log_transaction_in_tx
 from bot_modules.user_repo import ensure_user_exists, fetch_casino_share_stats_rows, get_user_stats
 
@@ -87,11 +87,9 @@ def _user_role_value(raw) -> str:
 
 def get_inflation_multiplier():
     """依全服流通量計算通膨倍率，回傳 (multiplier, circulation, avg_balance)。"""
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT COALESCE(SUM(balance), 0), COUNT(*) FROM users")
-    row = c.fetchone()
-    conn.close()
+    with db_cursor() as c:
+        c.execute("SELECT COALESCE(SUM(balance), 0), COUNT(*) FROM users")
+        row = c.fetchone()
     circulation = int((row[0] if row else 0) or 0)
     user_count = int((row[1] if row else 0) or 0)
     avg_balance = circulation / user_count if user_count > 0 else 50000.0
@@ -199,97 +197,81 @@ def claim_beg_sync(user_id: int) -> typing.Dict[str, typing.Any]:
 
 def choose_role_sync(user_id: int, role: str, now: datetime.datetime) -> typing.Dict[str, typing.Any]:
     ensure_user_exists(user_id, 50000)
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute(
-        """SELECT COALESCE(role,'civilian'), COALESCE(wanted_stars,0), last_role_change,
-                  COALESCE(good_citizen_cert_active,0)
-           FROM users WHERE user_id=%s FOR UPDATE""",
-        (str(user_id),),
-    )
-    row = c.fetchone()
-    old_role = (row[0] or "civilian") if row else "civilian"
-    wanted_now = int(row[1] or 0) if row else 0
-    last_role_change = row[2] if row else None
-    cert_active = int(row[3] or 0) if row else 0
-    if role != old_role and cert_active:
-        conn.close()
-        return {"ok": False, "reason": "cert_active"}
-    if role != old_role and last_role_change is not None:
-        elapsed = (now - last_role_change).total_seconds()
-        if elapsed < ROLE_CHANGE_COOLDOWN_SECONDS:
-            conn.close()
-            next_dt = last_role_change + datetime.timedelta(seconds=ROLE_CHANGE_COOLDOWN_SECONDS)
-            return {"ok": False, "reason": "cooldown", "next_dt": next_dt}
-    if role == "civilian" and old_role == "civilian":
-        conn.close()
-        return {"ok": False, "reason": "already_civilian"}
-    if old_role == "criminal" and wanted_now > 0 and role in ("cop", "civilian"):
-        conn.close()
-        return {"ok": False, "reason": "wanted_block", "wanted_now": wanted_now}
-    if role in ("cop", "civilian"):
+    with db_cursor(commit=True) as c:
         c.execute(
-            "UPDATE users SET role=%s, wanted_stars=0, wanted_hunted_count=0, last_five_robs=NULL, last_role_change=%s WHERE user_id=%s",
-            (role, now, str(user_id)),
+            """SELECT COALESCE(role,'civilian'), COALESCE(wanted_stars,0), last_role_change,
+                      COALESCE(good_citizen_cert_active,0)
+               FROM users WHERE user_id=%s FOR UPDATE""",
+            (str(user_id),),
         )
-    else:
-        c.execute("UPDATE users SET role=%s, last_role_change=%s WHERE user_id=%s", (role, now, str(user_id)))
-    conn.commit()
-    conn.close()
+        row = c.fetchone()
+        old_role = (row[0] or "civilian") if row else "civilian"
+        wanted_now = int(row[1] or 0) if row else 0
+        last_role_change = row[2] if row else None
+        cert_active = int(row[3] or 0) if row else 0
+        if role != old_role and cert_active:
+            return {"ok": False, "reason": "cert_active"}
+        if role != old_role and last_role_change is not None:
+            elapsed = (now - last_role_change).total_seconds()
+            if elapsed < ROLE_CHANGE_COOLDOWN_SECONDS:
+                next_dt = last_role_change + datetime.timedelta(seconds=ROLE_CHANGE_COOLDOWN_SECONDS)
+                return {"ok": False, "reason": "cooldown", "next_dt": next_dt}
+        if role == "civilian" and old_role == "civilian":
+            return {"ok": False, "reason": "already_civilian"}
+        if old_role == "criminal" and wanted_now > 0 and role in ("cop", "civilian"):
+            return {"ok": False, "reason": "wanted_block", "wanted_now": wanted_now}
+        if role in ("cop", "civilian"):
+            c.execute(
+                "UPDATE users SET role=%s, wanted_stars=0, wanted_hunted_count=0, last_five_robs=NULL, last_role_change=%s WHERE user_id=%s",
+                (role, now, str(user_id)),
+            )
+        else:
+            c.execute("UPDATE users SET role=%s, last_role_change=%s WHERE user_id=%s", (role, now, str(user_id)))
     return {"ok": True, "old_role": old_role}
 
 
 def toggle_good_citizen_sync(user_id: int, now: datetime.datetime) -> typing.Dict[str, typing.Any]:
     ensure_user_exists(user_id, 50000)
     uid = str(user_id)
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute(
-        """SELECT COALESCE(role,'civilian'), COALESCE(balance,0),
-                  COALESCE(good_citizen_cert_active,0), last_good_citizen_cert_action,
-                  good_citizen_cert_broken_until
-           FROM users WHERE user_id=%s FOR UPDATE""",
-        (uid,),
-    )
-    row = c.fetchone()
-    if not row:
-        conn.close()
-        return {"ok": False, "reason": "not_found"}
-    role_raw, bal_raw, cert_active_raw, last_action, broken_until = row
-    role_now = _user_role_value(role_raw)
-    bal = int(bal_raw or 0)
-    cert_active = int(cert_active_raw or 0)
-    if role_now != "civilian":
-        conn.close()
-        return {"ok": False, "reason": "not_civilian"}
-    if cert_active == 0 and broken_until is not None and now < broken_until:
-        conn.close()
-        return {"ok": False, "reason": "broken_lock", "until": broken_until}
-    if last_action is not None:
-        elapsed = (now - last_action).total_seconds()
-        if elapsed < GOOD_CITIZEN_CERT_COOLDOWN_SECONDS:
-            conn.close()
-            next_dt = last_action + datetime.timedelta(seconds=GOOD_CITIZEN_CERT_COOLDOWN_SECONDS)
-            return {"ok": False, "reason": "cooldown", "next_dt": next_dt}
-    if bal < GOOD_CITIZEN_CERT_COST:
-        conn.close()
-        return {"ok": False, "reason": "insufficient", "balance": bal}
-    next_active = 0 if cert_active else 1
-    reason = "啟用良民證（防搶）" if next_active else "解除良民證（取消防搶）"
-    c.execute(
-        """UPDATE users
-           SET balance=balance-%s,
-               good_citizen_cert_active=%s,
-               last_good_citizen_cert_action=%s
-           WHERE user_id=%s AND balance >= %s""",
-        (GOOD_CITIZEN_CERT_COST, next_active, now, uid, GOOD_CITIZEN_CERT_COST),
-    )
-    if c.rowcount == 0:
-        conn.close()
-        return {"ok": False, "reason": "deduct_failed"}
-    log_transaction_in_tx(c, user_id, -GOOD_CITIZEN_CERT_COST, reason)
-    conn.commit()
-    conn.close()
+    with db_cursor(commit=True) as c:
+        c.execute(
+            """SELECT COALESCE(role,'civilian'), COALESCE(balance,0),
+                      COALESCE(good_citizen_cert_active,0), last_good_citizen_cert_action,
+                      good_citizen_cert_broken_until
+               FROM users WHERE user_id=%s FOR UPDATE""",
+            (uid,),
+        )
+        row = c.fetchone()
+        if not row:
+            return {"ok": False, "reason": "not_found"}
+        role_raw, bal_raw, cert_active_raw, last_action, broken_until = row
+        role_now = _user_role_value(role_raw)
+        bal = int(bal_raw or 0)
+        cert_active = int(cert_active_raw or 0)
+        if role_now != "civilian":
+            return {"ok": False, "reason": "not_civilian"}
+        if cert_active == 0 and broken_until is not None and now < broken_until:
+            return {"ok": False, "reason": "broken_lock", "until": broken_until}
+        if last_action is not None:
+            elapsed = (now - last_action).total_seconds()
+            if elapsed < GOOD_CITIZEN_CERT_COOLDOWN_SECONDS:
+                next_dt = last_action + datetime.timedelta(seconds=GOOD_CITIZEN_CERT_COOLDOWN_SECONDS)
+                return {"ok": False, "reason": "cooldown", "next_dt": next_dt}
+        if bal < GOOD_CITIZEN_CERT_COST:
+            return {"ok": False, "reason": "insufficient", "balance": bal}
+        next_active = 0 if cert_active else 1
+        reason = "啟用良民證（防搶）" if next_active else "解除良民證（取消防搶）"
+        c.execute(
+            """UPDATE users
+               SET balance=balance-%s,
+                   good_citizen_cert_active=%s,
+                   last_good_citizen_cert_action=%s
+               WHERE user_id=%s AND balance >= %s""",
+            (GOOD_CITIZEN_CERT_COST, next_active, now, uid, GOOD_CITIZEN_CERT_COST),
+        )
+        if c.rowcount == 0:
+            return {"ok": False, "reason": "deduct_failed"}
+        log_transaction_in_tx(c, user_id, -GOOD_CITIZEN_CERT_COST, reason)
     return {"ok": True, "next_active": next_active, "new_balance": bal - GOOD_CITIZEN_CERT_COST}
 
 
@@ -404,25 +386,22 @@ def credit_balance_with_log(user_id, amount, reason):
 
 def settle_duel_payouts_with_log(challenger_id, opponent_id, a_amt, b_amt, s_a, s_b):
     """E 卡結算：先入帳，再寫各自分配紀錄。"""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    lock_user_rows(cur, [challenger_id, opponent_id])
-    if a_amt > 0:
-        cur.execute(
-            "UPDATE users SET balance=balance+%s WHERE user_id=%s",
-            (a_amt, str(challenger_id)),
-        )
-    if b_amt > 0:
-        cur.execute(
-            "UPDATE users SET balance=balance+%s WHERE user_id=%s",
-            (b_amt, str(opponent_id)),
-        )
-    if a_amt > 0:
-        log_transaction_in_tx(cur, challenger_id, a_amt, f"E卡決鬥分配（積分 {s_a}:{s_b}）")
-    if b_amt > 0:
-        log_transaction_in_tx(cur, opponent_id, b_amt, f"E卡決鬥分配（積分 {s_a}:{s_b}）")
-    conn.commit()
-    conn.close()
+    with db_cursor(commit=True) as cur:
+        lock_user_rows(cur, [challenger_id, opponent_id])
+        if a_amt > 0:
+            cur.execute(
+                "UPDATE users SET balance=balance+%s WHERE user_id=%s",
+                (a_amt, str(challenger_id)),
+            )
+        if b_amt > 0:
+            cur.execute(
+                "UPDATE users SET balance=balance+%s WHERE user_id=%s",
+                (b_amt, str(opponent_id)),
+            )
+        if a_amt > 0:
+            log_transaction_in_tx(cur, challenger_id, a_amt, f"E卡決鬥分配（積分 {s_a}:{s_b}）")
+        if b_amt > 0:
+            log_transaction_in_tx(cur, opponent_id, b_amt, f"E卡決鬥分配（積分 {s_a}:{s_b}）")
 
 def roll_gamble_exp_from_bet(main_bet: int) -> int:
     return game_repo.roll_gamble_exp_from_bet(GAMBLE_EXP_MIN, GAMBLE_EXP_MAX, main_bet)

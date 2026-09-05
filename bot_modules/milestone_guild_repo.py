@@ -2,7 +2,7 @@ import os
 import threading
 import typing
 
-from bot_modules.db import get_db_connection
+from bot_modules.db import db_conn, db_cursor
 
 _cache_lock = threading.Lock()
 _milestone_guild_whitelist: typing.Set[int] = set()
@@ -28,11 +28,9 @@ def _parse_guild_id(raw: typing.Any) -> typing.Optional[int]:
 
 
 def reload_milestone_guild_whitelist_cache() -> typing.Set[int]:
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT guild_id FROM level_milestone_guild_whitelist")
-    rows = c.fetchall() or []
-    conn.close()
+    with db_cursor() as c:
+        c.execute("SELECT guild_id FROM level_milestone_guild_whitelist")
+        rows = c.fetchall() or []
     loaded = {_parse_guild_id(row[0]) for row in rows}
     loaded.discard(None)
     with _cache_lock:
@@ -43,23 +41,21 @@ def reload_milestone_guild_whitelist_cache() -> typing.Set[int]:
 
 def seed_milestone_guild_whitelist_from_env() -> bool:
     """若白名單為空，從 LEVEL_MILESTONE_GUILD_ID 匯入一筆（向下相容）。"""
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM level_milestone_guild_whitelist")
-    count = int((c.fetchone() or [0])[0] or 0)
-    if count > 0:
-        conn.close()
-        return False
-    env_gid = _parse_guild_id(os.getenv("LEVEL_MILESTONE_GUILD_ID", ""))
-    if env_gid is None:
-        conn.close()
-        return False
-    c.execute(
-        "INSERT IGNORE INTO level_milestone_guild_whitelist (guild_id, added_by) VALUES (%s, %s)",
-        (str(env_gid), "env:LEVEL_MILESTONE_GUILD_ID"),
-    )
-    conn.commit()
-    conn.close()
+    # 提早返回的兩條路徑不該 commit，因此用 db_conn 自行掌控 commit 時機
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM level_milestone_guild_whitelist")
+        count = int((c.fetchone() or [0])[0] or 0)
+        if count > 0:
+            return False
+        env_gid = _parse_guild_id(os.getenv("LEVEL_MILESTONE_GUILD_ID", ""))
+        if env_gid is None:
+            return False
+        c.execute(
+            "INSERT IGNORE INTO level_milestone_guild_whitelist (guild_id, added_by) VALUES (%s, %s)",
+            (str(env_gid), "env:LEVEL_MILESTONE_GUILD_ID"),
+        )
+        conn.commit()
     return True
 
 
@@ -75,15 +71,13 @@ def add_milestone_guild_sync(guild_id: int, added_by: typing.Optional[int] = Non
     gid = _parse_guild_id(guild_id)
     if gid is None:
         return {"ok": False, "reason": "bad_guild_id"}
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute(
-        "INSERT IGNORE INTO level_milestone_guild_whitelist (guild_id, added_by) VALUES (%s, %s)",
-        (str(gid), str(added_by) if added_by is not None else None),
-    )
-    inserted = c.rowcount > 0
-    conn.commit()
-    conn.close()
+    with db_cursor(commit=True) as c:
+        c.execute(
+            "INSERT IGNORE INTO level_milestone_guild_whitelist (guild_id, added_by) VALUES (%s, %s)",
+            (str(gid), str(added_by) if added_by is not None else None),
+        )
+        inserted = c.rowcount > 0
+    # reload 會另開連線，必須在歸還連線之後才呼叫
     reload_milestone_guild_whitelist_cache()
     return {"ok": True, "inserted": inserted, "guild_id": gid}
 
@@ -92,12 +86,10 @@ def remove_milestone_guild_sync(guild_id: int) -> typing.Dict[str, typing.Any]:
     gid = _parse_guild_id(guild_id)
     if gid is None:
         return {"ok": False, "reason": "bad_guild_id"}
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("DELETE FROM level_milestone_guild_whitelist WHERE guild_id=%s", (str(gid),))
-    removed = c.rowcount > 0
-    conn.commit()
-    conn.close()
+    with db_cursor(commit=True) as c:
+        c.execute("DELETE FROM level_milestone_guild_whitelist WHERE guild_id=%s", (str(gid),))
+        removed = c.rowcount > 0
+    # reload 會另開連線，必須在歸還連線之後才呼叫
     reload_milestone_guild_whitelist_cache()
     return {"ok": True, "removed": removed, "guild_id": gid}
 

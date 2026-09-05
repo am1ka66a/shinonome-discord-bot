@@ -7,6 +7,7 @@ import discord
 from discord import app_commands
 
 from bot_modules import milestone_guild_repo
+from bot_modules.db import db_cursor
 
 
 def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.Any]) -> None:
@@ -61,91 +62,78 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
 
     def admin_give_balance_sync(target_user_id: typing.Union[int, str], amount: int) -> typing.Tuple[int, int]:
         uid = str(target_user_id)
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute("SELECT COALESCE(balance,0) FROM users WHERE user_id=%s FOR UPDATE", (uid,))
-        row = c.fetchone()
-        before_bal = int((row[0] if row else 0) or 0)
-        c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (int(amount), uid))
-        c.execute("SELECT COALESCE(balance,0) FROM users WHERE user_id=%s", (uid,))
-        row2 = c.fetchone()
-        after_bal = int((row2[0] if row2 else before_bal + int(amount)) or 0)
-        conn.commit()
-        conn.close()
+        with db_cursor(commit=True, connect=get_db_connection) as c:
+            c.execute("SELECT COALESCE(balance,0) FROM users WHERE user_id=%s FOR UPDATE", (uid,))
+            row = c.fetchone()
+            before_bal = int((row[0] if row else 0) or 0)
+            c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (int(amount), uid))
+            c.execute("SELECT COALESCE(balance,0) FROM users WHERE user_id=%s", (uid,))
+            row2 = c.fetchone()
+            after_bal = int((row2[0] if row2 else before_bal + int(amount)) or 0)
         return before_bal, after_bal
 
     def admin_take_balance_sync(target_user_id: typing.Union[int, str], amount: int) -> typing.Tuple[int, int]:
         uid = str(target_user_id)
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute("SELECT COALESCE(balance,0) FROM users WHERE user_id=%s FOR UPDATE", (uid,))
-        row = c.fetchone()
-        before_bal = int((row[0] if row else 0) or 0)
-        c.execute("UPDATE users SET balance=GREATEST(0, balance-%s) WHERE user_id=%s", (int(amount), uid))
-        c.execute("SELECT COALESCE(balance,0) FROM users WHERE user_id=%s", (uid,))
-        row2 = c.fetchone()
-        after_bal = int((row2[0] if row2 else max(0, before_bal - int(amount))) or 0)
-        conn.commit()
-        conn.close()
+        with db_cursor(commit=True, connect=get_db_connection) as c:
+            c.execute("SELECT COALESCE(balance,0) FROM users WHERE user_id=%s FOR UPDATE", (uid,))
+            row = c.fetchone()
+            before_bal = int((row[0] if row else 0) or 0)
+            c.execute("UPDATE users SET balance=GREATEST(0, balance-%s) WHERE user_id=%s", (int(amount), uid))
+            c.execute("SELECT COALESCE(balance,0) FROM users WHERE user_id=%s", (uid,))
+            row2 = c.fetchone()
+            after_bal = int((row2[0] if row2 else max(0, before_bal - int(amount))) or 0)
         return before_bal, after_bal
 
     def admin_set_balance_sync(target_user_id: typing.Union[int, str], amount: int) -> int:
         uid = str(target_user_id)
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute("SELECT COALESCE(balance,0) FROM users WHERE user_id=%s FOR UPDATE", (uid,))
-        row = c.fetchone()
-        before_bal = int((row[0] if row else 0) or 0)
-        c.execute("UPDATE users SET balance=%s WHERE user_id=%s", (int(amount), uid))
-        conn.commit()
-        conn.close()
+        with db_cursor(commit=True, connect=get_db_connection) as c:
+            c.execute("SELECT COALESCE(balance,0) FROM users WHERE user_id=%s FOR UPDATE", (uid,))
+            row = c.fetchone()
+            before_bal = int((row[0] if row else 0) or 0)
+            c.execute("UPDATE users SET balance=%s WHERE user_id=%s", (int(amount), uid))
         return before_bal
 
     def grant_mass_rewards_sync(coins: int, exp: int, note_text: str) -> typing.Dict[str, int]:
         """批次發放：幣走 set-based SQL；EXP 走 executemany 批次更新並同步 level。"""
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute("SELECT user_id, COALESCE(exp,0), COALESCE(level,1) FROM users")
-        rows = c.fetchall()
-        target_rows = [(str(r[0]), int(r[1] or 0), int(r[2] or 1)) for r in rows if r and r[0] is not None]
-        target_count = len(target_rows)
-        if target_count <= 0:
-            conn.close()
-            return {"target_count": 0, "coins_changed": 0, "exp_changed": 0, "leveled_up_users": 0}
+        with db_cursor(commit=True, connect=get_db_connection) as c:
+            c.execute("SELECT user_id, COALESCE(exp,0), COALESCE(level,1) FROM users")
+            rows = c.fetchall()
+            target_rows = [(str(r[0]), int(r[1] or 0), int(r[2] or 1)) for r in rows if r and r[0] is not None]
+            target_count = len(target_rows)
+            if target_count <= 0:
+                return {"target_count": 0, "coins_changed": 0, "exp_changed": 0, "leveled_up_users": 0}
 
-        if coins > 0:
-            reason = "管理員活動發幣"
-            if note_text:
-                reason += f"（備註: {note_text}）"
-            c.execute("UPDATE users SET balance=balance+%s", (int(coins),))
-            c.execute(
-                "INSERT INTO logs (user_id, amount, reason) "
-                "SELECT user_id, %s, %s FROM users",
-                (int(coins), reason),
-            )
-            # 全期總金流鏡像：此批次不綁 source_log_id，避免逐筆回填造成額外成本。
-            c.execute(
-                "INSERT INTO casino_logs (user_id, amount, reason) "
-                "SELECT user_id, %s, %s FROM users",
-                (int(coins), reason),
-            )
+            if coins > 0:
+                reason = "管理員活動發幣"
+                if note_text:
+                    reason += f"（備註: {note_text}）"
+                c.execute("UPDATE users SET balance=balance+%s", (int(coins),))
+                c.execute(
+                    "INSERT INTO logs (user_id, amount, reason) "
+                    "SELECT user_id, %s, %s FROM users",
+                    (int(coins), reason),
+                )
+                # 全期總金流鏡像：此批次不綁 source_log_id，避免逐筆回填造成額外成本。
+                c.execute(
+                    "INSERT INTO casino_logs (user_id, amount, reason) "
+                    "SELECT user_id, %s, %s FROM users",
+                    (int(coins), reason),
+                )
 
-        leveled_up_users = 0
-        if exp > 0:
-            updates: typing.List[typing.Tuple[int, int, str]] = []
-            exp_add = int(exp)
-            for uid, old_exp, old_lv in target_rows:
-                new_exp = old_exp + exp_add
-                calc_lv, _cur, _need = calc_level_from_exp(new_exp)
-                new_lv = max(old_lv, int(calc_lv))
-                if new_lv > old_lv:
-                    leveled_up_users += 1
-                updates.append((new_exp, new_lv, uid))
-            if updates:
-                c.executemany("UPDATE users SET exp=%s, level=%s WHERE user_id=%s", updates)
+            leveled_up_users = 0
+            if exp > 0:
+                updates: typing.List[typing.Tuple[int, int, str]] = []
+                exp_add = int(exp)
+                for uid, old_exp, old_lv in target_rows:
+                    new_exp = old_exp + exp_add
+                    calc_lv, _cur, _need = calc_level_from_exp(new_exp)
+                    new_lv = max(old_lv, int(calc_lv))
+                    if new_lv > old_lv:
+                        leveled_up_users += 1
+                    updates.append((new_exp, new_lv, uid))
+                if updates:
+                    c.executemany("UPDATE users SET exp=%s, level=%s WHERE user_id=%s", updates)
 
-        conn.commit()
-        conn.close()
         return {
             "target_count": target_count,
             "coins_changed": int(coins),
@@ -183,11 +171,8 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
         old_level = int(lv_row[1] or 1) if lv_row else 1
         target_exp = exp_required_for_level(level)
 
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute("UPDATE users SET level=%s, exp=%s WHERE user_id=%s", (int(level), int(target_exp), str(member.id)))
-        conn.commit()
-        conn.close()
+        with db_cursor(commit=True, connect=get_db_connection) as c:
+            c.execute("UPDATE users SET level=%s, exp=%s WHERE user_id=%s", (int(level), int(target_exp), str(member.id)))
 
         milestone_note = ""
         if level > old_level:
@@ -306,11 +291,8 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
         if err:
             return await interaction.response.send_message(err, ephemeral=True)
         member = m_user
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute("INSERT IGNORE INTO blacklist (user_id) VALUES (%s)", (str(member.id),))
-        conn.commit()
-        conn.close()
+        with db_cursor(commit=True, connect=get_db_connection) as c:
+            c.execute("INSERT IGNORE INTO blacklist (user_id) VALUES (%s)", (str(member.id),))
         await interaction.response.send_message(f"{member.mention} 已加入黑名單。", ephemeral=True)
 
     @bot.tree.command(name="unban", description="[管理員] 將玩家移出黑名單")
@@ -329,11 +311,8 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
         if err:
             return await interaction.response.send_message(err, ephemeral=True)
         member = m_user
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute("DELETE FROM blacklist WHERE user_id=%s", (str(member.id),))
-        conn.commit()
-        conn.close()
+        with db_cursor(commit=True, connect=get_db_connection) as c:
+            c.execute("DELETE FROM blacklist WHERE user_id=%s", (str(member.id),))
         await interaction.response.send_message(f"{member.mention} 已解除黑名單。", ephemeral=True)
 
     @bot.tree.command(name="resetall_zero", description="[管理員] 全伺服器餘額清零")
@@ -341,11 +320,8 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
     async def resetall_zero_slash(interaction: discord.Interaction):
         if not is_slash_host(interaction):
             return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute("UPDATE users SET balance=0")
-        conn.commit()
-        conn.close()
+        with db_cursor(commit=True, connect=get_db_connection) as c:
+            c.execute("UPDATE users SET balance=0")
         await interaction.response.send_message("💥 全伺服器帳戶餘額已清零。")
 
     @bot.tree.command(name="resetall_default", description="[管理員] 全伺服器重置為 50,000")
@@ -353,11 +329,8 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
     async def resetall_default_slash(interaction: discord.Interaction):
         if not is_slash_host(interaction):
             return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute("UPDATE users SET balance=50000, rescue_count=0, total_games=0, wins=0, total_profit=0")
-        conn.commit()
-        conn.close()
+        with db_cursor(commit=True, connect=get_db_connection) as c:
+            c.execute("UPDATE users SET balance=50000, rescue_count=0, total_games=0, wins=0, total_profit=0")
         await interaction.response.send_message("🔄 全服已重置為 50,000，並重置統計。")
 
     @bot.tree.command(name="lock", description="[管理員] 開關賭場營業狀態")
@@ -513,19 +486,17 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
         )
         if err:
             return await interaction.response.send_message(err, ephemeral=True)
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute(
-            "SELECT COALESCE(balance,0), COALESCE(role,'civilian'), COALESCE(wanted_stars,0), COALESCE(wanted_hunted_count,0), "
-            "COALESCE(in_prison,0), prison_start, COALESCE(bail_debt,0), COALESCE(good_citizen_cert_active,0), "
-            "good_citizen_cert_broken_until, last_five_robs "
-            "FROM users WHERE user_id=%s",
-            (str(target_user.id),),
-        )
-        row = c.fetchone()
-        c.execute("SELECT 1 FROM blacklist WHERE user_id=%s", (str(target_user.id),))
-        blacklisted = c.fetchone() is not None
-        conn.close()
+        with db_cursor(connect=get_db_connection) as c:
+            c.execute(
+                "SELECT COALESCE(balance,0), COALESCE(role,'civilian'), COALESCE(wanted_stars,0), COALESCE(wanted_hunted_count,0), "
+                "COALESCE(in_prison,0), prison_start, COALESCE(bail_debt,0), COALESCE(good_citizen_cert_active,0), "
+                "good_citizen_cert_broken_until, last_five_robs "
+                "FROM users WHERE user_id=%s",
+                (str(target_user.id),),
+            )
+            row = c.fetchone()
+            c.execute("SELECT 1 FROM blacklist WHERE user_id=%s", (str(target_user.id),))
+            blacklisted = c.fetchone() is not None
         if not row:
             return await interaction.response.send_message("找不到玩家資料。", ephemeral=True)
 
@@ -589,39 +560,40 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
         )
         if err:
             return await interaction.response.send_message(err, ephemeral=True)
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute("SELECT COALESCE(in_prison,0), COALESCE(bail_debt,0), COALESCE(wanted_stars,0) FROM users WHERE user_id=%s", (str(target_user.id),))
-        row = c.fetchone()
-        if not row:
-            conn.close()
-            return await interaction.response.send_message("找不到玩家資料。", ephemeral=True)
-        was_in_prison, debt_before, stars_before = int(row[0] or 0), int(row[1] or 0), int(row[2] or 0)
-        if not was_in_prison:
-            conn.close()
-            return await interaction.response.send_message("該玩家目前不在監獄。", ephemeral=True)
-        if clear_debt and clear_wanted:
-            c.execute(
-                "UPDATE users SET in_prison=0, prison_start=NULL, bail_debt=0, wanted_stars=0, wanted_hunted_count=0 WHERE user_id=%s",
-                (str(target_user.id),),
-            )
-        elif clear_debt:
-            c.execute(
-                "UPDATE users SET in_prison=0, prison_start=NULL, bail_debt=0 WHERE user_id=%s",
-                (str(target_user.id),),
-            )
-        elif clear_wanted:
-            c.execute(
-                "UPDATE users SET in_prison=0, prison_start=NULL, wanted_stars=0, wanted_hunted_count=0 WHERE user_id=%s",
-                (str(target_user.id),),
-            )
-        else:
-            c.execute(
-                "UPDATE users SET in_prison=0, prison_start=NULL WHERE user_id=%s",
-                (str(target_user.id),),
-            )
-        conn.commit()
-        conn.close()
+        blocked: typing.Optional[str] = None
+        debt_before = 0
+        stars_before = 0
+        with db_cursor(commit=True, connect=get_db_connection) as c:
+            c.execute("SELECT COALESCE(in_prison,0), COALESCE(bail_debt,0), COALESCE(wanted_stars,0) FROM users WHERE user_id=%s", (str(target_user.id),))
+            row = c.fetchone()
+            if not row:
+                blocked = "找不到玩家資料。"
+            else:
+                was_in_prison, debt_before, stars_before = int(row[0] or 0), int(row[1] or 0), int(row[2] or 0)
+                if not was_in_prison:
+                    blocked = "該玩家目前不在監獄。"
+                elif clear_debt and clear_wanted:
+                    c.execute(
+                        "UPDATE users SET in_prison=0, prison_start=NULL, bail_debt=0, wanted_stars=0, wanted_hunted_count=0 WHERE user_id=%s",
+                        (str(target_user.id),),
+                    )
+                elif clear_debt:
+                    c.execute(
+                        "UPDATE users SET in_prison=0, prison_start=NULL, bail_debt=0 WHERE user_id=%s",
+                        (str(target_user.id),),
+                    )
+                elif clear_wanted:
+                    c.execute(
+                        "UPDATE users SET in_prison=0, prison_start=NULL, wanted_stars=0, wanted_hunted_count=0 WHERE user_id=%s",
+                        (str(target_user.id),),
+                    )
+                else:
+                    c.execute(
+                        "UPDATE users SET in_prison=0, prison_start=NULL WHERE user_id=%s",
+                        (str(target_user.id),),
+                    )
+        if blocked:
+            return await interaction.response.send_message(blocked, ephemeral=True)
         await interaction.response.send_message(
             f"✅ 已釋放 {target_user.mention}。\n"
             f"清債: {'是' if clear_debt else '否'}（原 `{debt_before:,}`）｜"
@@ -637,20 +609,18 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
             return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
         if tx_id <= 0:
             return await interaction.response.send_message("tx_id 必須大於 0。", ephemeral=True)
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute("SELECT id, user_id, amount, reason FROM logs WHERE id=%s", (int(tx_id),))
-        row = c.fetchone()
+        with db_cursor(connect=get_db_connection) as c:
+            c.execute("SELECT id, user_id, amount, reason FROM logs WHERE id=%s", (int(tx_id),))
+            row = c.fetchone()
+            if row:
+                _id, uid, amt, rs = int(row[0]), str(row[1]), int(row[2] or 0), str(row[3] or "")
+                c.execute(
+                    "SELECT 1 FROM logs WHERE user_id=%s AND reason LIKE %s LIMIT 1",
+                    (uid, f"管理員沖正 tx#{_id}%"),
+                )
+                already = c.fetchone() is not None
         if not row:
-            conn.close()
             return await interaction.response.send_message("找不到該流水 ID。", ephemeral=True)
-        _id, uid, amt, rs = int(row[0]), str(row[1]), int(row[2] or 0), str(row[3] or "")
-        c.execute(
-            "SELECT 1 FROM logs WHERE user_id=%s AND reason LIKE %s LIMIT 1",
-            (uid, f"管理員沖正 tx#{_id}%"),
-        )
-        already = c.fetchone() is not None
-        conn.close()
         if already:
             return await interaction.response.send_message("這筆流水看起來已經沖正過了。", ephemeral=True)
         reverse = -amt
@@ -692,20 +662,18 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
         if err:
             return await interaction.response.send_message(err, ephemeral=True)
 
-        conn = get_db_connection()
-        c = conn.cursor()
-        if target_user is not None:
-            c.execute(
-                "SELECT id, user_id, amount, reason, created_at FROM logs WHERE user_id=%s ORDER BY id DESC LIMIT %s",
-                (str(target_user.id), limit),
-            )
-        else:
-            c.execute(
-                "SELECT id, user_id, amount, reason, created_at FROM logs ORDER BY id DESC LIMIT %s",
-                (limit,),
-            )
-        rows = c.fetchall()
-        conn.close()
+        with db_cursor(connect=get_db_connection) as c:
+            if target_user is not None:
+                c.execute(
+                    "SELECT id, user_id, amount, reason, created_at FROM logs WHERE user_id=%s ORDER BY id DESC LIMIT %s",
+                    (str(target_user.id), limit),
+                )
+            else:
+                c.execute(
+                    "SELECT id, user_id, amount, reason, created_at FROM logs ORDER BY id DESC LIMIT %s",
+                    (limit,),
+                )
+            rows = c.fetchall()
         if not rows:
             return await interaction.response.send_message("查無流水資料。", ephemeral=True)
 

@@ -481,10 +481,6 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
             guild = interaction.guild or bot.get_guild(self.guild_id)
             if not guild:
                 return await interaction.response.send_message("無法取得伺服器。", ephemeral=True)
-            member_a = guild.get_member(self.uid_a)
-            member_b = guild.get_member(self.uid_b)
-            if not member_a or not member_b:
-                return await interaction.response.send_message("找不到對戰玩家。", ephemeral=True)
             if not await try_deduct_balance_async(self.uid_a, self.bet, "俄羅斯輪盤重賽下注"):
                 return await interaction.response.send_message("發起方餘額不足，重賽取消。", ephemeral=True)
             if not await try_deduct_balance_async(self.uid_b, self.bet, "俄羅斯輪盤重賽下注"):

@@ -4,7 +4,7 @@ import typing
 from bot_modules import config
 from bot_modules import domain_sync
 from bot_modules import economy_repo
-from bot_modules.db import get_db_connection
+from bot_modules.db import db_cursor, get_db_connection
 
 
 def _day_key_from_dt(dt: datetime.datetime) -> str:
@@ -14,19 +14,17 @@ def _day_key_from_dt(dt: datetime.datetime) -> str:
 def fetch_user_cooldowns_sync(user_id: int) -> typing.Dict[str, typing.Any]:
     uid = str(user_id)
     now = config.now_tw_naive()
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute(
-        """SELECT last_beg, last_rescue, last_rob, last_bicycle, last_role_change,
+    with db_cursor() as c:
+        c.execute(
+            """SELECT last_beg, last_rescue, last_rob, last_bicycle, last_role_change,
                   last_good_citizen_cert_action, last_wanted_buyout, role, balance, rescue_count,
                   good_citizen_cert_active
            FROM users WHERE user_id=%s""",
-        (uid,),
-    )
-    row = c.fetchone()
-    c.execute("SELECT last_claim FROM daily_claims WHERE user_id=%s", (uid,))
-    daily_row = c.fetchone()
-    conn.close()
+            (uid,),
+        )
+        row = c.fetchone()
+        c.execute("SELECT last_claim FROM daily_claims WHERE user_id=%s", (uid,))
+        daily_row = c.fetchone()
 
     items: typing.List[typing.Dict[str, typing.Any]] = []
 
@@ -90,27 +88,24 @@ def fetch_user_cooldowns_sync(user_id: int) -> typing.Dict[str, typing.Any]:
 
 def fetch_user_profile_sync(user_id: int) -> typing.Optional[typing.Dict[str, typing.Any]]:
     uid = str(user_id)
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute(
-        """SELECT balance, total_games, wins, total_profit, exp, level,
+    with db_cursor() as c:
+        c.execute(
+            """SELECT balance, total_games, wins, total_profit, exp, level,
                   COALESCE(role,'civilian'), COALESCE(wanted_stars,0), COALESCE(in_prison,0),
                   COALESCE(arrest_count,0), COALESCE(good_citizen_cert_active,0), COALESCE(bail_debt,0)
            FROM users WHERE user_id=%s""",
-        (uid,),
-    )
-    row = c.fetchone()
-    if not row:
-        conn.close()
-        return None
-    c.execute("SELECT COUNT(*) + 1 FROM users WHERE balance > %s", (int(row[0] or 0),))
-    bal_rank = int((c.fetchone() or [1])[0])
-    c.execute(
-        "SELECT COUNT(*) + 1 FROM users WHERE level > %s OR (level = %s AND exp > %s)",
-        (int(row[5] or 1), int(row[5] or 1), int(row[4] or 0)),
-    )
-    lv_rank = int((c.fetchone() or [1])[0])
-    conn.close()
+            (uid,),
+        )
+        row = c.fetchone()
+        if not row:
+            return None
+        c.execute("SELECT COUNT(*) + 1 FROM users WHERE balance > %s", (int(row[0] or 0),))
+        bal_rank = int((c.fetchone() or [1])[0])
+        c.execute(
+            "SELECT COUNT(*) + 1 FROM users WHERE level > %s OR (level = %s AND exp > %s)",
+            (int(row[5] or 1), int(row[5] or 1), int(row[4] or 0)),
+        )
+        lv_rank = int((c.fetchone() or [1])[0])
     total_games = int(row[1] or 0)
     wins = int(row[2] or 0)
     return {

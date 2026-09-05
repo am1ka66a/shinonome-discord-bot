@@ -3,7 +3,7 @@ import threading
 import typing
 import uuid
 
-from bot_modules.db import get_db_connection
+from bot_modules.db import db_cursor
 
 _lock = threading.Lock()
 _user_active: typing.Dict[int, str] = {}
@@ -90,31 +90,28 @@ def save_match_sync(
 ) -> None:
     participant_ids = _payload_participants(payload)
     register_users_for_match(match_id, participant_ids)
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute(
-        """INSERT INTO russian_roulette_active_matches
-           (match_id, guild_id, channel_id, message_id, mode, phase, payload)
-           VALUES (%s, %s, %s, %s, %s, %s, %s)
-           ON DUPLICATE KEY UPDATE
-           guild_id=VALUES(guild_id),
-           channel_id=VALUES(channel_id),
-           message_id=VALUES(message_id),
-           mode=VALUES(mode),
-           phase=VALUES(phase),
-           payload=VALUES(payload)""",
-        (
-            str(match_id),
-            str(guild_id),
-            str(channel_id),
-            str(message_id) if message_id else None,
-            str(mode),
-            str(phase),
-            json.dumps(payload, ensure_ascii=False),
-        ),
-    )
-    conn.commit()
-    conn.close()
+    with db_cursor(commit=True) as c:
+        c.execute(
+            """INSERT INTO russian_roulette_active_matches
+               (match_id, guild_id, channel_id, message_id, mode, phase, payload)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)
+               ON DUPLICATE KEY UPDATE
+               guild_id=VALUES(guild_id),
+               channel_id=VALUES(channel_id),
+               message_id=VALUES(message_id),
+               mode=VALUES(mode),
+               phase=VALUES(phase),
+               payload=VALUES(payload)""",
+            (
+                str(match_id),
+                str(guild_id),
+                str(channel_id),
+                str(message_id) if message_id else None,
+                str(mode),
+                str(phase),
+                json.dumps(payload, ensure_ascii=False),
+            ),
+        )
 
 
 def delete_match_sync(match_id: str, payload: typing.Optional[typing.Dict[str, typing.Any]] = None) -> None:
@@ -122,23 +119,18 @@ def delete_match_sync(match_id: str, payload: typing.Optional[typing.Dict[str, t
         row = fetch_match_sync(match_id)
         payload = (row or {}).get("payload") or {}
     unregister_match_users(match_id, _payload_participants(payload))
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("DELETE FROM russian_roulette_active_matches WHERE match_id=%s", (str(match_id),))
-    conn.commit()
-    conn.close()
+    with db_cursor(commit=True) as c:
+        c.execute("DELETE FROM russian_roulette_active_matches WHERE match_id=%s", (str(match_id),))
 
 
 def fetch_match_sync(match_id: str) -> typing.Optional[typing.Dict[str, typing.Any]]:
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute(
-        """SELECT match_id, guild_id, channel_id, message_id, mode, phase, payload
-           FROM russian_roulette_active_matches WHERE match_id=%s""",
-        (str(match_id),),
-    )
-    row = c.fetchone()
-    conn.close()
+    with db_cursor() as c:
+        c.execute(
+            """SELECT match_id, guild_id, channel_id, message_id, mode, phase, payload
+               FROM russian_roulette_active_matches WHERE match_id=%s""",
+            (str(match_id),),
+        )
+        row = c.fetchone()
     if not row:
         return None
     payload = row[6]
@@ -158,14 +150,12 @@ def fetch_match_sync(match_id: str) -> typing.Optional[typing.Dict[str, typing.A
 
 
 def fetch_active_matches_sync() -> typing.List[typing.Dict[str, typing.Any]]:
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute(
-        """SELECT match_id, guild_id, channel_id, message_id, mode, phase, payload
-           FROM russian_roulette_active_matches"""
-    )
-    rows = c.fetchall() or []
-    conn.close()
+    with db_cursor() as c:
+        c.execute(
+            """SELECT match_id, guild_id, channel_id, message_id, mode, phase, payload
+               FROM russian_roulette_active_matches"""
+        )
+        rows = c.fetchall() or []
     out: typing.List[typing.Dict[str, typing.Any]] = []
     for row in rows:
         payload = row[6]

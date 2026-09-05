@@ -53,11 +53,22 @@ def configure_stdio_line_buffering() -> None:
                 pass
 
 
+def members_intent_enabled() -> bool:
+    return str(os.getenv("DISCORD_MEMBERS_INTENT", "true")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def build_intents() -> discord.Intents:
     intents = discord.Intents.default()
     intents.message_content = True
     if hasattr(intents, "dm_messages"):
         intents.dm_messages = True
+    # 沒有 members 時 guild.get_member() 幾乎只在對方位於語音頻道時才有值。
+    intents.members = members_intent_enabled()
     return intents
 
 

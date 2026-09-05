@@ -17,6 +17,7 @@ get_casino_stats_rows_cached: typing.Optional[typing.Callable] = None
 get_wanted_list_rows_cached: typing.Optional[typing.Callable] = None
 get_good_citizen_rows_cached: typing.Optional[typing.Callable] = None
 get_wanted_status_cached: typing.Optional[typing.Callable] = None
+resolve_guild_member_cached: typing.Optional[typing.Callable] = None
 cleanup_local_caches: typing.Optional[typing.Callable] = None
 get_lb_balance_snapshot_age: typing.Optional[typing.Callable] = None
 get_lb_level_snapshot_age: typing.Optional[typing.Callable] = None
@@ -41,7 +42,10 @@ def register_snapshot_cache(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Di
     _casino_stats_cache_lock = asyncio.Lock()
     _leaderboard_snapshot_ready = asyncio.Event()
     _casino_stats_snapshot_ready = asyncio.Event()
-    _guild_member_cache: typing.Dict[typing.Tuple[int, int], typing.Tuple[float, bool]] = {}
+    _guild_member_cache: typing.Dict[
+        typing.Tuple[int, int], typing.Tuple[float, typing.Optional[discord.Member]]
+    ] = {}
+    _guild_member_inflight: typing.Dict[typing.Tuple[int, int], "asyncio.Task"] = {}
     _guild_member_cache_lock = asyncio.Lock()
     _wanted_list_cache: typing.Optional[typing.Tuple[float, typing.List[typing.Tuple]]] = None
     _good_citizen_cache: typing.Optional[typing.Tuple[float, typing.List[typing.Tuple]]] = None
@@ -226,6 +230,53 @@ def register_snapshot_cache(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Di
                 _metrics_counters["wanted_status_miss"] += 1
             return row
 
+    async def _resolve_guild_member_cached(
+        guild: discord.Guild,
+        user_id: int,
+    ) -> typing.Optional[discord.Member]:
+        """解析伺服器成員；連「查無此人」也一併快取，避免離開伺服器的玩家每次都打 API。"""
+        key = (int(guild.id), int(user_id))
+        cached = _guild_member_cache.get(key)
+        if cached and (time.time() - cached[0]) < GUILD_MEMBER_CACHE_SECONDS:
+            async with _metrics_lock:
+                _metrics_counters["guild_member_hit"] += 1
+            return cached[1]
+
+        member = guild.get_member(int(user_id))
+        if member is not None:
+            _guild_member_cache[key] = (time.time(), member)
+            async with _metrics_lock:
+                _metrics_counters["guild_member_hit"] += 1
+            return member
+
+        async def _fetch() -> typing.Optional[discord.Member]:
+            try:
+                fetched = await guild.fetch_member(int(user_id))
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                fetched = None
+            except Exception:
+                logger.exception("fetch_member 失敗: guild=%s user=%s", guild.id, user_id)
+                fetched = None
+            _guild_member_cache[key] = (time.time(), fetched)
+            return fetched
+
+        # 同一個 key 併發時共用一次 fetch，避免 gather 打出重複請求。
+        async with _guild_member_cache_lock:
+            cached = _guild_member_cache.get(key)
+            if cached and (time.time() - cached[0]) < GUILD_MEMBER_CACHE_SECONDS:
+                async with _metrics_lock:
+                    _metrics_counters["guild_member_hit"] += 1
+                return cached[1]
+            task = _guild_member_inflight.get(key)
+            if task is None:
+                task = asyncio.create_task(_fetch())
+                _guild_member_inflight[key] = task
+                task.add_done_callback(lambda _t, k=key: _guild_member_inflight.pop(k, None))
+
+        async with _metrics_lock:
+            _metrics_counters["guild_member_miss"] += 1
+        return await asyncio.shield(task)
+
     def _cleanup_local_caches() -> None:
         now_ts = time.time()
         for store, ttl in (
@@ -289,6 +340,7 @@ def register_snapshot_cache(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Di
     global get_wanted_list_rows_cached
     global get_good_citizen_rows_cached
     global get_wanted_status_cached
+    global resolve_guild_member_cached
     global cleanup_local_caches
     global get_lb_balance_snapshot_age
     global get_lb_level_snapshot_age
@@ -301,6 +353,7 @@ def register_snapshot_cache(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Di
     get_wanted_list_rows_cached = _get_wanted_list_rows_cached
     get_good_citizen_rows_cached = _get_good_citizen_rows_cached
     get_wanted_status_cached = _get_wanted_status_cached
+    resolve_guild_member_cached = _resolve_guild_member_cached
     cleanup_local_caches = _cleanup_local_caches
     get_lb_balance_snapshot_age = _get_lb_balance_snapshot_age
     get_lb_level_snapshot_age = _get_lb_level_snapshot_age
