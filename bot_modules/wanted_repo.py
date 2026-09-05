@@ -6,7 +6,7 @@ from bot_modules.db import db_cursor
 
 def fetch_wanted_status_row_sync(ensure_user_exists, get_db_connection, user_id: int):
     ensure_user_exists(user_id, 50000)
-    with db_cursor() as c:
+    with db_cursor(connect=get_db_connection) as c:
         c.execute(
             """SELECT COALESCE(role,'civilian'), COALESCE(wanted_stars,0), COALESCE(wanted_hunted_count,0),
                   COALESCE(in_prison,0), last_five_robs, COALESCE(arrest_count,0),
@@ -20,7 +20,7 @@ def fetch_wanted_status_row_sync(ensure_user_exists, get_db_connection, user_id:
 
 
 def fetch_wanted_list_rows_sync(get_db_connection):
-    with db_cursor() as c:
+    with db_cursor(connect=get_db_connection) as c:
         c.execute(
             """SELECT user_id, COALESCE(wanted_stars,0), COALESCE(wanted_hunted_count,0),
                   COALESCE(in_prison,0), last_five_robs
@@ -41,7 +41,7 @@ def pay_bail_sync(
 ) -> typing.Dict[str, typing.Any]:
     ensure_user_exists(user_id, 0)
     uid = str(user_id)
-    with db_cursor(commit=True) as c:
+    with db_cursor(commit=True, connect=get_db_connection) as c:
         c.execute(
             "SELECT COALESCE(in_prison,0), COALESCE(balance,0), COALESCE(bail_debt,0) FROM users WHERE user_id=%s FOR UPDATE",
             (uid,),
@@ -82,7 +82,7 @@ def wanted_buyout_sync(
     ensure_user_exists(user_id, 50000)
     uid = str(user_id)
     cost = int(wanted_buyout_cost)
-    with db_cursor(commit=True) as c:
+    with db_cursor(commit=True, connect=get_db_connection) as c:
         c.execute(
             "SELECT role, COALESCE(wanted_stars,0), COALESCE(balance,0), COALESCE(in_prison,0), last_wanted_buyout FROM users WHERE user_id=%s FOR UPDATE",
             (uid,),
@@ -134,7 +134,7 @@ def break_citizen_sync(
 ) -> typing.Dict[str, typing.Any]:
     ensure_user_exists(attacker_id, 50000)
     ensure_user_exists(target_id, 0)
-    with db_cursor(commit=True) as c:
+    with db_cursor(commit=True, connect=get_db_connection) as c:
         lock_user_rows(c, [attacker_id, target_id])
 
         attacker_bal = get_locked_user_balance(c, attacker_id)
@@ -172,7 +172,7 @@ def break_citizen_sync(
 
 
 def fetch_good_citizen_rows_sync(get_db_connection) -> typing.List[typing.Tuple[typing.Any, typing.Any, typing.Any]]:
-    with db_cursor() as c:
+    with db_cursor(connect=get_db_connection) as c:
         c.execute(
             """SELECT user_id, COALESCE(balance,0), last_good_citizen_cert_action
            FROM users

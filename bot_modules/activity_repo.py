@@ -10,7 +10,7 @@ def purge_old_logs_sync(get_db_connection, retention_days: int) -> int:
     """刪除 logs 超過 retention_days 的資料，回傳刪除筆數。"""
     if retention_days <= 0:
         return 0
-    with db_cursor(commit=True) as c:
+    with db_cursor(commit=True, connect=get_db_connection) as c:
         c.execute(
             "DELETE FROM logs WHERE created_at < DATE_SUB(NOW(), INTERVAL %s DAY)",
             (retention_days,),
@@ -29,7 +29,7 @@ def award_vc_rewards_sync(
     if not user_ids:
         return 0
     awarded: typing.List[str] = []
-    with db_cursor(commit=True) as c:
+    with db_cursor(commit=True, connect=get_db_connection) as c:
         for user_id in user_ids:
             c.execute("SELECT last_vc_reward FROM activity_stats WHERE user_id=%s", (user_id,))
             row = c.fetchone()
@@ -72,7 +72,7 @@ def process_on_message_activity_sync(
         if exp_result:
             old_level, new_level = int(exp_result[0] or 1), int(exp_result[1] or 1)
         exp_awarded = True
-    with db_cursor(commit=True) as c:
+    with db_cursor(commit=True, connect=get_db_connection) as c:
         c.execute(
             "INSERT INTO activity_stats (user_id, msg_count) VALUES (%s, %s) ON DUPLICATE KEY UPDATE msg_count=msg_count+%s",
             (user_id, pending_count, pending_count),

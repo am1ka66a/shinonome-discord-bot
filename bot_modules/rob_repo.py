@@ -33,7 +33,7 @@ def append_rob_history_on_cursor(c, user_id: int, steal_amount: int, now_tw_naiv
 
 def get_last_five_robs_total(get_db_connection, user_id: typing.Union[int, str]) -> typing.Tuple[int, int, typing.List[typing.Any]]:
     uid = str(user_id)
-    with db_cursor() as c:
+    with db_cursor(connect=get_db_connection) as c:
         c.execute("SELECT last_five_robs FROM users WHERE user_id=%s", (uid,))
         row = c.fetchone()
     if not row or not row[0]:
@@ -62,12 +62,12 @@ def rob_history_total_from_raw(raw: typing.Any) -> typing.Tuple[int, int]:
 
 
 def clear_rob_history(get_db_connection, user_id: typing.Union[int, str]) -> None:
-    with db_cursor(commit=True) as c:
+    with db_cursor(commit=True, connect=get_db_connection) as c:
         c.execute("UPDATE users SET last_five_robs=NULL WHERE user_id=%s", (str(user_id),))
 
 
 def load_rob_context(get_db_connection, lock_user_rows, user_role_value_func, robber_id: int, target_id: int) -> typing.Dict[str, typing.Any]:
-    with db_cursor() as c:
+    with db_cursor(connect=get_db_connection) as c:
         lock_user_rows(c, [robber_id, target_id])
         c.execute(
             "SELECT COALESCE(in_prison,0), COALESCE(role,'civilian'), balance, last_rob, level FROM users WHERE user_id=%s FOR UPDATE",
@@ -108,7 +108,7 @@ def apply_rob_success_db(
     now,
     success_rate_pct: int,
 ) -> typing.Dict[str, typing.Any]:
-    with db_conn() as conn:
+    with db_conn(get_db_connection) as conn:
         c = conn.cursor()
         lock_user_rows(c, [robber_id, target_id])
         c.execute("SELECT COALESCE(balance,0) FROM users WHERE user_id=%s FOR UPDATE", (str(target_id),))
@@ -253,7 +253,7 @@ def apply_rob_fail_db(
     target_id: int,
     now,
 ) -> typing.Dict[str, typing.Any]:
-    with db_cursor(commit=True) as c:
+    with db_cursor(commit=True, connect=get_db_connection) as c:
         lock_user_rows(c, [robber_id, target_id])
         c.execute("SELECT COALESCE(balance,0) FROM users WHERE user_id=%s FOR UPDATE", (str(robber_id),))
         rrow = c.fetchone()
