@@ -237,6 +237,9 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
             return m
 
         async def persist(self, phase: str) -> None:
+            # 結算後才落盤會留下幽靈對局，把玩家永久卡在「進行中」
+            if self.settled:
+                return
             msg_id = self.message.id if self.message else None
             await save_rr_match_async(
                 match_id=self.match_id,
@@ -388,11 +391,16 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
                 emb.set_footer(text="歷程過長，僅顯示最近的部分")
             return emb
 
-        async def settle_duel(self, loser_uid: int) -> int:
+        # 勝負判定（同步、瞬間完成）與金流結算（多次 DB 往返、很慢）刻意分開：
+        # 互動必須在 3 秒內回覆，所以先算出結果並更新畫面，錢和戰績之後再補。
+        def mark_settled(self) -> bool:
+            """同步搶下結算權，回傳 True 代表由這次呼叫負責付錢。"""
             if self.settled:
-                return self.other_uid_duel(loser_uid)
+                return False
             self.settled = True
-            winner_uid = self.other_uid_duel(loser_uid)
+            return True
+
+        async def payout_duel(self, loser_uid: int, winner_uid: int) -> None:
             pot = self.pot
             win_stake = self.stake_of(winner_uid)
             lose_stake = self.stake_of(loser_uid)
@@ -402,30 +410,44 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
             await record_rr_result_async(winner_uid, is_win=True, profit_delta=pot - win_stake)
             await record_rr_result_async(loser_uid, is_win=False, profit_delta=-lose_stake)
             await self.clear_persist()
+
+        async def settle_duel(self, loser_uid: int) -> int:
+            winner_uid = self.other_uid_duel(loser_uid)
+            if self.mark_settled():
+                await self.payout_duel(loser_uid, winner_uid)
             return winner_uid
 
-        async def eliminate_royale(self, uid: int, *, timeout: bool = False) -> typing.Optional[int]:
+        def apply_royale_elimination(self, uid: int) -> typing.Optional[int]:
+            """同步淘汰玩家並推進輪次，回傳勝者（尚未分出勝負則為 None）。"""
             uid = int(uid)
             was_turn = self.turn_uid == uid
             next_turn = self.next_alive_uid(uid) if was_turn else self.turn_uid
             if uid in self.alive_ids:
                 self.alive_ids = [x for x in self.alive_ids if x != uid]
-            lose_stake = self.stake_of(uid)
-            await update_game_result_async(uid, 0, -lose_stake, False, share_recovery=False)
-            await record_rr_result_async(uid, is_win=False, profit_delta=-lose_stake)
             if len(self.alive_ids) == 1:
                 self.settled = True
-                winner_uid = self.alive_ids[0]
-                pot = self.pot
-                win_stake = self.stake_of(winner_uid)
-                await credit_balance_with_log_async(winner_uid, pot, "俄羅斯輪盤淘汰賽勝利")
-                await update_game_result_async(winner_uid, 0, pot - win_stake, True, share_recovery=False)
-                await record_rr_result_async(winner_uid, is_win=True, profit_delta=pot - win_stake)
-                await self.clear_persist()
-                return winner_uid
+                return self.alive_ids[0]
             if was_turn and self.alive_ids:
                 self.turn_uid = next_turn if next_turn in self.alive_ids else self.alive_ids[0]
             return None
+
+        async def payout_royale(self, loser_uid: int, winner_uid: typing.Optional[int]) -> None:
+            lose_stake = self.stake_of(loser_uid)
+            await update_game_result_async(loser_uid, 0, -lose_stake, False, share_recovery=False)
+            await record_rr_result_async(loser_uid, is_win=False, profit_delta=-lose_stake)
+            if winner_uid is None:
+                return
+            pot = self.pot
+            win_stake = self.stake_of(winner_uid)
+            await credit_balance_with_log_async(winner_uid, pot, "俄羅斯輪盤淘汰賽勝利")
+            await update_game_result_async(winner_uid, 0, pot - win_stake, True, share_recovery=False)
+            await record_rr_result_async(winner_uid, is_win=True, profit_delta=pot - win_stake)
+            await self.clear_persist()
+
+        async def eliminate_royale(self, uid: int, *, timeout: bool = False) -> typing.Optional[int]:
+            winner_uid = self.apply_royale_elimination(uid)
+            await self.payout_royale(int(uid), winner_uid)
+            return winner_uid
 
         async def refund_participants(self, reason: str, uids: typing.Iterable[int]) -> None:
             if self.settled:
@@ -875,7 +897,8 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
 
         async def _finish_duel(self, interaction: discord.Interaction, loser_uid: int, *, timeout: bool = False):
             m = self.match
-            await m.settle_duel(loser_uid)
+            winner_uid = m.other_uid_duel(loser_uid)
+            owns_payout = m.mark_settled()
             rematch_view = RrRematchView(
                 m.guild_id, m.channel_id, m.participant_ids[0], m.participant_ids[1], m.bet_base, match=m
             )
@@ -887,11 +910,13 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
                 view=rematch_view,
             )
             self.stop()
+            if owns_payout:
+                await m.payout_duel(loser_uid, winner_uid)
 
         async def _finish_royale_hit(self, interaction: discord.Interaction, loser_uid: int):
             m = self.match
             m.history.append(f"💥 第 {m.trigger_index + 1} 發 — <@{loser_uid}> 中彈！")
-            winner_uid = await m.eliminate_royale(loser_uid)
+            winner_uid = m.apply_royale_elimination(loser_uid)
             for child in self.children:
                 child.disabled = True
             if winner_uid:
@@ -900,13 +925,15 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
                     view=RrHistoryView(m),
                 )
                 self.stop()
+                await m.payout_royale(loser_uid, winner_uid)
                 return
             m.trigger_index += 1
             play_view = RrShootView(m)
             m.view = play_view
             await interaction.response.edit_message(embed=m.build_embed(interaction), view=play_view)
-            await m.persist("playing")
             self.stop()
+            await m.persist("playing")
+            await m.payout_royale(loser_uid, None)
 
         async def _fire(self, interaction: discord.Interaction) -> None:
             m = self.match
@@ -984,7 +1011,7 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
                 )
             m.stakes[interaction.user.id] = m.stake_of(interaction.user.id) + m.bet_base
             m.history.append(f"💰 <@{interaction.user.id}> 加注 `{m.bet_base:,}` 並繼續")
-            await m.persist("choice")
+            # 不在這裡落盤：_fire() 回覆玩家之後就會存檔，先存只是多一次 DB 往返拖慢按鈕
             shoot_view = RrShootView(m)
             m.view = shoot_view
             self.stop()
