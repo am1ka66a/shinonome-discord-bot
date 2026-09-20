@@ -138,6 +138,7 @@ def register_snapshot_cache(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Di
 
     async def refresh_leaderboard_snapshots_task():
         nonlocal _lb_balance_cache, _lb_level_cache
+        consecutive_failures = 0
         await bot.wait_until_ready()
         while not bot.is_closed():
             try:
@@ -150,12 +151,18 @@ def register_snapshot_cache(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Di
                     _lb_balance_cache = (now_ts, balance_rows)
                     _lb_level_cache = (now_ts, level_rows)
                     _leaderboard_snapshot_ready.set()
+                consecutive_failures = 0
             except Exception as e:
-                logger.exception("刷新排行榜背景快照失敗: %s", e)
+                consecutive_failures += 1
+                if consecutive_failures <= 3:
+                    logger.warning("刷新排行榜背景快照失敗（沿用舊快照）: %s", e)
+                else:
+                    logger.exception("刷新排行榜背景快照連續失敗 %s 次: %s", consecutive_failures, e)
             await asyncio.sleep(LEADERBOARD_SNAPSHOT_SECONDS)
 
     async def refresh_casino_stats_snapshot_task():
         nonlocal _casino_stats_cache
+        consecutive_failures = 0
         await bot.wait_until_ready()
         while not bot.is_closed():
             try:
@@ -163,8 +170,15 @@ def register_snapshot_cache(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Di
                 async with _casino_stats_cache_lock:
                     _casino_stats_cache = (time.time(), rows)
                     _casino_stats_snapshot_ready.set()
+                consecutive_failures = 0
             except Exception as e:
-                logger.exception("刷新 casino_stats 背景快照失敗: %s", e)
+                consecutive_failures += 1
+                if consecutive_failures <= 3:
+                    logger.warning("刷新 casino_stats 背景快照失敗（沿用舊快照）: %s", e)
+                else:
+                    logger.exception(
+                        "刷新 casino_stats 背景快照連續失敗 %s 次: %s", consecutive_failures, e
+                    )
             await asyncio.sleep(CASINO_STATS_SNAPSHOT_SECONDS)
 
     async def _get_wanted_list_rows_cached() -> typing.List[typing.Tuple]:

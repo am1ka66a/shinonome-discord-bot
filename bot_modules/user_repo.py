@@ -1,5 +1,5 @@
 from bot_modules import config
-from bot_modules.db import db_cursor, log_transaction
+from bot_modules.db import call_with_db_retry, db_cursor, log_transaction
 
 
 def is_blacklisted(user_id):
@@ -27,31 +27,47 @@ def fetch_record_rows(user_id, limit: int = 50):
         return c.fetchall()
 
 
-def fetch_casino_stats_rows():
+def _fetch_casino_stats_rows_once():
     with db_cursor() as c:
-        c.execute("SELECT COALESCE(SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END), 0) FROM casino_logs")
+        # 一次掃描 casino_logs，避免 60 秒背景快照連掃兩遍把連線拖死
+        c.execute(
+            "SELECT "
+            "COALESCE(SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END), 0), "
+            "COALESCE(SUM(CASE WHEN amount < 0 THEN -amount ELSE 0 END), 0) "
+            "FROM casino_logs"
+        )
         issued_row = c.fetchone()
-        c.execute("SELECT COALESCE(SUM(CASE WHEN amount < 0 THEN -amount ELSE 0 END), 0) FROM casino_logs")
-        recovered_row = c.fetchone()
         c.execute("SELECT COALESCE(SUM(balance), 0) FROM users")
         circulation_row = c.fetchone()
     return (
         int((issued_row[0] if issued_row else 0) or 0),
-        int((recovered_row[0] if recovered_row else 0) or 0),
+        int((issued_row[1] if issued_row else 0) or 0),
         int((circulation_row[0] if circulation_row else 0) or 0),
     )
 
 
-def fetch_balance_leaderboard_snapshot():
+def fetch_casino_stats_rows():
+    return call_with_db_retry(_fetch_casino_stats_rows_once)
+
+
+def _fetch_balance_leaderboard_snapshot_once():
     with db_cursor() as c:
         c.execute("SELECT user_id, balance FROM users ORDER BY balance DESC")
         return c.fetchall()
 
 
-def fetch_level_leaderboard_snapshot():
+def fetch_balance_leaderboard_snapshot():
+    return call_with_db_retry(_fetch_balance_leaderboard_snapshot_once)
+
+
+def _fetch_level_leaderboard_snapshot_once():
     with db_cursor() as c:
         c.execute("SELECT user_id, level, exp FROM users ORDER BY level DESC, exp DESC")
         return c.fetchall()
+
+
+def fetch_level_leaderboard_snapshot():
+    return call_with_db_retry(_fetch_level_leaderboard_snapshot_once)
 
 
 def fetch_casino_share_stats_rows(days: int = 7):

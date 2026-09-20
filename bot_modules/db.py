@@ -1,10 +1,15 @@
 import contextlib
 import os
+import time
 from urllib.parse import urlparse
 
 import pymysql
 from dbutils.pooled_db import PooledDB
 import threading
+
+# PyMySQL 在 socket 已被對端關掉、或 Railway proxy 丟空封包時，會變成 InterfaceError(0, '')。
+# DBUtils 會嘗試重連；重連當下若 DB 還不可達，就會把這個空錯誤原樣丟回來。
+_TRANSIENT_DB_CODES = {0, 2003, 2006, 2013, 2014, 2045, 4031}
 
 _mysql_pool = None
 _mysql_pool_lock = threading.Lock()
@@ -24,6 +29,7 @@ def _mysql_connect_kwargs() -> dict:
                 "database": (parsed.path or "/").lstrip("/"),
                 "charset": "utf8mb4",
                 "init_command": "SET time_zone = '+08:00'",
+                "connect_timeout": int(os.getenv("MYSQL_CONNECT_TIMEOUT", "10")),
             }
     return {
         "host": os.getenv("MYSQLHOST") or os.getenv("DB_HOST"),
@@ -33,6 +39,7 @@ def _mysql_connect_kwargs() -> dict:
         "database": os.getenv("MYSQLDATABASE") or os.getenv("DB_NAME"),
         "charset": "utf8mb4",
         "init_command": "SET time_zone = '+08:00'",
+        "connect_timeout": int(os.getenv("MYSQL_CONNECT_TIMEOUT", "10")),
     }
 
 
@@ -47,16 +54,63 @@ def _get_mysql_pool() -> PooledDB:
                     mincached=int(os.getenv("MYSQL_POOL_MINCACHED", "1")),
                     maxcached=int(os.getenv("MYSQL_POOL_MAXCACHED", "8")),
                     maxconnections=int(os.getenv("MYSQL_POOL_MAX", "16")),
+                    # 用到一定次數就丟，避免連線活超過 MySQL wait_timeout / proxy idle
+                    maxusage=int(os.getenv("MYSQL_POOL_MAXUSAGE", "50")),
                     blocking=True,
-                    ping=1,
+                    # ping=2（建立游標時檢查）而非預設的 1（自池中取出時檢查）：
+                    # DBUtils 重連失敗時會靜默發出死連線，之後 query 才炸成
+                    # InterfaceError(0, '')。檢查點放在建游標時，steady_db 的
+                    # 內建重試（失敗後重開游標再執行一次）才會一併重建底層連線。
+                    # 若重連當下 DB 仍不可達，call_with_db_retry 會再隔一小段時間重試整段操作。
+                    ping=int(os.getenv("MYSQL_POOL_PING", "2")),
                     **kw,
                 )
     return _mysql_pool
 
 
+def is_transient_db_error(exc: BaseException) -> bool:
+    """判斷是否為連線被掐斷、空封包、server gone away 這類可重試的錯誤。"""
+    if isinstance(exc, (pymysql.err.InterfaceError, pymysql.err.OperationalError, pymysql.err.InternalError)):
+        code = exc.args[0] if exc.args else None
+        if code in _TRANSIENT_DB_CODES or code in ("", None):
+            return True
+    text = str(exc)
+    return text == "(0, '')" or "InterfaceError(0, '')" in text or "(0, '')" in text
+
+
+def call_with_db_retry(func, *args, retries: int = 3, delay: float = 0.25, **kwargs):
+    """整段操作重試。用在唯讀快照：DBUtils 當下重連失敗時，隔一小段時間再拿新連線。"""
+    last_exc: BaseException | None = None
+    attempts = max(1, int(retries))
+    for attempt in range(attempts):
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:
+            last_exc = exc
+            if not is_transient_db_error(exc) or attempt >= attempts - 1:
+                raise
+            time.sleep(delay * (2 ** attempt))
+    raise last_exc  # pragma: no cover
+
+
 def get_db_connection():
     """從連線池取得連線；用完請 commit／rollback 並 close（會歸還池中）。"""
     return _get_mysql_pool().connection()
+
+
+def _release_conn(conn, *, discard: bool = False) -> None:
+    """歸還連線。discard=True 時先關掉底層 socket，避免把死連線放回池裡。"""
+    if discard:
+        try:
+            inner = getattr(conn, "_con", None)
+            if inner is not None:
+                inner.close()
+        except Exception:
+            pass
+    try:
+        conn.close()
+    except Exception:
+        pass
 
 
 @contextlib.contextmanager
@@ -66,16 +120,18 @@ def db_conn(connect=None):
     connect 可傳入自訂的取連線函式（供以依賴注入方式取得連線的模組使用）。
     """
     conn = (connect or get_db_connection)()
+    discard = False
     try:
         yield conn
-    except BaseException:
+    except BaseException as exc:
+        discard = is_transient_db_error(exc)
         try:
             conn.rollback()
         except Exception:
             pass
         raise
     finally:
-        conn.close()
+        _release_conn(conn, discard=discard)
 
 
 @contextlib.contextmanager
