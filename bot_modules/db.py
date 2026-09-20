@@ -43,11 +43,23 @@ def _mysql_connect_kwargs() -> dict:
     }
 
 
+def _ensure_mysql_auth_deps() -> None:
+    """caching_sha2_password 在非 SSL 新建連線時要用 cryptography 做 RSA。"""
+    try:
+        import cryptography  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            "缺少 cryptography，無法用 MySQL 8 的 caching_sha2_password 認證。"
+            "請把 cryptography 裝進 requirements 後重新部署。"
+        ) from exc
+
+
 def _get_mysql_pool() -> PooledDB:
     global _mysql_pool
     if _mysql_pool is None:
         with _mysql_pool_lock:
             if _mysql_pool is None:
+                _ensure_mysql_auth_deps()
                 kw = _mysql_connect_kwargs()
                 _mysql_pool = PooledDB(
                     creator=pymysql,
