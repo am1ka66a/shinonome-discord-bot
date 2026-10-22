@@ -36,29 +36,30 @@ def register_casino_light_commands(bot, ctx: typing.Dict[str, typing.Any]) -> No
         side: str,
     ):
         if not FEATURE_TOGGLES.get("coinflip", True) or not get_is_event_active():
-            return await interaction.response.send_message("🚫 賭場目前休息中。", ephemeral=True)
+            return await interaction_send(interaction, "🚫 賭場目前休息中。", ephemeral=True)
         bet = int(amount)
         if bet < COINFLIP_MIN_BET or bet > COINFLIP_MAX_BET:
-            return await interaction.response.send_message(
+            return await interaction_send(interaction,
                 f"下注須介於 `{COINFLIP_MIN_BET:,}`～`{COINFLIP_MAX_BET:,}` 東雲幣。",
                 ephemeral=True,
             )
+        await interaction_defer_if_needed(interaction)
         await ensure_user_exists_async(interaction.user.id, 50000)
         result = await settle_coinflip_async(interaction.user.id, bet, side)
         if not result.get("ok"):
             reason = result.get("reason")
             if reason == "insufficient":
                 bal = int(result.get("balance") or 0)
-                return await interaction.response.send_message(
+                return await interaction_send(interaction,
                     f"餘額不足（目前 `{bal:,}`，需要 `{bet:,}`）。",
                     ephemeral=True,
                 )
             if reason == "bad_amount":
-                return await interaction.response.send_message(
+                return await interaction_send(interaction,
                     f"下注須介於 `{COINFLIP_MIN_BET:,}`～`{COINFLIP_MAX_BET:,}` 東雲幣。",
                     ephemeral=True,
                 )
-            return await interaction.response.send_message("下注失敗，請稍後再試。", ephemeral=True)
+            return await interaction_send(interaction, "下注失敗，請稍後再試。", ephemeral=True)
 
         win = bool(result.get("win"))
         outcome = str(result.get("outcome") or "")
@@ -76,14 +77,15 @@ def register_casino_light_commands(bot, ctx: typing.Dict[str, typing.Any]) -> No
             inline=False,
         )
         emb.add_field(name="目前餘額", value=f"`{new_bal:,}` 東雲幣", inline=False)
-        await interaction.response.send_message(embed=emb)
+        await interaction_send(interaction, embed=emb)
 
     lottery_group = app_commands.Group(name="lottery", description="日彩池：購票參加、查看狀態")
 
     @lottery_group.command(name="status", description="查看今日彩池與你的購票")
     async def lottery_status_slash(interaction: discord.Interaction):
+        await interaction_defer_if_needed(interaction, ephemeral=True)
         if not FEATURE_TOGGLES.get("lottery", True):
-            return await interaction.response.send_message("🚫 日彩池目前關閉。", ephemeral=True)
+            return await interaction_send(interaction, "🚫 日彩池目前關閉。", ephemeral=True)
         await ensure_user_exists_async(interaction.user.id, 50000)
         status = await fetch_lottery_status_async(interaction.user.id)
         draw_ts = tw_naive_to_discord_ts(status["draw_dt"])
@@ -98,7 +100,7 @@ def register_casino_light_commands(bot, ctx: typing.Dict[str, typing.Any]) -> No
         else:
             emb.add_field(name="預計開獎", value=f"<t:{draw_ts}:F>（<t:{draw_ts}:R>）", inline=False)
         emb.set_footer(text=f"每張票 `{LOTTERY_TICKET_COST:,}` 東雲幣｜每日 00:00 開獎｜/lottery buy 購票")
-        await interaction.response.send_message(embed=emb, ephemeral=True)
+        await interaction_send(interaction, embed=emb, ephemeral=True)
 
     @lottery_group.command(name="buy", description="購買今日彩池彩券")
     @app_commands.describe(tickets=f"購買張數（1～{LOTTERY_MAX_TICKETS_PER_BUY}）")
@@ -106,8 +108,9 @@ def register_casino_light_commands(bot, ctx: typing.Dict[str, typing.Any]) -> No
         interaction: discord.Interaction,
         tickets: app_commands.Range[int, 1, 50] = 1,
     ):
+        await interaction_defer_if_needed(interaction, ephemeral=True)
         if not FEATURE_TOGGLES.get("lottery", True) or not get_is_event_active():
-            return await interaction.response.send_message("🚫 日彩池目前關閉。", ephemeral=True)
+            return await interaction_send(interaction, "🚫 日彩池目前關閉。", ephemeral=True)
         await ensure_user_exists_async(interaction.user.id, 50000)
         result = await buy_lottery_tickets_async(interaction.user.id, int(tickets))
         if not result.get("ok"):
@@ -115,13 +118,13 @@ def register_casino_light_commands(bot, ctx: typing.Dict[str, typing.Any]) -> No
             if reason == "insufficient":
                 bal = int(result.get("balance") or 0)
                 cost = int(result.get("cost") or 0)
-                return await interaction.response.send_message(
+                return await interaction_send(interaction,
                     f"餘額不足（目前 `{bal:,}`，需要 `{cost:,}`）。",
                     ephemeral=True,
                 )
             if reason == "round_closed":
-                return await interaction.response.send_message("今日彩池已結算，請等待明日。", ephemeral=True)
-            return await interaction.response.send_message("購票失敗，請稍後再試。", ephemeral=True)
+                return await interaction_send(interaction, "今日彩池已結算，請等待明日。", ephemeral=True)
+            return await interaction_send(interaction, "購票失敗，請稍後再試。", ephemeral=True)
 
         emb = discord.Embed(title="✅ 購票成功", color=0x57F287)
         emb.add_field(name="今日期別", value=str(result["day_key"]), inline=True)
@@ -129,6 +132,6 @@ def register_casino_light_commands(bot, ctx: typing.Dict[str, typing.Any]) -> No
         emb.add_field(name="你的總票數", value=f"`{int(result['my_tickets'])}` 張", inline=True)
         emb.add_field(name="目前彩池", value=f"`{int(result['pool']):,}` 東雲幣", inline=False)
         emb.add_field(name="目前餘額", value=f"`{int(result['balance']):,}` 東雲幣", inline=False)
-        await interaction.response.send_message(embed=emb, ephemeral=True)
+        await interaction_send(interaction, embed=emb, ephemeral=True)
 
     bot.tree.add_command(lottery_group)

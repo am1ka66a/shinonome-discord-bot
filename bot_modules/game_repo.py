@@ -45,7 +45,7 @@ def add_user_exp(get_db_connection, calc_level_from_exp_func, user_id, amount):
     if amount <= 0:
         return None
     with db_cursor(commit=True, connect=get_db_connection) as c:
-        c.execute("SELECT exp, level FROM users WHERE user_id=%s", (str(user_id),))
+        c.execute("SELECT exp, level FROM users WHERE user_id=%s FOR UPDATE", (str(user_id),))
         row = c.fetchone()
         if not row:
             return None
@@ -68,6 +68,9 @@ def get_claimed_milestones(get_db_connection, user_id) -> set:
 
 def try_claim_milestone(get_db_connection, log_transaction_in_tx, user_id, milestone, coin_amount) -> int:
     with db_cursor(commit=True, connect=get_db_connection) as c:
+        c.execute("SELECT user_id FROM users WHERE user_id=%s FOR UPDATE", (str(user_id),))
+        if not c.fetchone():
+            return -1
         c.execute("SELECT 1 FROM level_milestone_claims WHERE user_id=%s AND milestone=%s", (str(user_id), milestone))
         if c.fetchone():
             return -1

@@ -47,6 +47,7 @@ def register_economy_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             self.claimed_users = set()
             self.claim_results = []
             self._claim_lock = asyncio.Lock()
+            self.closed = False
 
         def summary_text(self):
             claimed = self.count - self.left_count
@@ -70,7 +71,7 @@ def register_economy_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                     return await interaction_send(interaction, "機器人不能搶紅包", ephemeral=True)
                 if interaction.user.id in self.claimed_users:
                     return await interaction_send(interaction, "你已經搶過這包了", ephemeral=True)
-                if self.left_count <= 0 or self.left_amount <= 0:
+                if self.closed or self.left_count <= 0 or self.left_amount <= 0:
                     return await interaction_send(interaction, "紅包已搶完", ephemeral=True)
 
                 if self.left_count == 1:
@@ -80,12 +81,15 @@ def register_economy_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                     non_last_cap = max(1, int(self.left_amount * 0.4))
                     capped_max_pick = max(1, min(max_pick, non_last_cap))
                     amount = random.randint(1, capped_max_pick)
+                try:
+                    await credit_balance_with_log_async(interaction.user.id, amount, f"搶紅包 #{self.packet_id}")
+                except Exception:
+                    logger.exception("紅包入帳失敗 packet_id=%s user=%s", self.packet_id, interaction.user.id)
+                    return await interaction_send(interaction, "入帳失敗，這份紅包尚未扣除，請稍後再試。", ephemeral=True)
                 self.left_amount -= amount
                 self.left_count -= 1
                 self.claimed_users.add(interaction.user.id)
                 self.claim_results.append((interaction.user.id, amount))
-
-                await credit_balance_with_log_async(interaction.user.id, amount, f"搶紅包 #{self.packet_id}")
 
                 if self.left_count <= 0 or self.left_amount <= 0:
                     for child in self.children:
@@ -106,6 +110,8 @@ def register_economy_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                 await interaction_send(interaction, f"🎉 你搶到 `{amount}` 東雲幣！", ephemeral=True)
 
         async def on_timeout(self):
+            async with self._claim_lock:
+                self.closed = True
             for child in self.children:
                 child.disabled = True
             try:
@@ -168,43 +174,45 @@ def register_economy_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
 
     @bot.tree.command(name="beg", description="街頭乞討")
     async def beg(interaction: discord.Interaction):
+        await interaction_defer_if_needed(interaction)
         result = await claim_beg_sync_async(interaction.user.id)
         if not result.get("ok"):
-            return await interaction.response.send_message("太快了", ephemeral=True)
+            return await interaction_send(interaction, "太快了", ephemeral=True)
         if result.get("fail"):
-            return await interaction.response.send_message("沒人鳥你 乞丐")
+            return await interaction_send(interaction, "沒人鳥你 乞丐")
         earn = int(result.get("earned") or 0)
-        return await interaction.response.send_message(f"你獲得了{earn}東雲幣!錢給你啦 乞丐!")
+        return await interaction_send(interaction, f"你獲得了{earn}東雲幣!錢給你啦 乞丐!")
 
 
 
     @bot.tree.command(name="rescue", description="破產救濟計畫，餘額為 0 元時可領 1,000 (每人限領 10 次)")
     async def rescue(interaction: discord.Interaction):
+        await interaction_defer_if_needed(interaction)
         result = await claim_rescue_sync_async(interaction.user.id)
         if not result.get("ok"):
             reason = result.get("reason")
             if reason == "not_bankrupt":
                 bal = int(result.get("balance") or 0)
-                return await interaction.response.send_message(
+                return await interaction_send(interaction,
                     f"💰 還沒破產（餘額: {bal}），請這位賭狗先去賭到傾家蕩產！完全歸零時再來領。",
                     ephemeral=True,
                 )
             if reason == "limit_reached":
-                return await interaction.response.send_message(
+                return await interaction_send(interaction,
                     "🚫 抱歉，你的救濟次數已達 10 次上限。這輩子不能再領了，賭鬼！",
                     ephemeral=True,
                 )
             if reason == "cooldown":
                 rem = int(result.get("remain_sec") or 0)
-                return await interaction.response.send_message(f"🕒 銀行還不想給你錢！請再等 `{int(rem//60)}` 分鐘。", ephemeral=True)
-            return await interaction.response.send_message("暫時無法領取救濟，請稍後再試。", ephemeral=True)
+                return await interaction_send(interaction, f"🕒 銀行還不想給你錢！請再等 `{int(rem//60)}` 分鐘。", ephemeral=True)
+            return await interaction_send(interaction, "暫時無法領取救濟，請稍後再試。", ephemeral=True)
         rescue_reward = int(result["reward"])
         claim_no = int(result["claim_no"])
         embed = discord.Embed(title="✅ 破產救濟發放", color=discord.Color.green())
         embed.add_field(name="獲得", value=f"`{rescue_reward:,}` 東雲幣", inline=False)
         embed.add_field(name="累計次數", value=f"`{claim_no}/10`", inline=False)
         embed.set_footer(text="請謹慎下注，避免再次破產")
-        await interaction.response.send_message(embed=embed)
+        await interaction_send(interaction, embed=embed)
 
     # /bj 已抽離到 bot_modules/commands/blackjack.py
 
@@ -306,26 +314,27 @@ def register_economy_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         user_id: typing.Optional[str] = None,
         note: str = "",
     ):
+        await interaction_defer_if_needed(interaction)
         m_user, err = await resolve_slash_target(
             interaction, member, user_id, required=True, in_guild_only=True
         )
         if err:
-            return await interaction.response.send_message(err, ephemeral=True)
+            return await interaction_send(interaction, err, ephemeral=True)
         if not isinstance(m_user, discord.Member):
-            return await interaction.response.send_message("轉帳對象必須是此伺服器成員。", ephemeral=True)
+            return await interaction_send(interaction, "轉帳對象必須是此伺服器成員。", ephemeral=True)
         member = m_user
         if amount <= 0:
-            return await interaction.response.send_message("金額必須大於 0", ephemeral=True)
+            return await interaction_send(interaction, "金額必須大於 0", ephemeral=True)
         if member.bot:
-            return await interaction.response.send_message("不能轉帳給機器人", ephemeral=True)
+            return await interaction_send(interaction, "不能轉帳給機器人", ephemeral=True)
         if member.id == interaction.user.id:
-            return await interaction.response.send_message("不能轉帳給自己", ephemeral=True)
+            return await interaction_send(interaction, "不能轉帳給自己", ephemeral=True)
         note_text = (note or "").strip()
         if len(note_text) > 100:
             note_text = note_text[:100]
         result = await transfer_sync_async(interaction.user.id, member.id, amount, note_text)
         if not result.get("ok"):
-            return await interaction.response.send_message("餘額不足，無法轉帳", ephemeral=True)
+            return await interaction_send(interaction, "餘額不足，無法轉帳", ephemeral=True)
         sender_after = int(result["sender_after"])
         receiver_after = int(result["receiver_after"])
 
@@ -362,28 +371,37 @@ def register_economy_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             inline=False
         )
         embed.set_footer(text=f"交易時間：{now_text}")
-        await interaction.response.send_message(embed=embed)
+        await interaction_send(interaction, embed=embed)
 
     @bot.tree.command(name="redpacket", description="發送紅包！")
     @app_commands.describe(total_amount="紅包總金額", count="份數", seconds="有效秒數(最少10秒)")
     async def redpacket(interaction: discord.Interaction, total_amount: int, count: int, seconds: int = 60):
         if not FEATURE_TOGGLES.get("redpacket", True):
-            return await interaction.response.send_message("⛔ `/redpacket` 目前暫時關閉中。", ephemeral=True)
+            return await interaction_send(interaction, "⛔ `/redpacket` 目前暫時關閉中。", ephemeral=True)
+        await interaction_defer_if_needed(interaction)
         await ensure_user_exists_async(interaction.user.id, 50000)
         if total_amount < count or total_amount <= 0:
-            return await interaction.response.send_message("總金額需大於 0，且至少要能每包 1 元。", ephemeral=True)
+            return await interaction_send(interaction, "總金額需大於 0，且至少要能每包 1 元。", ephemeral=True)
         if count < 1 or count > 100:
-            return await interaction.response.send_message("份數需介於 1 到 100。", ephemeral=True)
+            return await interaction_send(interaction, "份數需介於 1 到 100。", ephemeral=True)
         if not await try_deduct_balance_async(interaction.user.id, total_amount, "發送紅包扣款"):
-            return await interaction.response.send_message("餘額不足，無法發紅包", ephemeral=True)
+            return await interaction_send(interaction, "餘額不足，無法發紅包", ephemeral=True)
         timeout_seconds = max(RED_PACKET_MIN_SECONDS, seconds)
         view = RedPacketView(interaction.user.id, total_amount, count)
         view.timeout = timeout_seconds
-        await interaction.response.send_message(
-            f"{interaction.user.mention} 發了一個紅包！\n{view.summary_text()}\n"
-            f"⏰ 有效時間：`{timeout_seconds}` 秒",
-            view=view
-        )
+        try:
+            await interaction_send(
+                interaction,
+                f"{interaction.user.mention} 發了一個紅包！\n{view.summary_text()}\n"
+                f"⏰ 有效時間：`{timeout_seconds}` 秒",
+                view=view
+            )
+        except discord.HTTPException as exc:
+            if exc.status < 500:
+                # A definitive rejection means no claim button was published.
+                await credit_balance_with_log_async(interaction.user.id, total_amount, "紅包發送失敗退款")
+                view.stop()
+            raise
         try:
             view.message = await interaction.original_response()
         except Exception:

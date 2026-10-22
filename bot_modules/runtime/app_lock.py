@@ -33,7 +33,7 @@ def register_app_command_lock(
 ) -> None:
     """同一使用者的 mutating Slash 互斥；查詢類指令放行。"""
     read_only = read_only_commands if read_only_commands is not None else DEFAULT_READ_ONLY_APP_COMMANDS
-    locks: typing.Dict[int, typing.Tuple[str, float]] = {}
+    locks: typing.Dict[int, typing.Tuple[int, float]] = {}
     guard = asyncio.Lock()
 
     async def enforce_single_active_app_command(interaction: discord.Interaction) -> bool:
@@ -44,7 +44,7 @@ def register_app_command_lock(
         if command_name in read_only:
             return True
         uid = int(user.id)
-        now_ts = time.time()
+        now_ts = time.monotonic()
         async with guard:
             active = locks.get(uid)
             started_ts = active[1] if active else None
@@ -54,7 +54,7 @@ def register_app_command_lock(
                     ephemeral=True,
                 )
                 return False
-            locks[uid] = ("mutating", now_ts)
+            locks[uid] = (interaction.id, now_ts)
         return True
 
     # CommandTree.interaction_check 是一般的 coroutine 方法，不是裝飾器；
@@ -66,7 +66,10 @@ def register_app_command_lock(
         if user is None:
             return
         async with guard:
-            locks.pop(int(user.id), None)
+            uid = int(user.id)
+            active = locks.get(uid)
+            if active and active[0] == interaction.id:
+                locks.pop(uid, None)
 
     @bot.event
     async def on_app_command_completion(interaction: discord.Interaction, command: app_commands.Command):

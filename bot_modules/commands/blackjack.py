@@ -4,6 +4,7 @@ import typing
 
 import discord
 from discord import app_commands
+from bot_modules.ui.guards import serialized_action
 
 
 def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
@@ -33,7 +34,7 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
     def card_back_emoji(guild_id=None) -> str:
         return "**[??]**"
 
-    async def send_game(
+    async def _send_game(
         channel,
         gv: "BlackjackGame",
         interaction: discord.Interaction = None,
@@ -118,6 +119,11 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             lambda: channel.send(embed=embed, view=current_view),
             action="channel.send",
         )
+
+    async def send_game(channel, gv, **kwargs):
+        message = await _send_game(channel, gv, **kwargs)
+        gv.message = message
+        return message
 
     def calculate_score(hand):
         score, aces = 0, 0
@@ -218,6 +224,7 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             self.user, self.base_bet = user, base_bet
             self.p_bet, self.s_bet = p_bet, s_bet
             self.max_side = int(base_bet * side_bet_ratio)
+            self._callback_lock = asyncio.Lock()
 
         async def _build_embed_async(self, err: str = "") -> discord.Embed:
             await ensure_user_exists_async(self.user.id, 50000)
@@ -246,9 +253,12 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             return True
 
         @discord.ui.button(label="開始遊戲 (再來一局)", style=discord.ButtonStyle.success)
+        @serialized_action
         async def start(self, inter, btn):
             if inter.user.id != self.user.id:
                 return
+            if self.is_finished():
+                return await interaction_send(inter, "這個下注畫面已經使用過了。", ephemeral=True)
             if not feature_toggles.get("bj", True) or not get_is_event_active():
                 return await inter.response.send_message("打烊", ephemeral=True)
             await inter.response.defer()
@@ -284,6 +294,7 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             self.hand_results = [None]
             self._action_lock = asyncio.Lock()
             self._auto_settling = False
+            self.message = None
             self.side_p, self.side_m = check_sidebets(self.hands[0], self.d_hand[0], p_bet, s_bet)
             self.update_buttons()
 
@@ -392,6 +403,7 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             total_p = prof + getattr(self, "side_p", 0)
             settlement_credit = self.total_deducted + total_p
             await update_game_result_async(self.user.id, settlement_credit, total_p, win, is_push)
+            self.stop()
 
             if exp_gain > 0:
                 await ensure_user_exists_async(self.user.id, 50000)
@@ -549,6 +561,14 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                 else:
                     await self._edit(interaction=inter)
 
+        async def on_timeout(self):
+            async with self._action_lock:
+                if not getattr(self, "_game_over", False) and self.message:
+                    # Resolve the existing hands instead of silently abandoning a paid game.
+                    while self.current_hand < len(self.hands) - 1:
+                        self.current_hand += 1
+                    await self.resolve_dealer(message_obj=self.message)
+
         @discord.ui.button(label="停牌", style=discord.ButtonStyle.danger)
         async def stand(self, inter, btn):
             if inter.user.id != self.user.id:
@@ -603,6 +623,7 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         def __init__(self, user, parent_msg):
             super().__init__(timeout=30)
             self.user, self.parent_msg = user, parent_msg
+            self._callback_lock = asyncio.Lock()
 
         async def interaction_check(self, interaction: discord.Interaction) -> bool:
             if interaction.user.id != self.user.id:
@@ -610,17 +631,21 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             return True
 
         @discord.ui.button(label="確定 All In！", style=discord.ButtonStyle.danger)
+        @serialized_action
         async def confirm(self, inter, btn):
+            if self.is_finished():
+                return await interaction_send(inter, "這個確認畫面已經使用過了。", ephemeral=True)
             if not feature_toggles.get("bj", True) or not get_is_event_active():
                 return await inter.response.send_message("打烊", ephemeral=True)
+            await interaction_defer_if_needed(inter, thinking=False)
             stats = await get_user_stats_async(self.user.id)
             all_in_amount = int((stats[0] if stats else 0) or 0)
             if all_in_amount < 100:
-                return await inter.response.send_message("去乞討吧雜魚", ephemeral=True)
+                return await interaction_send(inter, "去乞討吧雜魚", ephemeral=True)
             if not await try_deduct_balance_async(self.user.id, all_in_amount, "21點 All In 開局扣款"):
-                return await inter.response.send_message("餘額不足（可能剛轉帳/變動），請重新開局。", ephemeral=True)
+                return await interaction_send(inter, "餘額不足（可能剛轉帳/變動），請重新開局。", ephemeral=True)
             self.stop()
-            await inter.response.edit_message(content="🔥 All In 已確認！正在為你開牌...", view=None)
+            await inter.edit_original_response(content="🔥 All In 已確認！正在為你開牌...", view=None)
             try:
                 await self.parent_msg.delete()
             except Exception:
@@ -634,6 +659,7 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         def __init__(self, user, last_bet, last_p_bet, last_s_bet, current_bal):
             super().__init__(timeout=90)
             self.user, self.last_bet, self.last_p_bet, self.last_s_bet, self.current_bal = user, last_bet, last_p_bet, last_s_bet, current_bal
+            self._callback_lock = asyncio.Lock()
 
         async def interaction_check(self, interaction: discord.Interaction) -> bool:
             if interaction.user.id != self.user.id:
@@ -641,9 +667,12 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             return True
 
         @discord.ui.button(label="再來一局", style=discord.ButtonStyle.success)
+        @serialized_action
         async def again(self, inter, btn):
             if inter.user.id != self.user.id:
                 return
+            if self.is_finished():
+                return await interaction_send(inter, "這個重賽畫面已經使用過了。", ephemeral=True)
             if not feature_toggles.get("bj", True) or not get_is_event_active():
                 return await inter.response.send_message("打烊", ephemeral=True)
             await inter.response.defer()
@@ -659,9 +688,12 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                 logger.error("21點 NewGameView.again：_send_game 未回傳訊息，略過自動 BJ 結算 user=%s", inter.user.id)
 
         @discord.ui.button(label="雙倍再局 (Double)", style=discord.ButtonStyle.primary)
+        @serialized_action
         async def double_again(self, inter, btn):
             if inter.user.id != self.user.id:
                 return
+            if self.is_finished():
+                return await interaction_send(inter, "這個重賽畫面已經使用過了。", ephemeral=True)
             if not feature_toggles.get("bj", True) or not get_is_event_active():
                 return await inter.response.send_message("打烊", ephemeral=True)
             await inter.response.defer()

@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import logging
 import os
@@ -160,14 +161,28 @@ def register_on_ready(
     event_tasks: typing.Dict[str, typing.Any],
     snapshot_cache_tasks: typing.Dict[str, typing.Any],
 ) -> None:
+    background_tasks: typing.Dict[str, asyncio.Task] = {}
+    ready_lock = asyncio.Lock()
+    initialized = False
+    bot._db_ready_event = asyncio.Event()
+
     @bot.event
     async def on_ready():
+        async with ready_lock:
+            await initialize_ready()
+
+    async def initialize_ready():
+        nonlocal initialized
         discord_log_register(bot, logger, default_channel_id=dm_relay_channel_id)
-        try:
-            init_db()
-            logger.info("資料庫初始化完成")
-        except Exception as e:
-            logger.exception("init_db 失敗: %s", e)
+        if not initialized:
+            try:
+                await asyncio.to_thread(init_db)
+                initialized = True
+                bot._db_ready_event.set()
+                logger.info("資料庫初始化完成")
+            except Exception as e:
+                logger.exception("init_db 失敗: %s", e)
+                return
         try:
             synced = await bot.tree.sync()
             logger.info("Slash 指令同步完成: %s 個", len(synced))
@@ -179,10 +194,14 @@ def register_on_ready(
                 logger.info("Guild 同步完成 %s: %s 個指令", guild.id, len(gsynced))
             except Exception as e:
                 logger.exception("Guild 同步失敗 %s: %s", guild.id, e)
-        bot.loop.create_task(event_tasks["vc_reward_task"]())
-        bot.loop.create_task(event_tasks["logs_retention_task"]())
-        bot.loop.create_task(event_tasks["cache_cleanup_task"]())
-        bot.loop.create_task(event_tasks["lottery_draw_task"]())
-        bot.loop.create_task(snapshot_cache_tasks["refresh_leaderboard_snapshots_task"]())
-        bot.loop.create_task(snapshot_cache_tasks["refresh_casino_stats_snapshot_task"]())
+        for name, factory in {**event_tasks, **snapshot_cache_tasks}.items():
+            if not name.endswith("_task"):
+                continue
+            existing = background_tasks.get(name)
+            if existing is None or existing.done():
+                if existing is not None and not existing.cancelled():
+                    error = existing.exception()
+                    if error is not None:
+                        logger.error("背景任務 %s 已停止: %s", name, error)
+                background_tasks[name] = asyncio.create_task(factory(), name=name)
         logger.info("機器人已啟動: %s（伺服器數 %s）", bot.user, len(bot.guilds))

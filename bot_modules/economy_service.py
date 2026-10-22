@@ -38,9 +38,11 @@ def credit_user(
     if amount <= 0:
         return
     with db_cursor(commit=True, connect=get_db_connection) as c:
-        c.execute("SELECT user_id FROM users WHERE user_id=%s FOR UPDATE", (str(user_id),))
-        c.fetchone()
-        c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (amount, str(user_id)))
+        c.execute(
+            "INSERT INTO users (user_id, balance) VALUES (%s, %s) "
+            "ON DUPLICATE KEY UPDATE balance=COALESCE(balance,0)+%s",
+            (str(user_id), amount, amount),
+        )
         log_transaction_in_tx(c, user_id, amount, reason)
 
 

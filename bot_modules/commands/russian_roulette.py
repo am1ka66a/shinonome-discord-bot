@@ -1,6 +1,8 @@
 import asyncio
+import logging
 import random
 import typing
+from functools import wraps
 
 import discord
 from discord import app_commands
@@ -32,8 +34,6 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
     interaction_defer_if_needed = ctx["interaction_defer_if_needed"]
     try_deduct_balance_async = ctx["try_deduct_balance_async"]
     credit_balance_with_log_async = ctx["credit_balance_with_log_async"]
-    update_game_result_async = ctx["update_game_result_async"]
-    record_rr_result_async = ctx["record_rr_result_async"]
     fetch_rr_stats_async = ctx["fetch_rr_stats_async"]
     fetch_rr_leaderboard_async = ctx["fetch_rr_leaderboard_async"]
     fetch_rr_rate_leaderboard_async = ctx["fetch_rr_rate_leaderboard_async"]
@@ -41,6 +41,23 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
     delete_rr_match_async = ctx["delete_rr_match_async"]
     fetch_active_rr_matches_async = ctx["fetch_active_rr_matches_async"]
     resolve_slash_target = ctx["resolve_slash_target"]
+
+    def match_action(callback):
+        @wraps(callback)
+        async def guarded(self, *args, **kwargs):
+            m = self.match
+            interaction = args[0] if args else None
+            if interaction is not None:
+                await interaction_defer_if_needed(interaction, thinking=False)
+            async with m.lock:
+                # Ignore queued callbacks from an earlier phase of the match.
+                view = self.view if isinstance(self, discord.ui.Select) else self
+                if m.view is not None and m.view is not view:
+                    if interaction is not None:
+                        await interaction_send(interaction, "畫面已更新，請使用目前的按鈕。", ephemeral=True)
+                    return
+                return await callback(self, *args, **kwargs)
+        return guarded
 
     def _hit_prob_pct(remaining_chambers: int, remaining_bullets: int) -> float:
         if remaining_chambers <= 0 or remaining_bullets <= 0:
@@ -404,12 +421,10 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
             pot = self.pot
             win_stake = self.stake_of(winner_uid)
             lose_stake = self.stake_of(loser_uid)
-            await credit_balance_with_log_async(winner_uid, pot, "俄羅斯輪盤勝利")
-            await update_game_result_async(winner_uid, 0, pot - win_stake, True, share_recovery=False)
-            await update_game_result_async(loser_uid, 0, -lose_stake, False, share_recovery=False)
-            await record_rr_result_async(winner_uid, is_win=True, profit_delta=pot - win_stake)
-            await record_rr_result_async(loser_uid, is_win=False, profit_delta=-lose_stake)
-            await self.clear_persist()
+            await asyncio.to_thread(rr_match_repo.settle_event_sync,
+                match_id=self.match_id, event_key="duel", credits={winner_uid: pot},
+                results={winner_uid: (True, pot - win_stake), loser_uid: (False, -lose_stake)},
+                reason="俄羅斯輪盤勝利", payload=self.to_payload(), finished=True)
 
         async def settle_duel(self, loser_uid: int) -> int:
             winner_uid = self.other_uid_duel(loser_uid)
@@ -433,16 +448,15 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
 
         async def payout_royale(self, loser_uid: int, winner_uid: typing.Optional[int]) -> None:
             lose_stake = self.stake_of(loser_uid)
-            await update_game_result_async(loser_uid, 0, -lose_stake, False, share_recovery=False)
-            await record_rr_result_async(loser_uid, is_win=False, profit_delta=-lose_stake)
-            if winner_uid is None:
-                return
-            pot = self.pot
-            win_stake = self.stake_of(winner_uid)
-            await credit_balance_with_log_async(winner_uid, pot, "俄羅斯輪盤淘汰賽勝利")
-            await update_game_result_async(winner_uid, 0, pot - win_stake, True, share_recovery=False)
-            await record_rr_result_async(winner_uid, is_win=True, profit_delta=pot - win_stake)
-            await self.clear_persist()
+            results = {loser_uid: (False, -lose_stake)}
+            credits = {}
+            if winner_uid is not None:
+                credits[winner_uid] = self.pot
+                results[winner_uid] = (True, self.pot - self.stake_of(winner_uid))
+            await asyncio.to_thread(rr_match_repo.settle_event_sync,
+                match_id=self.match_id, event_key=f"eliminate:{loser_uid}", credits=credits,
+                results=results, reason="俄羅斯輪盤淘汰賽勝利", payload=self.to_payload(),
+                finished=winner_uid is not None)
 
         async def eliminate_royale(self, uid: int, *, timeout: bool = False) -> typing.Optional[int]:
             winner_uid = self.apply_royale_elimination(uid)
@@ -453,11 +467,10 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
             if self.settled:
                 return
             self.settled = True
-            for uid in uids:
-                amt = self.stake_of(uid)
-                if amt > 0:
-                    await credit_balance_with_log_async(uid, amt, reason)
-            await self.clear_persist()
+            credits = {uid: self.stake_of(uid) for uid in uids if self.stake_of(uid) > 0}
+            await asyncio.to_thread(rr_match_repo.settle_event_sync,
+                match_id=self.match_id, event_key="refund", credits=credits, results={},
+                reason=reason, payload=self.to_payload(), finished=True)
 
     async def _finish_turn_timeout(view: discord.ui.View, *, reason: str) -> None:
         m: RrMatch = view.match  # type: ignore[attr-defined]
@@ -547,21 +560,20 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
                 max_values=1,
             )
 
+        @match_action
         async def callback(self, interaction: discord.Interaction):
             m = self.match
             view: RrInviteView = self.view  # type: ignore[assignment]
             if interaction.user.id != m.opponent_id:
-                return await interaction.response.send_message("這場對決不是邀請你的。", ephemeral=True)
+                return await interaction_send(interaction, "這場對決不是邀請你的。", ephemeral=True)
             if view.resolved or m.settled:
-                return await interaction.response.defer()
+                return await interaction_defer_if_needed(interaction, thinking=False)
             view.resolved = True
             reason = self.values[0]
-            await credit_balance_with_log_async(m.challenger_id, m.bet_base, "俄羅斯輪盤取消退款")
-            m.settled = True
-            await m.clear_persist()
+            await m.refund_participants("俄羅斯輪盤取消退款", [m.challenger_id])
             for child in view.children:
                 child.disabled = True
-            await interaction.response.edit_message(
+            await interaction.edit_original_response(
                 content=(
                     f"❌ <@{m.opponent_id}> 拒絕了 <@{m.challenger_id}> 的對決。"
                     f"理由：**{reason}**\n"
@@ -592,27 +604,32 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
             self.accepted: typing.Set[int] = set()
             self.message: typing.Optional[discord.Message] = None
             self.finished_match = match
+            self._callback_lock = asyncio.Lock()
+            self.started = False
             if match is not None:
                 self.add_item(RrHistoryButton(match))
 
         async def _try_start(self, interaction: discord.Interaction) -> None:
+            if self.started:
+                return await interaction_send(interaction, "重賽已經開始。", ephemeral=True)
             if self.accepted != {self.uid_a, self.uid_b}:
-                await interaction.response.send_message(
+                await interaction_send(interaction,
                     f"重賽確認：`{len(self.accepted)}/2`（需雙方都按 🔁 重賽）",
                     ephemeral=True,
                 )
                 return
             busy = rr_match_repo.any_user_busy([self.uid_a, self.uid_b])
             if busy:
-                return await interaction.response.send_message(_busy_msg(busy), ephemeral=True)
+                return await interaction_send(interaction, _busy_msg(busy), ephemeral=True)
             guild = interaction.guild or bot.get_guild(self.guild_id)
             if not guild:
-                return await interaction.response.send_message("無法取得伺服器。", ephemeral=True)
+                return await interaction_send(interaction, "無法取得伺服器。", ephemeral=True)
             if not await try_deduct_balance_async(self.uid_a, self.bet, "俄羅斯輪盤重賽下注"):
-                return await interaction.response.send_message("發起方餘額不足，重賽取消。", ephemeral=True)
+                return await interaction_send(interaction, "發起方餘額不足，重賽取消。", ephemeral=True)
             if not await try_deduct_balance_async(self.uid_b, self.bet, "俄羅斯輪盤重賽下注"):
                 await credit_balance_with_log_async(self.uid_a, self.bet, "俄羅斯輪盤重賽退款")
-                return await interaction.response.send_message("對手餘額不足，重賽取消。", ephemeral=True)
+                return await interaction_send(interaction, "對手餘額不足，重賽取消。", ephemeral=True)
+            self.started = True
             match_id = rr_match_repo.new_match_id()
             match = RrMatch(
                 match_id=match_id,
@@ -631,7 +648,7 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
             match.view = play_view
             for child in self.children:
                 child.disabled = True
-            await interaction.response.edit_message(
+            await interaction.edit_original_response(
                 content=f"🔁 重賽開始！各 `{self.bet:,}` 東雲幣",
                 embed=match.build_embed(),
                 view=play_view,
@@ -647,8 +664,10 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
         async def rematch(self, interaction: discord.Interaction, button: discord.ui.Button):
             if interaction.user.id not in (self.uid_a, self.uid_b):
                 return await interaction.response.send_message("這場重賽與你無關。", ephemeral=True)
-            self.accepted.add(interaction.user.id)
-            await self._try_start(interaction)
+            await interaction_defer_if_needed(interaction, thinking=False)
+            async with self._callback_lock:
+                self.accepted.add(interaction.user.id)
+                await self._try_start(interaction)
 
         async def on_timeout(self):
             # 重賽逾時後只留下歷程按鈕，讓大家還能回顧這場
@@ -673,14 +692,15 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
             self.add_item(DeclineReasonSelect(match))
 
         @discord.ui.button(label="接受", style=discord.ButtonStyle.success)
+        @match_action
         async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
             m = self.match
             if interaction.user.id != m.opponent_id:
-                return await interaction.response.send_message("這場對決不是邀請你的。", ephemeral=True)
+                return await interaction_send(interaction, "這場對決不是邀請你的。", ephemeral=True)
             if self.resolved or m.settled:
-                return await interaction.response.defer()
+                return await interaction_defer_if_needed(interaction, thinking=False)
             if not await try_deduct_balance_async(m.opponent_id, m.bet_base, "俄羅斯輪盤下注"):
-                return await interaction.response.send_message(
+                return await interaction_send(interaction,
                     f"❌ 餘額不足，需要 `{m.bet_base:,}` 東雲幣才能接受。",
                     ephemeral=True,
                 )
@@ -692,7 +712,7 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
                 child.disabled = True
             play_view = RrShootView(m)
             m.view = play_view
-            await interaction.response.edit_message(
+            await interaction.edit_original_response(
                 content=None,
                 embed=m.build_embed(interaction),
                 view=play_view,
@@ -705,19 +725,20 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
             self.stop()
 
         @discord.ui.button(label="↩️ 撤回", style=discord.ButtonStyle.secondary)
+        @match_action
         async def withdraw(self, interaction: discord.Interaction, button: discord.ui.Button):
             m = self.match
             if interaction.user.id != m.challenger_id:
-                return await interaction.response.send_message(
+                return await interaction_send(interaction,
                     "只有發起人可以撤回這場邀請。",
                     ephemeral=True,
                 )
             if self.resolved or m.settled:
-                return await interaction.response.defer()
+                return await interaction_defer_if_needed(interaction, thinking=False)
             self.resolved = True
             for child in self.children:
                 child.disabled = True
-            await interaction.response.edit_message(
+            await interaction.edit_original_response(
                 content=(
                     f"↩️ <@{m.challenger_id}> 撤回了對 <@{m.opponent_id}> 的對決邀請，"
                     f"已退回 `{m.bet_base:,}` 東雲幣。"
@@ -728,6 +749,7 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
             await m.refund_participants("俄羅斯輪盤邀請撤回退款", [m.challenger_id])
             self.stop()
 
+        @match_action
         async def on_timeout(self):
             m = self.match
             if self.resolved or m.settled:
@@ -899,19 +921,19 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
             m = self.match
             winner_uid = m.other_uid_duel(loser_uid)
             owns_payout = m.mark_settled()
+            if owns_payout:
+                await m.payout_duel(loser_uid, winner_uid)
             rematch_view = RrRematchView(
                 m.guild_id, m.channel_id, m.participant_ids[0], m.participant_ids[1], m.bet_base, match=m
             )
             rematch_view.message = m.message
             for child in self.children:
                 child.disabled = True
-            await interaction.response.edit_message(
+            await interaction.edit_original_response(
                 embed=m.build_embed(finished=True, loser_uid=loser_uid, timeout_loss=timeout),
                 view=rematch_view,
             )
             self.stop()
-            if owns_payout:
-                await m.payout_duel(loser_uid, winner_uid)
 
         async def _finish_royale_hit(self, interaction: discord.Interaction, loser_uid: int):
             m = self.match
@@ -920,28 +942,27 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
             for child in self.children:
                 child.disabled = True
             if winner_uid:
-                await interaction.response.edit_message(
+                await m.payout_royale(loser_uid, winner_uid)
+                await interaction.edit_original_response(
                     embed=m.build_embed(finished=True, loser_uid=loser_uid, winner_uid=winner_uid),
                     view=RrHistoryView(m),
                 )
                 self.stop()
-                await m.payout_royale(loser_uid, winner_uid)
                 return
             m.trigger_index += 1
+            await m.payout_royale(loser_uid, None)
             play_view = RrShootView(m)
             m.view = play_view
-            await interaction.response.edit_message(embed=m.build_embed(interaction), view=play_view)
+            await interaction.edit_original_response(embed=m.build_embed(interaction), view=play_view)
             self.stop()
-            await m.persist("playing")
-            await m.payout_royale(loser_uid, None)
 
         async def _fire(self, interaction: discord.Interaction) -> None:
             m = self.match
             if m.settled:
-                await interaction.response.send_message("對決已結束。", ephemeral=True)
+                await interaction_send(interaction, "對決已結束。", ephemeral=True)
                 return
             if interaction.user.id != m.turn_uid:
-                return await interaction.response.send_message(
+                return await interaction_send(interaction,
                     f"現在輪到 <@{m.turn_uid}>。",
                     ephemeral=True,
                 )
@@ -959,7 +980,7 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
             m.trigger_index += 1
             choice_view = RrChoiceView(m)
             m.view = choice_view
-            await interaction.response.edit_message(
+            await interaction.edit_original_response(
                 embed=m.build_embed(interaction, awaiting_choice=True),
                 view=choice_view,
             )
@@ -967,9 +988,11 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
             self.stop()
 
         @discord.ui.button(label="🔫 扣扳機", style=discord.ButtonStyle.danger)
+        @match_action
         async def pull_trigger(self, interaction: discord.Interaction, button: discord.ui.Button):
             await self._fire(interaction)
 
+        @match_action
         async def on_timeout(self):
             await _finish_turn_timeout(self, reason="逾時未扣扳機")
 
@@ -980,12 +1003,13 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
             self.add_item(RrHistoryButton(match))
 
         @discord.ui.button(label="🔫 繼續射", style=discord.ButtonStyle.danger)
+        @match_action
         async def continue_shoot(self, interaction: discord.Interaction, button: discord.ui.Button):
             m = self.match
             if m.settled:
-                return await interaction.response.send_message("對決已結束。", ephemeral=True)
+                return await interaction_send(interaction, "對決已結束。", ephemeral=True)
             if interaction.user.id != m.turn_uid:
-                return await interaction.response.send_message(
+                return await interaction_send(interaction,
                     f"請由 <@{m.turn_uid}> 決定。",
                     ephemeral=True,
                 )
@@ -995,17 +1019,18 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
             await shoot_view._fire(interaction)
 
         @discord.ui.button(label="💰 加注繼續", style=discord.ButtonStyle.primary)
+        @match_action
         async def double_down(self, interaction: discord.Interaction, button: discord.ui.Button):
             m = self.match
             if m.settled:
-                return await interaction.response.send_message("對決已結束。", ephemeral=True)
+                return await interaction_send(interaction, "對決已結束。", ephemeral=True)
             if interaction.user.id != m.turn_uid:
-                return await interaction.response.send_message(
+                return await interaction_send(interaction,
                     f"請由 <@{m.turn_uid}> 決定。",
                     ephemeral=True,
                 )
             if not await try_deduct_balance_async(interaction.user.id, m.bet_base, "俄羅斯輪盤加注"):
-                return await interaction.response.send_message(
+                return await interaction_send(interaction,
                     f"❌ 餘額不足，加注需要 `{m.bet_base:,}` 東雲幣。",
                     ephemeral=True,
                 )
@@ -1018,12 +1043,13 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
             await shoot_view._fire(interaction)
 
         @discord.ui.button(label="🛑 停手換人", style=discord.ButtonStyle.secondary)
+        @match_action
         async def pass_turn(self, interaction: discord.Interaction, button: discord.ui.Button):
             m = self.match
             if m.settled:
-                return await interaction.response.send_message("對決已結束。", ephemeral=True)
+                return await interaction_send(interaction, "對決已結束。", ephemeral=True)
             if interaction.user.id != m.turn_uid:
-                return await interaction.response.send_message(
+                return await interaction_send(interaction,
                     f"請由 <@{m.turn_uid}> 決定。",
                     ephemeral=True,
                 )
@@ -1034,10 +1060,11 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
                 m.turn_uid = m.next_alive_uid(m.turn_uid)
             shoot_view = RrShootView(m)
             m.view = shoot_view
-            await interaction.response.edit_message(embed=m.build_embed(interaction), view=shoot_view)
+            await interaction.edit_original_response(embed=m.build_embed(interaction), view=shoot_view)
             await m.persist("playing")
             self.stop()
 
+        @match_action
         async def on_timeout(self):
             await _finish_turn_timeout(self, reason="逾時未選擇（視同落敗）")
 
@@ -1287,17 +1314,26 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
         except Exception:
             await match.refund_participants("俄羅斯輪盤恢復失敗退款", match.participant_ids)
 
+    recovery_lock = asyncio.Lock()
+    recovered_matches = set()
+
     @bot.listen("on_ready")
     async def _recover_rr_matches_on_ready():
-        if getattr(bot, "_rr_recovered", False):
-            return
-        bot._rr_recovered = True
-        try:
-            records = await fetch_active_rr_matches_async()
-            for record in records:
-                await _recover_one(record)
-        except Exception:
-            pass
+        async with recovery_lock:
+            if getattr(bot, "_rr_recovered", False):
+                return
+            ready = getattr(bot, "_db_ready_event", None)
+            if ready is not None:
+                await ready.wait()
+            try:
+                records = await fetch_active_rr_matches_async()
+                for record in records:
+                    if record['match_id'] not in recovered_matches:
+                        await _recover_one(record)
+                        recovered_matches.add(record['match_id'])
+                bot._rr_recovered = True
+            except Exception:
+                logging.getLogger("shinonome_bot").exception("輪盤恢復失敗，保留存檔供下次連線重試")
 
 
 __all__ = ["register_russian_roulette_commands"]

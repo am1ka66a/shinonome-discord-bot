@@ -479,29 +479,10 @@ def claim_daily_reward(user_id, daily_reward: int = 100_000):
 
 
 def claim_hourly_reward(user_id, reward_per_slot: int = 1000):
-    ensure_user_exists(user_id, 50000)
-    bank_info = refresh_hourly_bank(user_id)
-    if not bank_info:
-        return {"ok": False}
-
-    level_num = int(bank_info["level"])
-    bank = int(bank_info["bank"])
-    if bank <= 0:
-        sec = int(bank_info["next_in_seconds"])
-        mins = max(1, int(sec // 60))
-        return {"ok": True, "claimed": False, "level": level_num, "mins": mins}
-
-    payout = payout_hourly_bank(user_id, bank, reward_per_slot)
-    stats = get_user_stats(user_id)
-    return {
-        "ok": True,
-        "claimed": True,
-        "level": level_num,
-        "bank": bank,
-        "reward_per_slot": reward_per_slot,
-        "payout": int(payout),
-        "balance": int((stats[0] if stats else 0) or 0),
-    }
+    return economy_repo.claim_hourly_reward(
+        ensure_user_exists, get_db_connection, now_tw_naive, log_transaction_in_tx,
+        MAX_LEVEL, user_id, reward_per_slot,
+    )
 
 
 def purge_old_logs_sync(retention_days: int) -> int:

@@ -5,9 +5,11 @@ import time
 import typing
 
 import discord
+from bot_modules.runtime.locks import KeyedLocks
 
 
 def register_events(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Dict[str, typing.Callable[..., typing.Any]]:
+    activity_locks = KeyedLocks()
     logger = ctx["logger"]
     now_tw_naive = ctx["now_tw_naive"]
     db_to_thread = ctx["db_to_thread"]
@@ -202,39 +204,40 @@ def register_events(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Dict[str, 
             if not message.guild:
                 return
 
-            user_id = str(message.author.id)
-            now = now_tw_naive()
-            now_ts = time.time()
+            async with activity_locks.hold(message.author.id):
+                user_id = str(message.author.id)
+                now = now_tw_naive()
+                now_ts = time.time()
 
-            pending_msg_counts[user_id] = pending_msg_counts.get(user_id, 0) + 1
-            pending = pending_msg_counts[user_id]
-            last_flush = last_msg_flush_ts.get(user_id, 0.0)
-            should_flush = pending >= msg_db_flush_count or (now_ts - last_flush) >= msg_db_flush_every_seconds
+                pending_msg_counts[user_id] = pending_msg_counts.get(user_id, 0) + 1
+                pending = pending_msg_counts[user_id]
+                last_flush = last_msg_flush_ts.get(user_id, 0.0)
+                should_flush = pending >= msg_db_flush_count or (now_ts - last_flush) >= msg_db_flush_every_seconds
 
-            last_exp_ts = last_exp_award_ts.get(user_id, 0.0)
-            exp_due = (now_ts - last_exp_ts) >= exp_cooldown_seconds
-            if not should_flush and not exp_due:
-                return
+                last_exp_ts = last_exp_award_ts.get(user_id, 0.0)
+                exp_due = (now_ts - last_exp_ts) >= exp_cooldown_seconds
+                if not should_flush and not exp_due:
+                    return
 
-            exp_gain = random.randint(12, 20) * chat_exp_multiplier if exp_due else 0
-            result = await db_to_thread(
-                process_on_message_activity_sync,
-                user_id,
-                pending,
-                now,
-                exp_due,
-                exp_gain,
-            )
-            pending_msg_counts[user_id] = 0
-            last_msg_flush_ts[user_id] = now_ts
-            if result.get("exp_awarded"):
-                last_exp_award_ts[user_id] = now_ts
-                o = int(result.get("old_level") or 1)
-                n = int(result.get("new_level") or 1)
-                if n > o and any(o < m <= n for m in level_mile_tiers):
-                    asyncio.create_task(
-                        process_level_ups(message.author, o, n, guild_id=message.guild.id)
-                    )
+                exp_gain = random.randint(12, 20) * chat_exp_multiplier if exp_due else 0
+                result = await db_to_thread(
+                    process_on_message_activity_sync,
+                    user_id,
+                    pending,
+                    now,
+                    exp_due,
+                    exp_gain,
+                )
+                pending_msg_counts[user_id] = 0
+                last_msg_flush_ts[user_id] = now_ts
+                if result.get("exp_awarded"):
+                    last_exp_award_ts[user_id] = now_ts
+                    o = int(result.get("old_level") or 1)
+                    n = int(result.get("new_level") or 1)
+                    if n > o and any(o < m <= n for m in level_mile_tiers):
+                        asyncio.create_task(
+                            process_level_ups(message.author, o, n, guild_id=message.guild.id)
+                        )
         except Exception as e:
             logger.exception("on_message 錯誤: %s", e)
         finally:

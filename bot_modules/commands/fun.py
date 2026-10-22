@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import random
 import typing
@@ -6,6 +7,7 @@ import discord
 from discord import app_commands
 
 from bot_modules.db import db_cursor
+from bot_modules.discord_helpers import interaction_defer_if_needed, interaction_send
 
 
 def register_fun_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
@@ -223,6 +225,7 @@ def register_fun_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
 
     @bot.tree.command(name="bicycle", description="嘗試偷走奈音的腳踏車")
     async def bicycle_slash(interaction: discord.Interaction):
+        await interaction_defer_if_needed(interaction)
         thief_id = str(interaction.user.id)
         target_id = "1027248561177509919"
         steal_amount = 100
@@ -233,48 +236,52 @@ def register_fun_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         # DB 工作全部在 with 內完成，回覆 Discord 的 await 一律等連線歸還後才做
         cooldown_ts: typing.Optional[int] = None
         outcome = ""
-        with db_cursor(commit=True, connect=get_db_connection) as c:
-            lock_user_rows(c, [thief_id, target_id])
-            c.execute("SELECT last_bicycle FROM users WHERE user_id=%s", (thief_id,))
-            row = c.fetchone()
-            last_bicycle = row[0] if row else None
-            if last_bicycle and (now - last_bicycle).total_seconds() < BICYCLE_COOLDOWN_SECONDS:
-                remain = BICYCLE_COOLDOWN_SECONDS - int((now - last_bicycle).total_seconds())
-                cooldown_ts = int((now + datetime.timedelta(seconds=remain)).replace(tzinfo=TW_TZ).timestamp())
-            elif random.random() >= 0.99:
-                c.execute("UPDATE users SET last_bicycle=%s WHERE user_id=%s", (now, thief_id))
-                outcome = "小黑龜再練練 連個腳踏車都偷不走"
-            else:
-                c.execute(
-                    "UPDATE users SET balance=balance-%s WHERE user_id=%s AND balance >= %s",
-                    (steal_amount, target_id, steal_amount),
-                )
-                if c.rowcount > 0:
-                    c.execute(
-                        "UPDATE users SET balance=balance+%s WHERE user_id=%s",
-                        (steal_amount, thief_id),
-                    )
+        def db_work(cooldown_ts=cooldown_ts, outcome=outcome):
+            with db_cursor(commit=True, connect=get_db_connection) as c:
+                lock_user_rows(c, [thief_id, target_id])
+                c.execute("SELECT last_bicycle FROM users WHERE user_id=%s", (thief_id,))
+                row = c.fetchone()
+                last_bicycle = row[0] if row else None
+                if last_bicycle and (now - last_bicycle).total_seconds() < BICYCLE_COOLDOWN_SECONDS:
+                    remain = BICYCLE_COOLDOWN_SECONDS - int((now - last_bicycle).total_seconds())
+                    cooldown_ts = int((now + datetime.timedelta(seconds=remain)).replace(tzinfo=TW_TZ).timestamp())
+                elif random.random() >= 0.99:
                     c.execute("UPDATE users SET last_bicycle=%s WHERE user_id=%s", (now, thief_id))
-                    log_transaction_in_tx(c, target_id, -steal_amount, f"腳踏車被偷（偷車者:{thief_id}）")
-                    log_transaction_in_tx(c, thief_id, steal_amount, f"偷走奈音腳踏車（目標:{target_id}）")
-                    outcome = "你成功偷走了奈音的腳踏車!"
+                    outcome = "小黑龜再練練 連個腳踏車都偷不走"
                 else:
-                    c.execute("UPDATE users SET last_bicycle=%s WHERE user_id=%s", (now, thief_id))
-                    outcome = "奈音身上沒錢了! 沒有腳踏車能偷!"
+                    c.execute(
+                        "UPDATE users SET balance=balance-%s WHERE user_id=%s AND balance >= %s",
+                        (steal_amount, target_id, steal_amount),
+                    )
+                    if c.rowcount > 0:
+                        c.execute(
+                            "UPDATE users SET balance=balance+%s WHERE user_id=%s",
+                            (steal_amount, thief_id),
+                        )
+                        c.execute("UPDATE users SET last_bicycle=%s WHERE user_id=%s", (now, thief_id))
+                        log_transaction_in_tx(c, target_id, -steal_amount, f"腳踏車被偷（偷車者:{thief_id}）")
+                        log_transaction_in_tx(c, thief_id, steal_amount, f"偷走奈音腳踏車（目標:{target_id}）")
+                        outcome = "你成功偷走了奈音的腳踏車!"
+                    else:
+                        c.execute("UPDATE users SET last_bicycle=%s WHERE user_id=%s", (now, thief_id))
+                        outcome = "奈音身上沒錢了! 沒有腳踏車能偷!"
+            return (cooldown_ts, outcome,)
+        cooldown_ts, outcome, = await asyncio.to_thread(db_work)
 
         if cooldown_ts is not None:
-            return await interaction.response.send_message(
+            return await interaction_send(interaction,
                 f"⏳ /bicycle 冷卻中，請於 <t:{cooldown_ts}:R> 再試。",
                 ephemeral=True,
             )
-        return await interaction.response.send_message(outcome)
+        return await interaction_send(interaction, outcome)
 
     @bot.tree.command(name="say", description="[管理員] 指定機器人對特定頻道發送內容")
     @app_commands.describe(text="你要機器人說什麼？", channel="指定發送到哪個頻道？(選填)")
     @app_commands.default_permissions(manage_messages=True)
     async def say_slash(interaction: discord.Interaction, text: str, channel: discord.TextChannel = None):
+        await interaction_defer_if_needed(interaction)
         if interaction.user.id not in ALLOWED_HOST_IDS:
-            return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
+            return await interaction_send(interaction, "❌ 你沒有權限使用此指令！", ephemeral=True)
         target_channel = channel or interaction.channel
         await target_channel.send(text)
-        await interaction.response.send_message(f"✅ 訊息已發送到 {target_channel.mention}！", ephemeral=True)
+        await interaction_send(interaction, f"✅ 訊息已發送到 {target_channel.mention}！", ephemeral=True)

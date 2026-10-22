@@ -1,3 +1,4 @@
+import asyncio
 import os
 import typing
 
@@ -62,7 +63,7 @@ async def process_level_ups(
     flavor_paras: typing.List[str] = []
     for m in crossed:
         coin_amt = LEVEL_MILESTONE_COINS.get(m, 0)
-        got = try_claim_milestone(member.id, m, coin_amt)
+        got = await asyncio.to_thread(try_claim_milestone, member.id, m, coin_amt)
         if got >= 0:
             fl = LEVEL_MILESTONE_FLAVOR.get(m)
             if fl:

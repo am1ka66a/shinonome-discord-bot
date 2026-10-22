@@ -30,8 +30,12 @@ def award_vc_rewards_sync(
         return 0
     awarded: typing.List[str] = []
     with db_cursor(commit=True, connect=get_db_connection) as c:
-        for user_id in user_ids:
-            c.execute("SELECT last_vc_reward FROM activity_stats WHERE user_id=%s", (user_id,))
+        for user_id in sorted(set(user_ids)):
+            c.execute(
+                "INSERT INTO activity_stats (user_id) VALUES (%s) "
+                "ON DUPLICATE KEY UPDATE user_id=user_id", (user_id,),
+            )
+            c.execute("SELECT last_vc_reward FROM activity_stats WHERE user_id=%s FOR UPDATE", (user_id,))
             row = c.fetchone()
             if row and row[0] is not None and (now - row[0]).total_seconds() < 1800:
                 continue

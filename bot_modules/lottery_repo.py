@@ -64,6 +64,18 @@ def finalize_due_rounds_sync(now: typing.Optional[datetime.datetime] = None) -> 
                 continue
             if _day_sort_key(key_str) >= current_sort:
                 continue
+            # Other commands and the background worker can finalize the same day.
+            # A locking read sees the latest committed state even under REPEATABLE READ.
+            c.execute(
+                "SELECT pool_amount, ticket_count, winner_id, drawn_at "
+                "FROM lottery_rounds WHERE week_key=%s FOR UPDATE",
+                (key_str,),
+            )
+            current = c.fetchone()
+            if not current or current[2] or current[3]:
+                conn.commit()
+                continue
+            pool_amount, ticket_count = current[:2]
             tickets_total = int(ticket_count or 0)
             pool = int(pool_amount or 0)
             winner_uid = None
@@ -73,11 +85,15 @@ def finalize_due_rounds_sync(now: typing.Optional[datetime.datetime] = None) -> 
                     (key_str,),
                 )
                 entries = c.fetchall() or []
-                weighted: typing.List[str] = []
-                for uid, tix in entries:
-                    weighted.extend([str(uid)] * max(1, int(tix or 0)))
-                if weighted:
-                    winner_uid = random.choice(weighted)
+                weights = [max(0, int(tix or 0)) for _, tix in entries]
+                if sum(weights):
+                    # Keep memory proportional to entrants, not total tickets.
+                    ticket = random.randrange(sum(weights))
+                    for (uid, _), weight in zip(entries, weights):
+                        ticket -= weight
+                        if ticket < 0:
+                            winner_uid = str(uid)
+                            break
                     c.execute("SELECT user_id FROM users WHERE user_id=%s FOR UPDATE", (winner_uid,))
                     if c.fetchone():
                         c.execute(
@@ -119,14 +135,7 @@ def buy_lottery_tickets_sync(
 
     with db_conn() as conn:
         c = conn.cursor()
-        c.execute("SELECT balance FROM users WHERE user_id=%s FOR UPDATE", (uid,))
-        row = c.fetchone()
-        if not row:
-            return {"ok": False, "reason": "not_found"}
-        balance = int(row[0] or 0)
-        if balance < cost:
-            return {"ok": False, "reason": "insufficient", "balance": balance, "cost": cost}
-
+        # Match finalization's lock order: round first, then user.
         c.execute(
             "INSERT INTO lottery_rounds (week_key, pool_amount, ticket_count) VALUES (%s, 0, 0) "
             "ON DUPLICATE KEY UPDATE week_key=week_key",
@@ -139,6 +148,14 @@ def buy_lottery_tickets_sync(
         round_row = c.fetchone()
         if round_row and round_row[0]:
             return {"ok": False, "reason": "round_closed", "day_key": day_key}
+
+        c.execute("SELECT balance FROM users WHERE user_id=%s FOR UPDATE", (uid,))
+        row = c.fetchone()
+        if not row:
+            return {"ok": False, "reason": "not_found"}
+        balance = int(row[0] or 0)
+        if balance < cost:
+            return {"ok": False, "reason": "insufficient", "balance": balance, "cost": cost}
 
         c.execute("UPDATE users SET balance=balance-%s WHERE user_id=%s", (cost, uid))
         log_transaction_in_tx(c, uid, -cost, f"日彩池購票（{day_key} x{tickets}）")

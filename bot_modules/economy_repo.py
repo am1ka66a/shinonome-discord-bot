@@ -3,6 +3,7 @@ import random
 import typing
 
 from bot_modules.db import db_conn, db_cursor
+from bot_modules.economy_service import credit_user
 
 
 def try_deduct_balance(get_db_connection, get_locked_user_balance, log_transaction_in_tx, user_id, amount, reason):
@@ -23,16 +24,7 @@ def try_deduct_balance(get_db_connection, get_locked_user_balance, log_transacti
 
 
 def credit_balance_with_log(get_db_connection, log_transaction_in_tx, user_id, amount, reason):
-    if amount <= 0:
-        return
-    with db_cursor(commit=True, connect=get_db_connection) as c:
-        c.execute("SELECT user_id FROM users WHERE user_id=%s FOR UPDATE", (str(user_id),))
-        c.fetchone()
-        c.execute(
-            "UPDATE users SET balance=balance+%s WHERE user_id=%s",
-            (amount, str(user_id)),
-        )
-        log_transaction_in_tx(c, user_id, amount, reason)
+    return credit_user(get_db_connection, log_transaction_in_tx, user_id, amount, reason)
 
 
 def claim_beg_sync(
@@ -44,6 +36,7 @@ def claim_beg_sync(
     user_id: int,
 ) -> typing.Dict[str, typing.Any]:
     ensure_user_exists(user_id, 50000)
+    inflation_mult, _, _ = get_inflation_multiplier_func()
     with db_conn(get_db_connection) as conn:
         c = conn.cursor()
         c.execute("SELECT balance, last_beg FROM users WHERE user_id=%s FOR UPDATE", (str(user_id),))
@@ -52,7 +45,6 @@ def claim_beg_sync(
         if row and row[1] and (now - row[1]).total_seconds() < 120:
             remain = 120 - int((now - row[1]).total_seconds())
             return {"ok": False, "reason": "cooldown", "remain_sec": max(1, remain)}
-        inflation_mult, _, _ = get_inflation_multiplier_func()
         base_earn = random.randint(100, 600)
         earn = max(50, int(base_earn * inflation_mult))
         fail = random.random() < 0.3
@@ -75,9 +67,10 @@ def claim_rescue_sync(
     user_id: int,
 ) -> typing.Dict[str, typing.Any]:
     ensure_user_exists(user_id, 50000)
+    inflation_mult, _, _ = get_inflation_multiplier_func()
     with db_conn(get_db_connection) as conn:
         c = conn.cursor()
-        c.execute("SELECT balance, last_rescue, rescue_count FROM users WHERE user_id=%s", (str(user_id),))
+        c.execute("SELECT balance, last_rescue, rescue_count FROM users WHERE user_id=%s FOR UPDATE", (str(user_id),))
         row = c.fetchone()
         if not row:
             return {"ok": False, "reason": "not_found"}
@@ -91,7 +84,6 @@ def claim_rescue_sync(
         if row[1] and (now - row[1]).total_seconds() < 3600:
             rem = 3600 - (now - row[1]).total_seconds()
             return {"ok": False, "reason": "cooldown", "remain_sec": max(1, int(rem))}
-        inflation_mult, _, _ = get_inflation_multiplier_func()
         rescue_reward = max(500, min(50000, int(1000 * inflation_mult)))
         c.execute(
             "UPDATE users SET balance=balance+%s, last_rescue=%s, rescue_count=rescue_count+1 WHERE user_id=%s",
@@ -136,6 +128,38 @@ def payout_hourly_bank(get_db_connection, log_transaction_in_tx, user_id, bank, 
         c.execute("UPDATE users SET balance=balance+%s, hourly_bank=0 WHERE user_id=%s", (payout, str(user_id)))
         log_transaction_in_tx(c, user_id, payout, "每小時簽到")
     return payout
+
+
+def claim_hourly_reward(ensure_user_exists, get_db_connection, now_tw_naive_func,
+                       log_transaction_in_tx, max_level, user_id, reward_per_slot=1000):
+    """Accumulate and consume hourly slots under the same user row lock."""
+    ensure_user_exists(user_id, 50000)
+    now = now_tw_naive_func()
+    uid = str(user_id)
+    with db_cursor(commit=True, connect=get_db_connection) as c:
+        c.execute("SELECT level, last_hourly_claim, hourly_bank FROM users WHERE user_id=%s FOR UPDATE", (uid,))
+        row = c.fetchone()
+        if not row:
+            return {"ok": False}
+        level = max(1, min(int(max_level), int(row[0] or 1)))
+        last_claim = row[1] or now
+        bank = max(0, int(row[2] or 0))
+        elapsed = max(0, int((now - last_claim).total_seconds() // 3600))
+        bank = min(level, bank + elapsed)
+        last_claim += datetime.timedelta(hours=elapsed)
+        payout = bank * int(reward_per_slot)
+        c.execute(
+            "UPDATE users SET last_hourly_claim=%s, hourly_bank=0, balance=balance+%s WHERE user_id=%s",
+            (last_claim, payout, uid),
+        )
+        if not bank:
+            seconds = max(0, 3600 - int((now - last_claim).total_seconds()))
+            return {"ok": True, "claimed": False, "level": level, "mins": max(1, (seconds + 59) // 60)}
+        log_transaction_in_tx(c, uid, payout, "每小時簽到")
+        c.execute("SELECT balance FROM users WHERE user_id=%s", (uid,))
+        balance = int((c.fetchone() or [0])[0] or 0)
+        return {"ok": True, "claimed": True, "level": level, "bank": bank,
+                "reward_per_slot": reward_per_slot, "payout": payout, "balance": balance}
 
 
 def claim_daily_reward(

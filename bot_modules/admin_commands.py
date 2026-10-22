@@ -8,6 +8,8 @@ from discord import app_commands
 
 from bot_modules import milestone_guild_repo
 from bot_modules.db import db_cursor
+from bot_modules.tx_ops import log_transaction_in_tx
+from bot_modules.discord_helpers import interaction_defer_if_needed, interaction_send
 
 
 def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.Any]) -> None:
@@ -60,7 +62,7 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
             chunks.append("\n".join(buf))
         return chunks
 
-    def admin_give_balance_sync(target_user_id: typing.Union[int, str], amount: int) -> typing.Tuple[int, int]:
+    def admin_give_balance_sync(target_user_id: typing.Union[int, str], amount: int, reason: str) -> typing.Tuple[int, int]:
         uid = str(target_user_id)
         with db_cursor(commit=True, connect=get_db_connection) as c:
             c.execute("SELECT COALESCE(balance,0) FROM users WHERE user_id=%s FOR UPDATE", (uid,))
@@ -70,9 +72,10 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
             c.execute("SELECT COALESCE(balance,0) FROM users WHERE user_id=%s", (uid,))
             row2 = c.fetchone()
             after_bal = int((row2[0] if row2 else before_bal + int(amount)) or 0)
+            log_transaction_in_tx(c, uid, after_bal - before_bal, reason)
         return before_bal, after_bal
 
-    def admin_take_balance_sync(target_user_id: typing.Union[int, str], amount: int) -> typing.Tuple[int, int]:
+    def admin_take_balance_sync(target_user_id: typing.Union[int, str], amount: int, reason: str) -> typing.Tuple[int, int]:
         uid = str(target_user_id)
         with db_cursor(commit=True, connect=get_db_connection) as c:
             c.execute("SELECT COALESCE(balance,0) FROM users WHERE user_id=%s FOR UPDATE", (uid,))
@@ -82,15 +85,17 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
             c.execute("SELECT COALESCE(balance,0) FROM users WHERE user_id=%s", (uid,))
             row2 = c.fetchone()
             after_bal = int((row2[0] if row2 else max(0, before_bal - int(amount))) or 0)
+            log_transaction_in_tx(c, uid, after_bal - before_bal, reason)
         return before_bal, after_bal
 
-    def admin_set_balance_sync(target_user_id: typing.Union[int, str], amount: int) -> int:
+    def admin_set_balance_sync(target_user_id: typing.Union[int, str], amount: int, reason: str) -> int:
         uid = str(target_user_id)
         with db_cursor(commit=True, connect=get_db_connection) as c:
             c.execute("SELECT COALESCE(balance,0) FROM users WHERE user_id=%s FOR UPDATE", (uid,))
             row = c.fetchone()
             before_bal = int((row[0] if row else 0) or 0)
             c.execute("UPDATE users SET balance=%s WHERE user_id=%s", (int(amount), uid))
+            log_transaction_in_tx(c, uid, int(amount) - before_bal, reason)
         return before_bal
 
     def grant_mass_rewards_sync(coins: int, exp: int, note_text: str) -> typing.Dict[str, int]:
@@ -154,15 +159,16 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
         member: typing.Optional[discord.Member] = None,
         user_id: typing.Optional[str] = None,
     ):
+        await interaction_defer_if_needed(interaction)
         if not is_slash_host(interaction):
-            return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
+            return await interaction_send(interaction, "❌ 你沒有權限使用此指令！", ephemeral=True)
         if level < 1 or level > max_level:
-            return await interaction.response.send_message(f"等級需介於 1~{max_level}。", ephemeral=True)
+            return await interaction_send(interaction, f"等級需介於 1~{max_level}。", ephemeral=True)
         m_user, err = await resolve_slash_target(
             interaction, member, user_id, required=True, in_guild_only=False
         )
         if err:
-            return await interaction.response.send_message(err, ephemeral=True)
+            return await interaction_send(interaction, err, ephemeral=True)
         member = m_user
 
         ensure_user_exists(member.id, 0)
@@ -171,8 +177,10 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
         old_level = int(lv_row[1] or 1) if lv_row else 1
         target_exp = exp_required_for_level(level)
 
-        with db_cursor(commit=True, connect=get_db_connection) as c:
-            c.execute("UPDATE users SET level=%s, exp=%s WHERE user_id=%s", (int(level), int(target_exp), str(member.id)))
+        def db_work():
+            with db_cursor(commit=True, connect=get_db_connection) as c:
+                c.execute("UPDATE users SET level=%s, exp=%s WHERE user_id=%s", (int(level), int(target_exp), str(member.id)))
+        await asyncio.to_thread(db_work)
 
         milestone_note = ""
         if level > old_level:
@@ -188,7 +196,7 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
                 else:
                     milestone_note = "\n⚠️ 此伺服器不在里程碑白名單，未觸發。"
 
-        await interaction.response.send_message(
+        await interaction_send(interaction,
             f"✅ 已將 {member.mention} 設定為 **Lv.{level}**\n"
             f"原本：Lv.{old_level} / EXP `{old_exp:,}`\n"
             f"現在：Lv.{level} / EXP `{target_exp:,}`"
@@ -210,30 +218,30 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
         user_id: typing.Optional[str] = None,
         note: str = "",
     ):
+        await interaction_defer_if_needed(interaction, ephemeral=True)
         if not is_slash_host(interaction):
-            return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
+            return await interaction_send(interaction, "❌ 你沒有權限使用此指令！", ephemeral=True)
         if amount <= 0:
-            return await interaction.response.send_message("數量必須大於 0", ephemeral=True)
+            return await interaction_send(interaction, "數量必須大於 0", ephemeral=True)
         m_user, err = await resolve_slash_target(
             interaction, member, user_id, required=True, in_guild_only=False
         )
         if err:
-            return await interaction.response.send_message(err, ephemeral=True)
+            return await interaction_send(interaction, err, ephemeral=True)
         member = m_user
-        ensure_user_exists(member.id, 0)
-        before_bal, after_bal = await asyncio.to_thread(admin_give_balance_sync, member.id, int(amount))
+        await ensure_user_exists_async(member.id, 0)
         note_text = (note or "").strip()
         if len(note_text) > 100:
             note_text = note_text[:100]
         reason = f"管理員發放（備註: {note_text}）" if note_text else "管理員發放"
-        log_transaction(member.id, amount, reason)
+        before_bal, after_bal = await asyncio.to_thread(admin_give_balance_sync, member.id, int(amount), reason)
         embed = discord.Embed(title="✅ 發放成功", color=discord.Color.green())
         embed.add_field(name="對象", value=member.mention, inline=False)
         embed.add_field(name="發放金額", value=f"`{amount:,}` 東雲幣", inline=False)
         embed.add_field(name="餘額變化", value=f"`{before_bal:,}` → `{after_bal:,}`", inline=False)
         embed.add_field(name="備註", value=note_text if note_text else "（無）", inline=False)
         embed.set_footer(text=f"操作人：{interaction.user.display_name}")
-        await interaction.response.send_message(embed=embed)
+        await interaction_send(interaction, embed=embed)
 
     @bot.tree.command(name="take", description="[管理員] 扣除玩家東雲幣")
     @app_commands.default_permissions(administrator=True)
@@ -250,30 +258,30 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
         user_id: typing.Optional[str] = None,
         note: str = "",
     ):
+        await interaction_defer_if_needed(interaction, ephemeral=True)
         if not is_slash_host(interaction):
-            return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
+            return await interaction_send(interaction, "❌ 你沒有權限使用此指令！", ephemeral=True)
         if amount <= 0:
-            return await interaction.response.send_message("數量必須大於 0", ephemeral=True)
+            return await interaction_send(interaction, "數量必須大於 0", ephemeral=True)
         m_user, err = await resolve_slash_target(
             interaction, member, user_id, required=True, in_guild_only=False
         )
         if err:
-            return await interaction.response.send_message(err, ephemeral=True)
+            return await interaction_send(interaction, err, ephemeral=True)
         member = m_user
-        ensure_user_exists(member.id, 0)
-        before_bal, after_bal = await asyncio.to_thread(admin_take_balance_sync, member.id, int(amount))
+        await ensure_user_exists_async(member.id, 0)
         note_text = (note or "").strip()
         if len(note_text) > 100:
             note_text = note_text[:100]
         reason = f"管理員扣除（備註: {note_text}）" if note_text else "管理員扣除"
-        log_transaction(member.id, -amount, reason)
+        before_bal, after_bal = await asyncio.to_thread(admin_take_balance_sync, member.id, int(amount), reason)
         embed = discord.Embed(title="✅ 扣款成功", color=discord.Color.green())
         embed.add_field(name="對象", value=member.mention, inline=False)
-        embed.add_field(name="扣除金額", value=f"`{amount:,}` 東雲幣", inline=False)
+        embed.add_field(name="扣除金額", value=f"`{before_bal - after_bal:,}` 東雲幣", inline=False)
         embed.add_field(name="餘額變化", value=f"`{before_bal:,}` → `{after_bal:,}`", inline=False)
         embed.add_field(name="備註", value=note_text if note_text else "（無）", inline=False)
         embed.set_footer(text=f"操作人：{interaction.user.display_name}")
-        await interaction.response.send_message(embed=embed)
+        await interaction_send(interaction, embed=embed)
 
     @bot.tree.command(name="ban", description="[管理員] 將玩家加入黑名單")
     @app_commands.default_permissions(administrator=True)
@@ -283,17 +291,20 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
         member: typing.Optional[discord.Member] = None,
         user_id: typing.Optional[str] = None,
     ):
+        await interaction_defer_if_needed(interaction)
         if not is_slash_host(interaction):
-            return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
+            return await interaction_send(interaction, "❌ 你沒有權限使用此指令！", ephemeral=True)
         m_user, err = await resolve_slash_target(
             interaction, member, user_id, required=True, in_guild_only=False
         )
         if err:
-            return await interaction.response.send_message(err, ephemeral=True)
+            return await interaction_send(interaction, err, ephemeral=True)
         member = m_user
-        with db_cursor(commit=True, connect=get_db_connection) as c:
-            c.execute("INSERT IGNORE INTO blacklist (user_id) VALUES (%s)", (str(member.id),))
-        await interaction.response.send_message(f"{member.mention} 已加入黑名單。", ephemeral=True)
+        def db_work():
+            with db_cursor(commit=True, connect=get_db_connection) as c:
+                c.execute("INSERT IGNORE INTO blacklist (user_id) VALUES (%s)", (str(member.id),))
+        await asyncio.to_thread(db_work)
+        await interaction_send(interaction, f"{member.mention} 已加入黑名單。", ephemeral=True)
 
     @bot.tree.command(name="unban", description="[管理員] 將玩家移出黑名單")
     @app_commands.default_permissions(administrator=True)
@@ -303,35 +314,44 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
         member: typing.Optional[discord.Member] = None,
         user_id: typing.Optional[str] = None,
     ):
+        await interaction_defer_if_needed(interaction)
         if not is_slash_host(interaction):
-            return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
+            return await interaction_send(interaction, "❌ 你沒有權限使用此指令！", ephemeral=True)
         m_user, err = await resolve_slash_target(
             interaction, member, user_id, required=True, in_guild_only=False
         )
         if err:
-            return await interaction.response.send_message(err, ephemeral=True)
+            return await interaction_send(interaction, err, ephemeral=True)
         member = m_user
-        with db_cursor(commit=True, connect=get_db_connection) as c:
-            c.execute("DELETE FROM blacklist WHERE user_id=%s", (str(member.id),))
-        await interaction.response.send_message(f"{member.mention} 已解除黑名單。", ephemeral=True)
+        def db_work():
+            with db_cursor(commit=True, connect=get_db_connection) as c:
+                c.execute("DELETE FROM blacklist WHERE user_id=%s", (str(member.id),))
+        await asyncio.to_thread(db_work)
+        await interaction_send(interaction, f"{member.mention} 已解除黑名單。", ephemeral=True)
 
     @bot.tree.command(name="resetall_zero", description="[管理員] 全伺服器餘額清零")
     @app_commands.default_permissions(administrator=True)
     async def resetall_zero_slash(interaction: discord.Interaction):
+        await interaction_defer_if_needed(interaction)
         if not is_slash_host(interaction):
-            return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
-        with db_cursor(commit=True, connect=get_db_connection) as c:
-            c.execute("UPDATE users SET balance=0")
-        await interaction.response.send_message("💥 全伺服器帳戶餘額已清零。")
+            return await interaction_send(interaction, "❌ 你沒有權限使用此指令！", ephemeral=True)
+        def db_work():
+            with db_cursor(commit=True, connect=get_db_connection) as c:
+                c.execute("UPDATE users SET balance=0")
+        await asyncio.to_thread(db_work)
+        await interaction_send(interaction, "💥 全伺服器帳戶餘額已清零。")
 
     @bot.tree.command(name="resetall_default", description="[管理員] 全伺服器重置為 50,000")
     @app_commands.default_permissions(administrator=True)
     async def resetall_default_slash(interaction: discord.Interaction):
+        await interaction_defer_if_needed(interaction)
         if not is_slash_host(interaction):
-            return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
-        with db_cursor(commit=True, connect=get_db_connection) as c:
-            c.execute("UPDATE users SET balance=50000, rescue_count=0, total_games=0, wins=0, total_profit=0")
-        await interaction.response.send_message("🔄 全服已重置為 50,000，並重置統計。")
+            return await interaction_send(interaction, "❌ 你沒有權限使用此指令！", ephemeral=True)
+        def db_work():
+            with db_cursor(commit=True, connect=get_db_connection) as c:
+                c.execute("UPDATE users SET balance=50000, rescue_count=0, total_games=0, wins=0, total_profit=0")
+        await asyncio.to_thread(db_work)
+        await interaction_send(interaction, "🔄 全服已重置為 50,000，並重置統計。")
 
     @bot.tree.command(name="lock", description="[管理員] 開關賭場營業狀態")
     @app_commands.default_permissions(administrator=True)
@@ -443,25 +463,23 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
         user_id: typing.Optional[str] = None,
         note: str = "",
     ):
+        await interaction_defer_if_needed(interaction, ephemeral=True)
         if not is_slash_host(interaction):
-            return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
+            return await interaction_send(interaction, "❌ 你沒有權限使用此指令！", ephemeral=True)
         if amount < 0:
-            return await interaction.response.send_message("餘額不可小於 0。", ephemeral=True)
+            return await interaction_send(interaction, "餘額不可小於 0。", ephemeral=True)
         target_user, err = await resolve_slash_target(
             interaction, member, user_id, required=True, in_guild_only=False
         )
         if err:
-            return await interaction.response.send_message(err, ephemeral=True)
+            return await interaction_send(interaction, err, ephemeral=True)
         await ensure_user_exists_async(target_user.id, 0)
-        before_bal = await asyncio.to_thread(admin_set_balance_sync, target_user.id, int(amount))
-
-        delta = int(amount) - before_bal
         note_text = (note or "").strip()[:100]
-        reason = f"管理員設定餘額（{before_bal:,}→{int(amount):,}）"
+        reason = f"管理員設定餘額（設為 {int(amount):,}）"
         if note_text:
             reason += f"（備註: {note_text}）"
-        if delta != 0:
-            log_transaction(target_user.id, delta, reason)
+        before_bal = await asyncio.to_thread(admin_set_balance_sync, target_user.id, int(amount), reason)
+        delta = int(amount) - before_bal
 
         embed = discord.Embed(title="✅ 餘額已設定", color=discord.Color.green())
         embed.add_field(name="對象", value=target_user.mention, inline=False)
@@ -469,7 +487,7 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
         embed.add_field(name="新餘額", value=f"`{int(amount):,}`", inline=True)
         embed.add_field(name="變動", value=f"`{delta:+,}`", inline=True)
         embed.add_field(name="備註", value=note_text if note_text else "（無）", inline=False)
-        await interaction.response.send_message(embed=embed)
+        await interaction_send(interaction, embed=embed)
 
     @bot.tree.command(name="admin_user_flags", description="[管理員] 查看玩家關鍵狀態")
     @app_commands.default_permissions(administrator=True)
@@ -479,26 +497,30 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
         member: typing.Optional[discord.Member] = None,
         user_id: typing.Optional[str] = None,
     ):
+        await interaction_defer_if_needed(interaction)
         if not is_slash_host(interaction):
-            return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
+            return await interaction_send(interaction, "❌ 你沒有權限使用此指令！", ephemeral=True)
         target_user, err = await resolve_slash_target(
             interaction, member, user_id, required=True, in_guild_only=False
         )
         if err:
-            return await interaction.response.send_message(err, ephemeral=True)
-        with db_cursor(connect=get_db_connection) as c:
-            c.execute(
-                "SELECT COALESCE(balance,0), COALESCE(role,'civilian'), COALESCE(wanted_stars,0), COALESCE(wanted_hunted_count,0), "
-                "COALESCE(in_prison,0), prison_start, COALESCE(bail_debt,0), COALESCE(good_citizen_cert_active,0), "
-                "good_citizen_cert_broken_until, last_five_robs "
-                "FROM users WHERE user_id=%s",
-                (str(target_user.id),),
-            )
-            row = c.fetchone()
-            c.execute("SELECT 1 FROM blacklist WHERE user_id=%s", (str(target_user.id),))
-            blacklisted = c.fetchone() is not None
+            return await interaction_send(interaction, err, ephemeral=True)
+        def db_work():
+            with db_cursor(connect=get_db_connection) as c:
+                c.execute(
+                    "SELECT COALESCE(balance,0), COALESCE(role,'civilian'), COALESCE(wanted_stars,0), COALESCE(wanted_hunted_count,0), "
+                    "COALESCE(in_prison,0), prison_start, COALESCE(bail_debt,0), COALESCE(good_citizen_cert_active,0), "
+                    "good_citizen_cert_broken_until, last_five_robs "
+                    "FROM users WHERE user_id=%s",
+                    (str(target_user.id),),
+                )
+                row = c.fetchone()
+                c.execute("SELECT 1 FROM blacklist WHERE user_id=%s", (str(target_user.id),))
+                blacklisted = c.fetchone() is not None
+            return (blacklisted, row,)
+        blacklisted, row, = await asyncio.to_thread(db_work)
         if not row:
-            return await interaction.response.send_message("找不到玩家資料。", ephemeral=True)
+            return await interaction_send(interaction, "找不到玩家資料。", ephemeral=True)
 
         bal, role, stars, hunted, in_pr, prison_start, bail_debt, cert_active, cert_broken_until, raw_hist = row
         role_disp = {"cop": "🚔 警察", "criminal": "🔪 搶匪"}.get(str(role or "civilian"), "👤 平民")
@@ -536,7 +558,7 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
         emb.add_field(name="最近搶劫紀錄", value=f"{hist_count} 筆｜總額 `{hist_total:,}`", inline=False)
         if prison_start:
             emb.set_footer(text=f"prison_start: {prison_start}")
-        await interaction.response.send_message(embed=emb, ephemeral=True)
+        await interaction_send(interaction, embed=emb, ephemeral=True)
 
     @bot.tree.command(name="admin_unjail", description="[管理員] 強制釋放玩家")
     @app_commands.default_permissions(administrator=True)
@@ -553,48 +575,52 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
         clear_debt: bool = False,
         clear_wanted: bool = True,
     ):
+        await interaction_defer_if_needed(interaction)
         if not is_slash_host(interaction):
-            return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
+            return await interaction_send(interaction, "❌ 你沒有權限使用此指令！", ephemeral=True)
         target_user, err = await resolve_slash_target(
             interaction, member, user_id, required=True, in_guild_only=False
         )
         if err:
-            return await interaction.response.send_message(err, ephemeral=True)
+            return await interaction_send(interaction, err, ephemeral=True)
         blocked: typing.Optional[str] = None
         debt_before = 0
         stars_before = 0
-        with db_cursor(commit=True, connect=get_db_connection) as c:
-            c.execute("SELECT COALESCE(in_prison,0), COALESCE(bail_debt,0), COALESCE(wanted_stars,0) FROM users WHERE user_id=%s", (str(target_user.id),))
-            row = c.fetchone()
-            if not row:
-                blocked = "找不到玩家資料。"
-            else:
-                was_in_prison, debt_before, stars_before = int(row[0] or 0), int(row[1] or 0), int(row[2] or 0)
-                if not was_in_prison:
-                    blocked = "該玩家目前不在監獄。"
-                elif clear_debt and clear_wanted:
-                    c.execute(
-                        "UPDATE users SET in_prison=0, prison_start=NULL, bail_debt=0, wanted_stars=0, wanted_hunted_count=0 WHERE user_id=%s",
-                        (str(target_user.id),),
-                    )
-                elif clear_debt:
-                    c.execute(
-                        "UPDATE users SET in_prison=0, prison_start=NULL, bail_debt=0 WHERE user_id=%s",
-                        (str(target_user.id),),
-                    )
-                elif clear_wanted:
-                    c.execute(
-                        "UPDATE users SET in_prison=0, prison_start=NULL, wanted_stars=0, wanted_hunted_count=0 WHERE user_id=%s",
-                        (str(target_user.id),),
-                    )
+        def db_work(blocked=blocked, debt_before=debt_before, stars_before=stars_before):
+            with db_cursor(commit=True, connect=get_db_connection) as c:
+                c.execute("SELECT COALESCE(in_prison,0), COALESCE(bail_debt,0), COALESCE(wanted_stars,0) FROM users WHERE user_id=%s", (str(target_user.id),))
+                row = c.fetchone()
+                if not row:
+                    blocked = "找不到玩家資料。"
                 else:
-                    c.execute(
-                        "UPDATE users SET in_prison=0, prison_start=NULL WHERE user_id=%s",
-                        (str(target_user.id),),
-                    )
+                    was_in_prison, debt_before, stars_before = int(row[0] or 0), int(row[1] or 0), int(row[2] or 0)
+                    if not was_in_prison:
+                        blocked = "該玩家目前不在監獄。"
+                    elif clear_debt and clear_wanted:
+                        c.execute(
+                            "UPDATE users SET in_prison=0, prison_start=NULL, bail_debt=0, wanted_stars=0, wanted_hunted_count=0 WHERE user_id=%s",
+                            (str(target_user.id),),
+                        )
+                    elif clear_debt:
+                        c.execute(
+                            "UPDATE users SET in_prison=0, prison_start=NULL, bail_debt=0 WHERE user_id=%s",
+                            (str(target_user.id),),
+                        )
+                    elif clear_wanted:
+                        c.execute(
+                            "UPDATE users SET in_prison=0, prison_start=NULL, wanted_stars=0, wanted_hunted_count=0 WHERE user_id=%s",
+                            (str(target_user.id),),
+                        )
+                    else:
+                        c.execute(
+                            "UPDATE users SET in_prison=0, prison_start=NULL WHERE user_id=%s",
+                            (str(target_user.id),),
+                        )
+            return (blocked, debt_before, stars_before,)
+        blocked, debt_before, stars_before, = await asyncio.to_thread(db_work)
         if blocked:
-            return await interaction.response.send_message(blocked, ephemeral=True)
-        await interaction.response.send_message(
+            return await interaction_send(interaction, blocked, ephemeral=True)
+        await interaction_send(interaction,
             f"✅ 已釋放 {target_user.mention}。\n"
             f"清債: {'是' if clear_debt else '否'}（原 `{debt_before:,}`）｜"
             f"清通緝: {'是' if clear_wanted else '否'}（原 {stars_before}★）",
@@ -605,36 +631,40 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
     @app_commands.default_permissions(administrator=True)
     @app_commands.describe(tx_id="logs 的流水 ID", note="備註（選填）")
     async def admin_revert_tx_slash(interaction: discord.Interaction, tx_id: int, note: str = ""):
+        await interaction_defer_if_needed(interaction)
         if not is_slash_host(interaction):
-            return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
+            return await interaction_send(interaction, "❌ 你沒有權限使用此指令！", ephemeral=True)
         if tx_id <= 0:
-            return await interaction.response.send_message("tx_id 必須大於 0。", ephemeral=True)
-        with db_cursor(connect=get_db_connection) as c:
-            c.execute("SELECT id, user_id, amount, reason FROM logs WHERE id=%s", (int(tx_id),))
-            row = c.fetchone()
-            if row:
+            return await interaction_send(interaction, "tx_id 必須大於 0。", ephemeral=True)
+        def db_work():
+            with db_cursor(commit=True, connect=get_db_connection) as c:
+                c.execute("SELECT id, user_id, amount, reason FROM logs WHERE id=%s", (int(tx_id),))
+                row = c.fetchone()
+                if not row:
+                    return None, "找不到該流水 ID。"
                 _id, uid, amt, rs = int(row[0]), str(row[1]), int(row[2] or 0), str(row[3] or "")
+                c.execute("SELECT COALESCE(balance,0) FROM users WHERE user_id=%s FOR UPDATE", (uid,))
+                user = c.fetchone()
+                if not user:
+                    return None, "找不到該玩家帳戶。"
                 c.execute(
-                    "SELECT 1 FROM logs WHERE user_id=%s AND reason LIKE %s LIMIT 1",
-                    (uid, f"管理員沖正 tx#{_id}%"),
+                    "SELECT 1 FROM logs WHERE user_id=%s AND reason LIKE %s LIMIT 1 FOR UPDATE",
+                    (uid, f"管理員沖正 tx#{_id}（%"),
                 )
-                already = c.fetchone() is not None
-        if not row:
-            return await interaction.response.send_message("找不到該流水 ID。", ephemeral=True)
-        if already:
-            return await interaction.response.send_message("這筆流水看起來已經沖正過了。", ephemeral=True)
-        reverse = -amt
-        if reverse > 0:
-            await credit_balance_with_log_async(uid, reverse, f"管理員沖正 tx#{_id}（原: {rs}）")
-        else:
-            ok = await try_deduct_balance_async(uid, abs(reverse), f"管理員沖正 tx#{_id}（原: {rs}）")
-            if not ok:
-                return await interaction.response.send_message(
-                    "沖正需要扣款，但目標餘額不足，已中止。可先手動調整餘額後再沖正。",
-                    ephemeral=True,
-                )
+                if c.fetchone():
+                    return None, "這筆流水已經沖正過了。"
+                reverse = -amt
+                if int(user[0] or 0) + reverse < 0:
+                    return None, "沖正需要扣款，但目標餘額不足，已中止。"
+                c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (reverse, uid))
+                log_transaction_in_tx(c, uid, reverse, f"管理員沖正 tx#{_id}（原: {rs}）"[:255])
+                return (_id, uid, amt, reverse), None
+        result, error = await asyncio.to_thread(db_work)
+        if error:
+            return await interaction_send(interaction, error, ephemeral=True)
+        _id, uid, amt, reverse = result
         note_text = (note or "").strip()
-        await interaction.response.send_message(
+        await interaction_send(interaction,
             f"✅ 已沖正 tx#{_id}\n對象：<@{int(uid)}>\n原金額：`{amt:+,}` → 沖正：`{reverse:+,}`"
             + (f"\n備註：{note_text}" if note_text else ""),
             ephemeral=True,
@@ -653,29 +683,33 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
         user_id: typing.Optional[str] = None,
         limit: int = 20,
     ):
+        await interaction_defer_if_needed(interaction)
         if not is_slash_host(interaction):
-            return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
+            return await interaction_send(interaction, "❌ 你沒有權限使用此指令！", ephemeral=True)
         limit = max(1, min(50, int(limit)))
         target_user, err = await resolve_slash_target(
             interaction, member, user_id, required=False, in_guild_only=False
         )
         if err:
-            return await interaction.response.send_message(err, ephemeral=True)
+            return await interaction_send(interaction, err, ephemeral=True)
 
-        with db_cursor(connect=get_db_connection) as c:
-            if target_user is not None:
-                c.execute(
-                    "SELECT id, user_id, amount, reason, created_at FROM logs WHERE user_id=%s ORDER BY id DESC LIMIT %s",
-                    (str(target_user.id), limit),
-                )
-            else:
-                c.execute(
-                    "SELECT id, user_id, amount, reason, created_at FROM logs ORDER BY id DESC LIMIT %s",
-                    (limit,),
-                )
-            rows = c.fetchall()
+        def db_work():
+            with db_cursor(connect=get_db_connection) as c:
+                if target_user is not None:
+                    c.execute(
+                        "SELECT id, user_id, amount, reason, created_at FROM logs WHERE user_id=%s ORDER BY id DESC LIMIT %s",
+                        (str(target_user.id), limit),
+                    )
+                else:
+                    c.execute(
+                        "SELECT id, user_id, amount, reason, created_at FROM logs ORDER BY id DESC LIMIT %s",
+                        (limit,),
+                    )
+                rows = c.fetchall()
+            return (rows,)
+        rows, = await asyncio.to_thread(db_work)
         if not rows:
-            return await interaction.response.send_message("查無流水資料。", ephemeral=True)
+            return await interaction_send(interaction, "查無流水資料。", ephemeral=True)
 
         lines: typing.List[str] = []
         for rid, uid, amt, reason, created_at in rows:
@@ -692,7 +726,7 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
             + (f"｜對象：<@{target_user.id}>" if target_user is not None else "")
         )
         chunks = chunk_text_lines([header, ""] + lines, 1900)
-        await interaction.response.send_message(chunks[0], ephemeral=True)
+        await interaction_send(interaction, chunks[0], ephemeral=True)
         for ch in chunks[1:]:
             await interaction.followup.send(ch, ephemeral=True)
 

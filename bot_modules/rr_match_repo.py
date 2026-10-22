@@ -4,6 +4,7 @@ import typing
 import uuid
 
 from bot_modules.db import db_cursor
+from bot_modules.tx_ops import lock_user_rows, log_transaction_in_tx
 
 _lock = threading.Lock()
 _user_active: typing.Dict[int, str] = {}
@@ -23,6 +24,62 @@ def init_rr_match_table(cursor) -> None:
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
         )"""
     )
+    cursor.execute(
+        """CREATE TABLE IF NOT EXISTS russian_roulette_settlements (
+            match_id VARCHAR(36) NOT NULL,
+            event_key VARCHAR(64) NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (match_id, event_key)
+        )"""
+    )
+
+
+def settle_event_sync(*, match_id: str, event_key: str, credits: typing.Dict[int, int],
+                      results: typing.Dict[int, typing.Tuple[bool, int]], reason: str,
+                      payload: typing.Dict[str, typing.Any], finished: bool) -> bool:
+    """Commit payouts, both stat tables, and the match checkpoint exactly once together."""
+    with db_cursor(commit=True) as c:
+        c.execute("SELECT match_id FROM russian_roulette_active_matches WHERE match_id=%s FOR UPDATE", (str(match_id),))
+        if not c.fetchone():
+            return False
+        c.execute(
+            "INSERT IGNORE INTO russian_roulette_settlements (match_id, event_key) VALUES (%s, %s)",
+            (str(match_id), event_key),
+        )
+        if c.rowcount == 0:
+            return False
+        user_ids = sorted(set(credits) | set(results))
+        if len(lock_user_rows(c, user_ids)) != len(user_ids):
+            raise ValueError("Russian roulette settlement references a missing user")
+        for uid in user_ids:
+            amount = int(credits.get(uid, 0))
+            if amount < 0:
+                raise ValueError("Settlement credits must be nonnegative")
+            if amount:
+                c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (amount, str(uid)))
+                log_transaction_in_tx(c, uid, amount, reason)
+            if uid in results:
+                win, profit = results[uid]
+                c.execute(
+                    "UPDATE users SET total_games=total_games+1, wins=wins+%s, "
+                    "total_profit=total_profit+%s WHERE user_id=%s",
+                    (int(win), int(profit), str(uid)),
+                )
+                c.execute(
+                    "INSERT INTO russian_roulette_stats (user_id, games, wins, profit) VALUES (%s, 1, %s, %s) "
+                    "ON DUPLICATE KEY UPDATE games=games+1, wins=wins+%s, profit=profit+%s",
+                    (str(uid), int(win), int(profit), int(win), int(profit)),
+                )
+        if finished:
+            c.execute("DELETE FROM russian_roulette_active_matches WHERE match_id=%s", (str(match_id),))
+        else:
+            c.execute(
+                "UPDATE russian_roulette_active_matches SET phase='playing', payload=%s WHERE match_id=%s",
+                (json.dumps(payload, ensure_ascii=False), str(match_id)),
+            )
+    if finished:
+        unregister_match_users(match_id, _payload_participants(payload))
+    return True
 
 
 def new_match_id() -> str:
@@ -95,7 +152,6 @@ def save_match_sync(
     payload: typing.Dict[str, typing.Any],
 ) -> None:
     participant_ids = _payload_participants(payload)
-    sync_match_users(match_id, participant_ids)
     with db_cursor(commit=True) as c:
         c.execute(
             """INSERT INTO russian_roulette_active_matches
@@ -118,15 +174,16 @@ def save_match_sync(
                 json.dumps(payload, ensure_ascii=False),
             ),
         )
+    sync_match_users(match_id, participant_ids)
 
 
 def delete_match_sync(match_id: str, payload: typing.Optional[typing.Dict[str, typing.Any]] = None) -> None:
     if payload is None:
         row = fetch_match_sync(match_id)
         payload = (row or {}).get("payload") or {}
-    unregister_match_users(match_id, _payload_participants(payload))
     with db_cursor(commit=True) as c:
         c.execute("DELETE FROM russian_roulette_active_matches WHERE match_id=%s", (str(match_id),))
+    unregister_match_users(match_id, _payload_participants(payload))
 
 
 def fetch_match_sync(match_id: str) -> typing.Optional[typing.Dict[str, typing.Any]]:

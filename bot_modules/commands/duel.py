@@ -1,8 +1,10 @@
+import asyncio
 import random
 import typing
 
 import discord
 from discord import app_commands
+from bot_modules.ui.guards import serialized_action
 
 
 def register_duel_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
@@ -35,18 +37,21 @@ def register_duel_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             self.bet = int(bet)
             self.message: typing.Optional[discord.Message] = None
             self.resolved = False
+            self._callback_lock = asyncio.Lock()
 
         async def _refund_challenger(self):
             await credit_balance_with_log_async(self.challenger.id, self.bet, "E卡決鬥取消退款")
 
         @discord.ui.button(label="接受", style=discord.ButtonStyle.success)
+        @serialized_action
         async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
             if interaction.user.id != self.opponent.id:
                 return await interaction.response.send_message("這場決鬥不是邀請你的。", ephemeral=True)
             if self.resolved:
                 return await interaction.response.defer()
+            await interaction_defer_if_needed(interaction, thinking=False)
             if not await try_deduct_balance_async(self.opponent.id, self.bet, "E卡決鬥下注"):
-                return await interaction.response.send_message(
+                return await interaction_send(interaction,
                     f"❌ 你的餘額不足，需要 `{self.bet:,}` 東雲幣才能接受此決鬥。",
                     ephemeral=True,
                 )
@@ -57,7 +62,7 @@ def register_duel_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             play = EDuelPlayView(match)
             match.view = play
             match.channel = interaction.channel
-            await interaction.response.edit_message(
+            await interaction.edit_original_response(
                 content=None,
                 embed=match.build_selection_embed(),
                 view=play,
@@ -69,16 +74,18 @@ def register_duel_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             self.stop()
 
         @discord.ui.button(label="拒絕", style=discord.ButtonStyle.danger)
+        @serialized_action
         async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
             if interaction.user.id != self.opponent.id:
                 return await interaction.response.send_message("這場決鬥不是邀請你的。", ephemeral=True)
             if self.resolved:
                 return await interaction.response.defer()
+            await interaction_defer_if_needed(interaction, thinking=False)
             self.resolved = True
             await self._refund_challenger()
             for child in self.children:
                 child.disabled = True
-            await interaction.response.edit_message(
+            await interaction.edit_original_response(
                 content=(
                     f"❌ {self.opponent.mention} 拒絕了 {self.challenger.mention} 的 E 卡決鬥。"
                     f"已退回挑戰者注金 `{self.bet:,}`。"
@@ -87,6 +94,7 @@ def register_duel_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             )
             self.stop()
 
+        @serialized_action
         async def on_timeout(self):
             if self.resolved:
                 return
@@ -117,9 +125,10 @@ def register_duel_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             self.key = key
             self.match = match
             self.picker_id = picker_id
+            self.round_key = (match.game_no, match.round_in_game)
 
         async def callback(self, interaction: discord.Interaction):
-            await self.match.record_pick(interaction, self.picker_id, self.key)
+            await self.match.record_pick(interaction, self.picker_id, self.key, self.round_key)
 
     class EDuelPickerView(discord.ui.View):
         def __init__(self, match: "EDuelMatch", picker_id: int):
@@ -153,6 +162,7 @@ def register_duel_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             self.view: typing.Optional["EDuelPlayView"] = None
             self.message: typing.Optional[discord.Message] = None
             self.settled = False
+            self._callback_lock = asyncio.Lock()
 
         def _make_hands(self, game_idx: int) -> typing.Dict[int, typing.Dict[str, int]]:
             roles = self.game_roles[game_idx]
@@ -372,9 +382,12 @@ def register_duel_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             emb.set_footer(text="計分：奴贏王 +3｜其餘決勝 +1｜兩大局制（第二大局交換陣營）")
             return emb
 
-        async def record_pick(self, interaction: discord.Interaction, picker_id: int, key: str):
+        @serialized_action
+        async def record_pick(self, interaction: discord.Interaction, picker_id: int, key: str, round_key):
             if interaction.user.id != picker_id:
                 return await interaction.response.send_message("這個按鈕不是給你的。", ephemeral=True)
+            if round_key != (self.game_no, self.round_in_game):
+                return await interaction.response.send_message("這是上一小局的選牌，請重新開啟選牌。", ephemeral=True)
             if self.settled:
                 return await interaction.response.send_message("此場決鬥已結束。", ephemeral=True)
             if picker_id in self.picks:
@@ -445,6 +458,7 @@ def register_duel_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                 except Exception:
                     pass
 
+        @serialized_action
         async def handle_timeout(self, view: "EDuelPlayView") -> None:
             if self.settled or self.view is not view:
                 return
