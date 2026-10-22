@@ -1,4 +1,5 @@
 import datetime
+import asyncio
 import io
 import re
 import typing
@@ -14,7 +15,21 @@ def register_relay(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Dict[str, t
     DM_RELAY_CHANNEL_ID = ctx["DM_RELAY_CHANNEL_ID"]
     DM_RELAY_NOTIFY_USER_ID = ctx["DM_RELAY_NOTIFY_USER_ID"]
     DISCORD_MESSAGE_CAP = ctx["DISCORD_MESSAGE_CAP"]
+    allowed_host_ids = frozenset(ctx.get("ALLOWED_HOST_IDS", ()))
     split_discord_message_chunks = ctx["split_discord_message_chunks"]
+
+    async def audited_send(target, staff_msg, part, reply_id=None, **kwargs):
+        audit = getattr(bot, "message_audit", None)
+        request_id = f"relay:{staff_msg.id}:{part}"
+        if audit is not None:
+            await asyncio.to_thread(audit, request_id, staff_msg.author.id, target.id, reply_id, "sending")
+        sent = await target.send(**kwargs)
+        if audit is not None:
+            try:
+                await asyncio.to_thread(audit, request_id, staff_msg.author.id, target.id, reply_id, "sent", sent.id)
+            except Exception:
+                logger.exception("轉接已送出但紀錄待核對 request=%s message=%s", request_id, sent.id)
+        return sent
 
     async def _resolve_relay_from_staff_reply(
         channel: discord.abc.GuildChannel, message: discord.Message
@@ -150,6 +165,8 @@ def register_relay(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Dict[str, t
                 raise RuntimeError(f"無法取得頻道：{e}") from e
         if not isinstance(ch, discord.abc.Messageable):
             raise RuntimeError("目標不是可發言頻道")
+        if getattr(getattr(ch, "guild", None), "id", None) != _guild_id:
+            raise RuntimeError("原訊息的伺服器與目標頻道不符")
 
         ref_msg: typing.Optional[discord.Message] = None
         try:
@@ -162,13 +179,14 @@ def register_relay(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Dict[str, t
             try:
                 data = await att.read()
                 files_first.append(discord.File(io.BytesIO(data), filename=att.filename or "attachment"))
-            except Exception:
-                continue
+            except Exception as exc:
+                raise RuntimeError(f"附件 {att.filename} 下載失敗，尚未發送回覆") from exc
 
         if not text and not files_first:
             raise RuntimeError("沒有可發送的文字或附件")
 
-        parts: typing.List[str] = split_discord_message_chunks(text) if text else [""]
+        prefix = f"<@{target_user_id}> " if ref_msg is None and text else ""
+        parts: typing.List[str] = split_discord_message_chunks(prefix + text) if text else [""]
 
         am = discord.AllowedMentions(users=[discord.Object(id=target_user_id)])
         first_chunk = True
@@ -176,26 +194,21 @@ def register_relay(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Dict[str, t
             use_ref = ref_msg if (first_chunk and ref_msg is not None) else None
             fs = files_first if idx == 0 else []
             if part:
-                if first_chunk and ref_msg is None:
-                    prefix = f"<@{target_user_id}> "
-                    room = max(0, DISCORD_MESSAGE_CAP - len(prefix))
-                    body = prefix + part[:room]
-                else:
-                    body = part[:DISCORD_MESSAGE_CAP]
+                body = part
                 kwargs: typing.Dict[str, typing.Any] = {"content": body, "allowed_mentions": am}
                 if use_ref is not None:
                     kwargs["reference"] = use_ref
                 if fs:
                     kwargs["files"] = fs
-                await ch.send(**kwargs)
+                await audited_send(ch, staff_msg, str(idx), original_message_id, **kwargs)
             elif idx == 0 and fs:
                 kwargs = {"allowed_mentions": am}
                 if ref_msg is not None:
                     kwargs["reference"] = ref_msg
                     kwargs["files"] = fs
-                    await ch.send(**kwargs)
+                    await audited_send(ch, staff_msg, str(idx), original_message_id, **kwargs)
                 else:
-                    await ch.send(
+                    await audited_send(ch, staff_msg, str(idx), original_message_id,
                         content=f"<@{target_user_id}>（附件）",
                         files=fs,
                         allowed_mentions=am,
@@ -210,6 +223,11 @@ def register_relay(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Dict[str, t
         """管理員在轉接頻道回覆轉發：私訊轉發 -> DM 對方；群組 @ 轉發 -> 在原頻道以機器人代發回覆（不私訊）。"""
         if message.channel.id != DM_RELAY_CHANNEL_ID:
             return False
+        if message.author.id not in allowed_host_ids:
+            # A channel permission change must not grant the ability to speak as the bot.
+            if message.reference:
+                await message.reply("❌ 只有主機白名單管理員可以代發回覆。", mention_author=False)
+            return True
         resolved = await _resolve_relay_from_staff_reply(message.channel, message)
         if resolved is None:
             return False
@@ -234,7 +252,7 @@ def register_relay(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Dict[str, t
             except Exception as e:
                 logger.exception("代發群組回覆失敗: %s", e)
                 try:
-                    await message.reply(f"❌ 無法在原頻道代發：{e}", mention_author=False)
+                    await message.reply(f"❌ 無法完成代發：{e}\n可能已有部分內容送出，請先核對目標頻道再重試。", mention_author=False)
                 except Exception:
                     pass
                 return True
@@ -246,14 +264,20 @@ def register_relay(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Dict[str, t
 
         try:
             user = await bot.fetch_user(uid)
-            for chunk in split_discord_message_chunks(text):
-                await user.send(chunk)
+            files = []
             for att in message.attachments:
                 try:
-                    data = await att.read()
-                    await user.send(file=discord.File(io.BytesIO(data), filename=att.filename or "file"))
-                except Exception:
-                    await user.send(att.url)
+                    files.append(await att.to_file(spoiler=att.is_spoiler()))
+                except Exception as exc:
+                    raise RuntimeError(f"附件 {att.filename} 下載失敗，尚未發送回覆") from exc
+            try:
+                for index, chunk in enumerate(split_discord_message_chunks(text)):
+                    await audited_send(user, message, f"text:{index}", content=chunk)
+                for index, upload in enumerate(files):
+                    await audited_send(user, message, f"file:{index}", file=upload)
+            finally:
+                for upload in files:
+                    upload.close()
         except discord.Forbidden:
             try:
                 await message.reply("❌ 無法私訊該使用者（可能已關閉與機器人的私訊）。", mention_author=False)
@@ -262,7 +286,7 @@ def register_relay(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Dict[str, t
         except Exception as e:
             logger.exception("轉發管理員回覆到私訊失敗: %s", e)
             try:
-                await message.reply(f"❌ 發送私訊失敗：{e}", mention_author=False)
+                await message.reply(f"❌ 無法完成私訊：{e}\n可能已有部分內容送出，請先核對再重試。", mention_author=False)
             except Exception:
                 pass
         else:

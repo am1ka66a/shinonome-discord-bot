@@ -5,6 +5,7 @@ import typing
 import discord
 from discord import app_commands
 from bot_modules.ui.guards import serialized_action
+from bot_modules.runtime.policy import allowed
 
 
 def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
@@ -22,6 +23,14 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
     roll_gamble_exp_from_bet = ctx["roll_gamble_exp_from_bet"]
     interaction_send = ctx["interaction_send"]
     interaction_defer_if_needed = ctx["interaction_defer_if_needed"]
+    store = getattr(bot, "game_store", None)
+
+    async def debit_game(inter, uid, amount, reason, sid=None):
+        if not await allowed(bot, uid):
+            return False
+        if store is not None:
+            return await store.call("debit", sid or f"bj:{inter.id}", "bj", uid, amount, str(inter.id), reason=reason)
+        return await try_deduct_balance_async(uid, amount, reason)
 
     def get_deck(num_decks=6):
         suits = ["♥️", "♦️", "♣️", "♠️"]
@@ -121,6 +130,8 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         )
 
     async def send_game(channel, gv, **kwargs):
+        if store is not None and getattr(gv, "session_id", None) and not getattr(gv, "_game_over", False):
+            await store.call("checkpoint", gv.session_id, gv.snapshot())
         message = await _send_game(channel, gv, **kwargs)
         gv.message = message
         return message
@@ -264,10 +275,10 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             await inter.response.defer()
             await ensure_user_exists_async(self.user.id, 50000)
             total_cost = self.base_bet + self.p_bet + self.s_bet
-            if not await try_deduct_balance_async(self.user.id, total_cost, "21點開局扣款"):
-                return await inter.followup.send("餘額不足", ephemeral=True)
+            if not await debit_game(inter, self.user.id, total_cost, "21點開局扣款"):
+                return await inter.followup.send("餘額不足、牌局已關閉或目前無法下注", ephemeral=True)
             self.stop()
-            gv = BlackjackGame(self.user, self.base_bet, self.p_bet, self.s_bet, upfront_cost=total_cost)
+            gv = BlackjackGame(self.user, self.base_bet, self.p_bet, self.s_bet, upfront_cost=total_cost, session_id=f"bj:{inter.id}")
             msg = await send_game(inter.channel, gv, interaction=inter)
             if msg is not None:
                 await gv.check_auto_bj(msg)
@@ -281,10 +292,13 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             await inter.response.send_modal(BetModal(self))
 
     class BlackjackGame(discord.ui.View):
-        def __init__(self, user, bet, p_bet, s_bet, upfront_cost=0):
+        def __init__(self, user, bet, p_bet, s_bet, upfront_cost=0, session_id=None):
             super().__init__(timeout=90)
             self.user, self.bet, self.p_bet, self.s_bet = user, bet, p_bet, s_bet
             self.total_deducted = upfront_cost
+            self.session_id = session_id
+            self._pending_settlement = None
+            self._game_over = False
             self.hand_bets = [bet]
             self.deck = get_deck()
             random.shuffle(self.deck)
@@ -298,9 +312,24 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             self.side_p, self.side_m = check_sidebets(self.hands[0], self.d_hand[0], p_bet, s_bet)
             self.update_buttons()
 
+        def snapshot(self):
+            return {"user_id": self.user.id, "bet": self.bet, "total_deducted": self.total_deducted,
+                    "hands": self.hands, "dealer": self.d_hand, "deck": self.deck,
+                    "hand_bets": self.hand_bets, "hand_results": self.hand_results,
+                    "current_hand": self.current_hand, "side_p": self.side_p}
+
         async def interaction_check(self, interaction: discord.Interaction) -> bool:
             if interaction.user.id != self.user.id:
                 await interaction.response.send_message("這不是你的牌局！", ephemeral=True)
+                return False
+            if self._pending_settlement and not self._game_over:
+                await interaction_defer_if_needed(interaction, thinking=False)
+                async with self._action_lock:
+                    await self.end(*self._pending_settlement[:4], interaction=interaction,
+                                   message_obj=self.message, exp_gain=self._pending_settlement[4],
+                                   exp_detail=self._pending_settlement[5])
+                return False
+            if self._game_over:
                 return False
             if self._action_lock.locked():
                 await interaction.response.send_message("⏳ 上一個操作仍在處理中，請稍候。", ephemeral=True)
@@ -398,14 +427,38 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         async def end(self, res, prof, win=False, is_push=False, message_obj=None, interaction=None, exp_gain=0, exp_detail=""):
             if getattr(self, "_game_over", False):
                 return
-            self._game_over = True
-
+            self._pending_settlement = self._pending_settlement or (res, prof, win, is_push, exp_gain, exp_detail)
+            res, prof, win, is_push, exp_gain, exp_detail = self._pending_settlement
             total_p = prof + getattr(self, "side_p", 0)
             settlement_credit = self.total_deducted + total_p
-            await update_game_result_async(self.user.id, settlement_credit, total_p, win, is_push)
+            try:
+                if store is not None and self.session_id:
+                    from bot_modules import domain_sync
+                    uid = str(self.user.id)
+                    credits = {uid: settlement_credit}
+                    reasons = {uid: [[settlement_credit, "21點遊戲結算"]]}
+                    if domain_sync.CASINO_RECOVERY_SHARE_ENABLED and total_p < 0:
+                        beneficiary = str(domain_sync.CASINO_RECOVERY_SHARE_TARGET_ID or "").strip()
+                        share = int(-total_p * domain_sync.CASINO_RECOVERY_SHARE_RATE)
+                        if beneficiary and share > 0:
+                            credits[beneficiary] = credits.get(beneficiary, 0) + share
+                            reasons.setdefault(beneficiary, []).append(
+                                [share, f"{domain_sync.CASINO_RECOVERY_SHARE_REASON_PREFIX}｜21點回收切割"])
+                    receipt = await store.finish(self.session_id, credits, {uid: (win, total_p, is_push)}, reasons)
+                    if uid not in receipt["results"]:
+                        res, prof, exp_gain = "牌局已中斷，已依紀錄退回注金。", 0, 0
+                        self.side_p = 0
+                else:
+                    await update_game_result_async(self.user.id, settlement_credit, total_p, win, is_push)
+            except Exception:
+                logger.exception("21點結算待恢復 session=%s", self.session_id)
+                if interaction:
+                    await interaction_send(interaction, "結算暫時失敗，已保留結果；請稍後再按按鈕重試。", ephemeral=True)
+                return
+            self._game_over = True
             self.stop()
 
-            if exp_gain > 0:
+            if exp_gain > 0 and await allowed(bot, self.user.id):
                 await ensure_user_exists_async(self.user.id, 50000)
                 exp_result = await add_user_exp_async(self.user.id, exp_gain)
                 if exp_result and exp_result[1] > exp_result[0]:
@@ -563,6 +616,10 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
 
         async def on_timeout(self):
             async with self._action_lock:
+                if self._pending_settlement and not self._game_over:
+                    await self.end(*self._pending_settlement[:4], message_obj=self.message,
+                                   exp_gain=self._pending_settlement[4], exp_detail=self._pending_settlement[5])
+                    return
                 if not getattr(self, "_game_over", False) and self.message:
                     # Resolve the existing hands instead of silently abandoning a paid game.
                     while self.current_hand < len(self.hands) - 1:
@@ -593,8 +650,8 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             async with self._action_lock:
                 await inter.response.defer()
                 extra_cost = self.hand_bets[self.current_hand]
-                if not await try_deduct_balance_async(self.user.id, extra_cost, "21點雙倍加注"):
-                    return await inter.followup.send("餘額不足", ephemeral=True)
+                if not await debit_game(inter, self.user.id, extra_cost, "21點雙倍加注", self.session_id):
+                    return await inter.followup.send("餘額不足、牌局已關閉或目前無法下注", ephemeral=True)
                 self.total_deducted += extra_cost
                 self.hand_bets[self.current_hand] *= 2
                 self.p_hand.append(self.deck.pop())
@@ -608,8 +665,8 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                 return
             async with self._action_lock:
                 await inter.response.defer()
-                if not await try_deduct_balance_async(self.user.id, self.bet, "21點分牌加注"):
-                    return await inter.followup.send("餘額不足", ephemeral=True)
+                if not await debit_game(inter, self.user.id, self.bet, "21點分牌加注", self.session_id):
+                    return await inter.followup.send("餘額不足、牌局已關閉或目前無法下注", ephemeral=True)
                 self.total_deducted += self.bet
                 self.is_split, c1, c2 = True, self.hands[0][0], self.hands[0][1]
                 self.hands, self.hand_results, self.hand_bets = [[c1, self.deck.pop()], [c2, self.deck.pop()]], [None, None], [self.bet, self.bet]
@@ -642,7 +699,7 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             all_in_amount = int((stats[0] if stats else 0) or 0)
             if all_in_amount < 100:
                 return await interaction_send(inter, "去乞討吧雜魚", ephemeral=True)
-            if not await try_deduct_balance_async(self.user.id, all_in_amount, "21點 All In 開局扣款"):
+            if not await debit_game(inter, self.user.id, all_in_amount, "21點 All In 開局扣款"):
                 return await interaction_send(inter, "餘額不足（可能剛轉帳/變動），請重新開局。", ephemeral=True)
             self.stop()
             await inter.edit_original_response(content="🔥 All In 已確認！正在為你開牌...", view=None)
@@ -650,7 +707,7 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                 await self.parent_msg.delete()
             except Exception:
                 pass
-            gv = BlackjackGame(self.user, all_in_amount, 0, 0, upfront_cost=all_in_amount)
+            gv = BlackjackGame(self.user, all_in_amount, 0, 0, upfront_cost=all_in_amount, session_id=f"bj:{inter.id}")
             msg = await send_game(inter.channel, gv)
             if msg is not None:
                 await gv.check_auto_bj(msg)
@@ -677,10 +734,10 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                 return await inter.response.send_message("打烊", ephemeral=True)
             await inter.response.defer()
             total_cost = self.last_bet + self.last_p_bet + self.last_s_bet
-            if not await try_deduct_balance_async(self.user.id, total_cost, "21點開局扣款"):
-                return await inter.followup.send("餘額不足", ephemeral=True)
+            if not await debit_game(inter, self.user.id, total_cost, "21點開局扣款"):
+                return await inter.followup.send("餘額不足、牌局已關閉或目前無法下注", ephemeral=True)
             self.stop()
-            gv = BlackjackGame(self.user, self.last_bet, self.last_p_bet, self.last_s_bet, upfront_cost=total_cost)
+            gv = BlackjackGame(self.user, self.last_bet, self.last_p_bet, self.last_s_bet, upfront_cost=total_cost, session_id=f"bj:{inter.id}")
             msg = await send_game(inter.channel, gv, interaction=inter)
             if msg is not None:
                 await gv.check_auto_bj(msg)
@@ -699,10 +756,10 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             await inter.response.defer()
             new_bet = self.last_bet * 2
             total_cost = new_bet + self.last_p_bet + self.last_s_bet
-            if not await try_deduct_balance_async(self.user.id, total_cost, "21點開局扣款"):
-                return await inter.followup.send("餘額不足", ephemeral=True)
+            if not await debit_game(inter, self.user.id, total_cost, "21點開局扣款"):
+                return await inter.followup.send("餘額不足、牌局已關閉或目前無法下注", ephemeral=True)
             self.stop()
-            gv = BlackjackGame(self.user, new_bet, self.last_p_bet, self.last_s_bet, upfront_cost=total_cost)
+            gv = BlackjackGame(self.user, new_bet, self.last_p_bet, self.last_s_bet, upfront_cost=total_cost, session_id=f"bj:{inter.id}")
             msg = await send_game(inter.channel, gv, interaction=inter)
             if msg is not None:
                 await gv.check_auto_bj(msg)

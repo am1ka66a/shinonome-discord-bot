@@ -6,6 +6,7 @@ import discord
 from discord import app_commands
 
 from bot_modules.ui.views import LinePagerView
+from bot_modules.runtime.policy import require_allowed
 
 
 def register_economy_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
@@ -33,13 +34,15 @@ def register_economy_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
     fetch_record_rows_async = ctx["fetch_record_rows_async"]
     now_tw_naive = ctx["now_tw_naive"]
     logger = ctx["logger"]
+    store = getattr(bot, "game_store", None)
 
     class RedPacketView(discord.ui.View):
-        def __init__(self, creator_id, total_amount, count):
+        def __init__(self, creator_id, total_amount, count, session_id=None):
             super().__init__(timeout=120)
             red_packet_seq_ref[0] += 1
             self.packet_id = red_packet_seq_ref[0]
             self.creator_id = creator_id
+            self.session_id = session_id
             self.total_amount = total_amount
             self.count = count
             self.left_amount = total_amount
@@ -66,6 +69,8 @@ def register_economy_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         @discord.ui.button(label="搶紅包", style=discord.ButtonStyle.success)
         async def claim(self, interaction: discord.Interaction, button: discord.ui.Button):
             await interaction_defer_if_needed(interaction, ephemeral=True, thinking=False)
+            if not await require_allowed(bot, interaction):
+                return
             async with self._claim_lock:
                 if interaction.user.bot:
                     return await interaction_send(interaction, "機器人不能搶紅包", ephemeral=True)
@@ -82,14 +87,25 @@ def register_economy_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                     capped_max_pick = max(1, min(max_pick, non_last_cap))
                     amount = random.randint(1, capped_max_pick)
                 try:
-                    await credit_balance_with_log_async(interaction.user.id, amount, f"搶紅包 #{self.packet_id}")
+                    if store is not None and self.session_id:
+                        amount, data = await store.call("claim", self.session_id, interaction.user.id)
+                    else:
+                        await credit_balance_with_log_async(interaction.user.id, amount, f"搶紅包 #{self.packet_id}")
+                except ValueError as exc:
+                    return await interaction_send(interaction, str(exc), ephemeral=True)
                 except Exception:
                     logger.exception("紅包入帳失敗 packet_id=%s user=%s", self.packet_id, interaction.user.id)
                     return await interaction_send(interaction, "入帳失敗，這份紅包尚未扣除，請稍後再試。", ephemeral=True)
-                self.left_amount -= amount
-                self.left_count -= 1
-                self.claimed_users.add(interaction.user.id)
-                self.claim_results.append((interaction.user.id, amount))
+                if store is not None and self.session_id:
+                    self.claim_results = [(int(uid), value) for uid, value in data["claims"].items()]
+                    self.claimed_users = {uid for uid, _ in self.claim_results}
+                    self.left_amount = self.total_amount - sum(value for _, value in self.claim_results)
+                    self.left_count = self.count - len(self.claimed_users)
+                else:
+                    self.left_amount -= amount
+                    self.left_count -= 1
+                    self.claimed_users.add(interaction.user.id)
+                    self.claim_results.append((interaction.user.id, amount))
 
                 if self.left_count <= 0 or self.left_amount <= 0:
                     for child in self.children:
@@ -111,13 +127,15 @@ def register_economy_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
 
         async def on_timeout(self):
             async with self._claim_lock:
+                if store is not None and self.session_id:
+                    await store.finish(self.session_id, {}, reason="紅包逾時退回未領金額", refund=True)
                 self.closed = True
             for child in self.children:
                 child.disabled = True
             try:
                 if hasattr(self, "message") and self.message:
                     await self.message.edit(
-                        content=self.summary_text() + "\n⌛ 紅包已逾時關閉。\n" + self.winners_text(),
+                        content=self.summary_text() + "\n⌛ 紅包已逾時關閉；未領金額已退回。\n" + self.winners_text(),
                         view=self,
                     )
             except Exception:
@@ -384,10 +402,17 @@ def register_economy_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             return await interaction_send(interaction, "總金額需大於 0，且至少要能每包 1 元。", ephemeral=True)
         if count < 1 or count > 100:
             return await interaction_send(interaction, "份數需介於 1 到 100。", ephemeral=True)
-        if not await try_deduct_balance_async(interaction.user.id, total_amount, "發送紅包扣款"):
-            return await interaction_send(interaction, "餘額不足，無法發紅包", ephemeral=True)
+        session_id = f"redpacket:{interaction.id}"
         timeout_seconds = max(RED_PACKET_MIN_SECONDS, seconds)
-        view = RedPacketView(interaction.user.id, total_amount, count)
+        if store is not None:
+            paid = await store.call("debit", session_id, "redpacket", interaction.user.id, total_amount, "open",
+                                    {"creator_id": interaction.user.id, "count": count, "claims": {}}, timeout_seconds,
+                                    reason="發送紅包扣款")
+        else:
+            paid = await try_deduct_balance_async(interaction.user.id, total_amount, "發送紅包扣款")
+        if not paid:
+            return await interaction_send(interaction, "餘額不足，無法發紅包", ephemeral=True)
+        view = RedPacketView(interaction.user.id, total_amount, count, session_id)
         view.timeout = timeout_seconds
         try:
             await interaction_send(
@@ -399,7 +424,10 @@ def register_economy_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         except discord.HTTPException as exc:
             if exc.status < 500:
                 # A definitive rejection means no claim button was published.
-                await credit_balance_with_log_async(interaction.user.id, total_amount, "紅包發送失敗退款")
+                if store is not None:
+                    await store.finish(session_id, {}, reason="紅包發送失敗退款", refund=True)
+                else:
+                    await credit_balance_with_log_async(interaction.user.id, total_amount, "紅包發送失敗退款")
                 view.stop()
             raise
         try:

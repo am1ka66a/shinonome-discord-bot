@@ -21,6 +21,8 @@ DEFAULT_READ_ONLY_APP_COMMANDS: typing.Set[str] = {
     "admin_user_flags",
     "admin_logs",
     "dev_list_guilds",
+    "profile", "cooldowns", "rank", "compare", "lottery status",
+    "russian_roulette stats me", "russian_roulette stats wins", "russian_roulette stats rate",
 }
 
 
@@ -40,7 +42,8 @@ def register_app_command_lock(
         user = getattr(interaction, "user", None)
         if user is None:
             return True
-        command_name = getattr(getattr(interaction, "command", None), "name", "") or ""
+        command = getattr(interaction, "command", None)
+        command_name = getattr(command, "qualified_name", None) or getattr(command, "name", "") or ""
         if command_name in read_only:
             return True
         uid = int(user.id)

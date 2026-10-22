@@ -1,6 +1,7 @@
 # bot.py — 組裝與啟動入口（業務邏輯在 bot_modules/）
 
 import datetime
+import asyncio
 import os
 import sys
 import typing
@@ -15,6 +16,8 @@ from bot_modules import milestone_guild_repo
 from bot_modules import discord_helpers
 from bot_modules import discord_logging
 from bot_modules import assembly
+from bot_modules import state_repo
+from bot_modules.runtime import policy
 from bot_modules.async_bridge import build_async_wrappers
 from bot_modules.bot_core import (
     configure_stdio_line_buffering,
@@ -148,6 +151,8 @@ async def process_level_ups(
     new_lv: int,
     guild_id: typing.Optional[int] = None,
 ):
+    if not await policy.allowed(bot, member.id):
+        return
     await level_rewards.process_level_ups(
         member,
         old_lv,
@@ -190,12 +195,40 @@ _snapshot_cache_tasks = snapshot_cache.register_snapshot_cache(
 )
 
 app_lock.register_app_command_lock(bot, logger)
+policy.install_policy(bot, ALLOWED_HOST_IDS, logger)
+bot.game_store = state_repo.GameStore()
+bot.message_audit = state_repo.audit_message
+bot.settings_lock = asyncio.Lock()
+
+
+def initialize_bot_state():
+    init_db()
+    settings = state_repo.load_settings()
+    for feature in FEATURE_TOGGLES:
+        FEATURE_TOGGLES[feature] = bool(settings.get("feature:" + feature, FEATURE_TOGGLES[feature]))
+    set_share_enabled(bool(settings.get("feature:share", get_share_enabled())))
+    set_is_event_active(bool(settings.get("casino_open", get_is_event_active())))
+
+
+async def game_recovery_task():
+    await bot._db_ready_event.wait()
+    startup = True
+    while not bot.is_closed():
+        try:
+            recovered = await bot.game_store.call("recover", startup)
+            startup = False
+            if recovered:
+                logger.info("已恢復 %s 筆遊戲結算／退款", recovered)
+        except Exception:
+            logger.exception("遊戲結算恢復失敗，保留紀錄等待下次重試")
+        await asyncio.sleep(20)
 
 _relay_handlers = relay.register_relay(
     bot,
     {
         "logger": logger,
         "DM_RELAY_CHANNEL_ID": DM_RELAY_CHANNEL_ID,
+        "ALLOWED_HOST_IDS": ALLOWED_HOST_IDS,
         "DM_RELAY_NOTIFY_USER_ID": DM_RELAY_NOTIFY_USER_ID,
         "DISCORD_MESSAGE_CAP": DISCORD_MESSAGE_CAP,
         "split_discord_message_chunks": _split_discord_message_chunks,
@@ -233,11 +266,13 @@ _event_tasks = register_events(
     },
 )
 
+_event_tasks["game_recovery_task"] = game_recovery_task
+
 register_on_ready(
     bot,
     logger=logger,
     dm_relay_channel_id=DM_RELAY_CHANNEL_ID,
-    init_db=init_db,
+    init_db=initialize_bot_state,
     discord_log_register=discord_logging.register_discord_log_handler,
     event_tasks=_event_tasks,
     snapshot_cache_tasks=_snapshot_cache_tasks,

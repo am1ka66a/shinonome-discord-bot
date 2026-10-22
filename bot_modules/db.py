@@ -158,6 +158,8 @@ def db_cursor(commit: bool = False, connect=None):
 def init_db():
     with db_conn() as conn:
         c = conn.cursor()
+        from bot_modules.state_repo import init_state_tables
+        init_state_tables(c)
         c.execute(
             """CREATE TABLE IF NOT EXISTS users
                      (user_id VARCHAR(255) PRIMARY KEY, balance BIGINT, rescue_count INT DEFAULT 0,

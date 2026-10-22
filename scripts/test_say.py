@@ -60,6 +60,7 @@ class SayTests(unittest.TestCase):
     def invoke(self, **kwargs):
         # Every awaited I/O is mocked and returns immediately. Advancing this
         # coroutine directly avoids opening even the event loop's local sockets.
+        kwargs.setdefault("preview", False)
         coroutine = self.command.callback(self.inter, **kwargs)
         try:
             with self.assertRaises(StopIteration):
@@ -76,7 +77,7 @@ class SayTests(unittest.TestCase):
 
     def test_command_exposes_optional_image_and_reply(self):
         options = {p.name: p for p in self.command.parameters}
-        self.assertEqual(set(options), {"text", "channel", "image", "reply_to"})
+        self.assertEqual(set(options), {"text", "channel", "image", "reply_to", "preview"})
         self.assertTrue(all(not p.required for p in options.values()))
         self.assertEqual(options["image"].type, discord.AppCommandOptionType.attachment)
         self.assertIn(discord.ChannelType.public_thread, options["channel"].channel_types)

@@ -5,6 +5,7 @@ import typing
 import discord
 from discord import app_commands
 from bot_modules.ui.guards import serialized_action
+from bot_modules.runtime.policy import allowed
 
 
 def register_duel_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
@@ -15,6 +16,14 @@ def register_duel_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
     credit_balance_with_log_async = ctx["credit_balance_with_log_async"]
     settle_duel_payouts_with_log_async = ctx["settle_duel_payouts_with_log_async"]
     feature_toggles = ctx["FEATURE_TOGGLES"]
+    store = getattr(bot, "game_store", None)
+
+    async def debit(inter, uid, amount, sid):
+        if not await allowed(bot, uid):
+            return False
+        if store is not None:
+            return await store.call("debit", sid, "duel", uid, amount, str(inter.id), reason="E卡決鬥下注")
+        return await try_deduct_balance_async(uid, amount, "E卡決鬥下注")
 
     duel_cards = {
         "king": ("👑", "王"),
@@ -30,16 +39,19 @@ def register_duel_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         return "emperor"
 
     class EDuelInviteView(discord.ui.View):
-        def __init__(self, challenger: discord.Member, opponent: discord.Member, bet: int):
+        def __init__(self, challenger: discord.Member, opponent: discord.Member, bet: int, session_id=None):
             super().__init__(timeout=120)
             self.challenger = challenger
             self.opponent = opponent
             self.bet = int(bet)
+            self.session_id = session_id
             self.message: typing.Optional[discord.Message] = None
             self.resolved = False
             self._callback_lock = asyncio.Lock()
 
         async def _refund_challenger(self):
+            if store is not None and self.session_id:
+                return await store.finish(self.session_id, {}, reason="E卡決鬥取消退款", refund=True)
             await credit_balance_with_log_async(self.challenger.id, self.bet, "E卡決鬥取消退款")
 
         @discord.ui.button(label="接受", style=discord.ButtonStyle.success)
@@ -50,7 +62,7 @@ def register_duel_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             if self.resolved:
                 return await interaction.response.defer()
             await interaction_defer_if_needed(interaction, thinking=False)
-            if not await try_deduct_balance_async(self.opponent.id, self.bet, "E卡決鬥下注"):
+            if not await debit(interaction, self.opponent.id, self.bet, self.session_id):
                 return await interaction_send(interaction,
                     f"❌ 你的餘額不足，需要 `{self.bet:,}` 東雲幣才能接受此決鬥。",
                     ephemeral=True,
@@ -58,7 +70,7 @@ def register_duel_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             self.resolved = True
             for child in self.children:
                 child.disabled = True
-            match = EDuelMatch(self.challenger, self.opponent, self.bet)
+            match = EDuelMatch(self.challenger, self.opponent, self.bet, self.session_id)
             play = EDuelPlayView(match)
             match.view = play
             match.channel = interaction.channel
@@ -81,8 +93,8 @@ def register_duel_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             if self.resolved:
                 return await interaction.response.defer()
             await interaction_defer_if_needed(interaction, thinking=False)
-            self.resolved = True
             await self._refund_challenger()
+            self.resolved = True
             for child in self.children:
                 child.disabled = True
             await interaction.edit_original_response(
@@ -98,8 +110,8 @@ def register_duel_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         async def on_timeout(self):
             if self.resolved:
                 return
-            self.resolved = True
             await self._refund_challenger()
+            self.resolved = True
             for child in self.children:
                 child.disabled = True
             try:
@@ -141,10 +153,12 @@ def register_duel_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                 self.add_item(DuelCardButton(key, match, picker_id, cnt))
 
     class EDuelMatch:
-        def __init__(self, challenger: discord.Member, opponent: discord.Member, bet: int):
+        def __init__(self, challenger: discord.Member, opponent: discord.Member, bet: int, session_id=None):
             self.challenger = challenger
             self.opponent = opponent
             self.bet = int(bet)
+            self.session_id = session_id
+            self.pending_outcome = None
             first_emperor = random.choice([challenger.id, opponent.id])
             first_slave = opponent.id if first_emperor == challenger.id else challenger.id
             self.game_roles: typing.List[typing.Dict[int, str]] = [
@@ -292,6 +306,12 @@ def register_duel_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             return emb
 
         async def _refresh_message(self) -> None:
+            if store is not None and self.session_id:
+                await store.call("checkpoint", self.session_id, {
+                    "scores": self.scores, "hands": self.hands, "picks": self.picks,
+                    "game_no": self.game_no, "round_in_game": self.round_in_game,
+                    "history": self.round_history, "roles": self.game_roles,
+                })
             if not self.message or not self.view:
                 return
             try:
@@ -323,6 +343,8 @@ def register_duel_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             return "\n".join(lines)
 
         async def _refund_both(self, reason: str) -> None:
+            if store is not None and self.session_id:
+                return await store.finish(self.session_id, {}, reason=reason, refund=True)
             await credit_balance_with_log_async(self.challenger.id, self.bet, reason)
             await credit_balance_with_log_async(self.opponent.id, self.bet, reason)
 
@@ -337,14 +359,14 @@ def register_duel_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             else:
                 a_amt = pot * s_a // total
                 b_amt = pot - a_amt
-            await settle_duel_payouts_with_log_async(
-                self.challenger.id,
-                self.opponent.id,
-                a_amt,
-                b_amt,
-                s_a,
-                s_b,
-            )
+            if store is not None and self.session_id:
+                receipt = await store.finish(self.session_id, {self.challenger.id: a_amt, self.opponent.id: b_amt},
+                                             reason=f"E卡決鬥分配（積分 {s_a}:{s_b}）")
+                a_amt = receipt["credits"].get(str(self.challenger.id), 0)
+                b_amt = receipt["credits"].get(str(self.opponent.id), 0)
+                self.interrupted = "退回" in str(receipt["reason"])
+            else:
+                await settle_duel_payouts_with_log_async(self.challenger.id, self.opponent.id, a_amt, b_amt, s_a, s_b)
             return {"a": a_amt, "b": b_amt, "s_a": s_a, "s_b": s_b}
 
         def _build_final_embed(self, payouts: typing.Dict[str, int]) -> discord.Embed:
@@ -362,6 +384,9 @@ def register_duel_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                 outcome = f"🏆 {self.opponent.mention} 以 **{s_b} : {s_a}** 勝出！"
                 color = 0x57F287
             emb = discord.Embed(title="⚔️ E 卡決鬥｜整場結算", description=outcome, color=color)
+            if getattr(self, "interrupted", False):
+                emb.title = "E 卡決鬥｜中斷退款"
+                emb.description = "此局已中斷，以下為實際退回的注金。"
             emb.add_field(
                 name="積分",
                 value=(
@@ -390,6 +415,9 @@ def register_duel_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                 return await interaction.response.send_message("這是上一小局的選牌，請重新開啟選牌。", ephemeral=True)
             if self.settled:
                 return await interaction.response.send_message("此場決鬥已結束。", ephemeral=True)
+            if self.pending_outcome:
+                await interaction_defer_if_needed(interaction, ephemeral=True)
+                return await self.finish_pending()
             if picker_id in self.picks:
                 return await interaction.response.send_message("你本小局已經選過了。", ephemeral=True)
             if int(self.hands.get(picker_id, {}).get(key, 0) or 0) <= 0:
@@ -447,8 +475,20 @@ def register_duel_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                 await self._refresh_message()
                 return
 
-            self.settled = True
+            self.pending_outcome = "payout"
+            await self.finish_pending()
+
+        async def finish_pending(self):
+            if self.settled:
+                return
+            if self.pending_outcome == "refund":
+                await self._refund_both("E卡決鬥逾時退款")
+                self.settled = True
+                if self.view:
+                    self.view.stop()
+                return
             payouts = await self._settle_match()
+            self.settled = True
             if self.message and self.view:
                 for child in self.view.children:
                     child.disabled = True
@@ -462,8 +502,10 @@ def register_duel_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         async def handle_timeout(self, view: "EDuelPlayView") -> None:
             if self.settled or self.view is not view:
                 return
-            self.settled = True
-            await self._refund_both("E卡決鬥逾時退款")
+            if self.pending_outcome == "payout":
+                return await self.finish_pending()
+            self.pending_outcome = "refund"
+            await self.finish_pending()
             pending = []
             if self.challenger.id not in self.picks:
                 pending.append(self.challenger.mention)
@@ -496,6 +538,11 @@ def register_duel_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                 return await interaction.response.send_message("你不是這場決鬥的玩家。", ephemeral=True)
             if m.settled:
                 return await interaction.response.send_message("此場決鬥已結束。", ephemeral=True)
+            if m.pending_outcome:
+                await interaction_defer_if_needed(interaction, ephemeral=True)
+                async with m._callback_lock:
+                    await m.finish_pending()
+                return
             if interaction.user.id in m.picks:
                 return await interaction.response.send_message(
                     "你本小局已經選過了，等對手出牌。", ephemeral=True
@@ -533,13 +580,14 @@ def register_duel_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         await interaction_defer_if_needed(interaction)
         await ensure_user_exists_async(interaction.user.id, 50000)
         await ensure_user_exists_async(member.id, 50000)
-        if not await try_deduct_balance_async(interaction.user.id, bet, "E卡決鬥下注"):
+        session_id = f"duel:{interaction.id}"
+        if not await debit(interaction, interaction.user.id, bet, session_id):
             return await interaction_send(
                 interaction,
                 f"❌ 你的餘額不足，需要 `{bet:,}` 東雲幣才能發起決鬥。",
                 ephemeral=True,
             )
-        view = EDuelInviteView(interaction.user, member, bet)
+        view = EDuelInviteView(interaction.user, member, bet, session_id)
         sent = await interaction_send(
             interaction,
             content=(

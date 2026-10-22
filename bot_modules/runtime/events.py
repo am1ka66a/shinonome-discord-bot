@@ -5,6 +5,7 @@ import time
 import typing
 
 import discord
+from bot_modules.runtime.policy import allowed
 from bot_modules.runtime.locks import KeyedLocks
 
 
@@ -72,7 +73,8 @@ def register_events(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Dict[str, 
                     for member in vc.members:
                         if member.bot or member.voice.self_deaf or member.voice.deaf:
                             continue
-                        candidate_user_ids.add(str(member.id))
+                        if await allowed(bot, member.id):
+                            candidate_user_ids.add(str(member.id))
             try:
                 await db_to_thread(award_vc_rewards_sync, list(candidate_user_ids), now)
             except Exception as e:
@@ -204,6 +206,8 @@ def register_events(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Dict[str, 
             if not message.guild:
                 return
 
+            if not await allowed(bot, message.author.id):
+                return
             async with activity_locks.hold(message.author.id):
                 user_id = str(message.author.id)
                 now = now_tw_naive()

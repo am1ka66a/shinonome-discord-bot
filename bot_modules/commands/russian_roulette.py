@@ -2,6 +2,7 @@ import asyncio
 import logging
 import random
 import typing
+from bot_modules.runtime.policy import allowed
 from functools import wraps
 
 import discord
@@ -32,7 +33,11 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
     ensure_user_exists_async = ctx["ensure_user_exists_async"]
     interaction_send = ctx["interaction_send"]
     interaction_defer_if_needed = ctx["interaction_defer_if_needed"]
-    try_deduct_balance_async = ctx["try_deduct_balance_async"]
+    original_debit = ctx["try_deduct_balance_async"]
+    async def try_deduct_balance_async(uid, *args):
+        if not await allowed(bot, uid):
+            return False
+        return await original_debit(uid, *args)
     credit_balance_with_log_async = ctx["credit_balance_with_log_async"]
     fetch_rr_stats_async = ctx["fetch_rr_stats_async"]
     fetch_rr_leaderboard_async = ctx["fetch_rr_leaderboard_async"]

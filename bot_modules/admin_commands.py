@@ -358,8 +358,13 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
     async def lock_slash(interaction: discord.Interaction):
         if not is_slash_host(interaction):
             return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
-        set_is_event_active(not bool(get_is_event_active()))
-        await interaction.response.send_message(f"賭場狀態已切換：`{get_is_event_active()}`")
+        await interaction_defer_if_needed(interaction, ephemeral=True)
+        from bot_modules.state_repo import save_setting
+        async with bot.settings_lock:
+            enabled = not bool(get_is_event_active())
+            await asyncio.to_thread(save_setting, "casino_open", enabled)
+            set_is_event_active(enabled)
+        await interaction_send(interaction, f"賭場狀態已切換：`{get_is_event_active()}`", ephemeral=True)
 
     @bot.tree.command(name="adminhelp", description="[管理員] 查看管理指令清單")
     @app_commands.default_permissions(administrator=True)
@@ -749,12 +754,16 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
         if not is_slash_host(interaction):
             return await interaction.response.send_message("❌ 你沒有權限使用此指令！", ephemeral=True)
         feature = (feature or "").strip().lower()
-        if feature == "share":
-            set_share_enabled(bool(enabled))
-        else:
-            if feature not in feature_toggles:
-                return await interaction.response.send_message("不支援的功能名稱。", ephemeral=True)
-            feature_toggles[feature] = bool(enabled)
+        if feature != "share" and feature not in feature_toggles:
+            return await interaction.response.send_message("不支援的功能名稱。", ephemeral=True)
+        await interaction_defer_if_needed(interaction, ephemeral=True)
+        from bot_modules.state_repo import save_setting
+        async with bot.settings_lock:
+            await asyncio.to_thread(save_setting, "feature:" + feature, bool(enabled))
+            if feature == "share":
+                set_share_enabled(bool(enabled))
+            else:
+                feature_toggles[feature] = bool(enabled)
         status = "啟用" if enabled else "停用"
         state_lines = [
             f"rob: {'on' if feature_toggles.get('rob', True) else 'off'}",
@@ -766,7 +775,7 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
             f"russian_roulette: {'on' if feature_toggles.get('russian_roulette', True) else 'off'}",
             f"share: {'on' if get_share_enabled() else 'off'}",
         ]
-        await interaction.response.send_message(
+        await interaction_send(interaction,
             f"✅ 功能 `{feature}` 已設為 **{status}**\n目前狀態：\n" + "\n".join(state_lines),
             ephemeral=True,
         )
