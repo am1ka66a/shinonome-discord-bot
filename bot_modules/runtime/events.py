@@ -206,6 +206,9 @@ def register_events(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Dict[str, 
             if not message.guild:
                 return
 
+            ready = getattr(bot, "_db_ready_event", None)
+            if ready is not None and not ready.is_set():
+                return
             if not await allowed(bot, message.author.id):
                 return
             async with activity_locks.hold(message.author.id):

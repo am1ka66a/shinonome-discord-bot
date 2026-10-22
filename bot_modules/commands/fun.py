@@ -31,43 +31,6 @@ def register_fun_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
     ALLOWED_HOST_IDS = ctx["ALLOWED_HOST_IDS"]
     logger = logging.getLogger(__name__)
 
-    class SayPreview(discord.ui.View):
-        def __init__(self, owner_id, arguments):
-            super().__init__(timeout=120)
-            self.owner_id = owner_id
-            self.arguments = arguments
-            self.used = False
-            self.lock = asyncio.Lock()
-
-        async def interaction_check(self, interaction):
-            if interaction.user.id != self.owner_id or interaction.user.id not in ALLOWED_HOST_IDS:
-                await interaction_send(interaction, "只有原操作者可以確認發送。", ephemeral=True)
-                return False
-            return True
-
-        @discord.ui.button(label="確認發送", style=discord.ButtonStyle.success)
-        async def confirm(self, interaction, button):
-            if not await self.interaction_check(interaction):
-                return
-            await interaction_defer_if_needed(interaction, ephemeral=True)
-            async with self.lock:
-                if self.used or self.is_finished():
-                    return await interaction_send(interaction, "這個預覽已失效，請重新使用 /say。", ephemeral=True)
-                self.used = True
-                self.stop()
-                await interaction.edit_original_response(view=None)
-                await say_slash.callback(interaction, **self.arguments, preview=False)
-
-        @discord.ui.button(label="取消", style=discord.ButtonStyle.secondary)
-        async def cancel(self, interaction, button):
-            if not await self.interaction_check(interaction):
-                return
-            async with self.lock:
-                if self.used:
-                    return await interaction_send(interaction, "這個預覽已處理。", ephemeral=True)
-                self.used = True
-                self.stop()
-                await interaction.response.edit_message(content="已取消發送。", embed=None, view=None)
     ROB_BASE_SUCCESS_RATE = ctx["ROB_BASE_SUCCESS_RATE"]
     COP_HUNT_CAPTURE_BASE_PCT = ctx["COP_HUNT_CAPTURE_BASE_PCT"]
     COP_HUNT_CAPTURE_PER_STAR_PCT = ctx["COP_HUNT_CAPTURE_PER_STAR_PCT"]
@@ -337,7 +300,6 @@ def register_fun_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         channel="目標文字頻道／討論串（未填時使用訊息連結的頻道，或目前頻道）",
         image="要上傳的圖片（可與文字一起發送）",
         reply_to="要回覆的訊息連結，或目標頻道內的訊息 ID（選填）",
-        preview="先顯示預覽，確認後才發送（預設開啟）",
     )
     @app_commands.guild_only()
     @app_commands.default_permissions(manage_messages=True)
@@ -347,7 +309,11 @@ def register_fun_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         channel: typing.Optional[typing.Union[discord.TextChannel, discord.Thread]] = None,
         image: typing.Optional[discord.Attachment] = None,
         reply_to: typing.Optional[str] = None,
-        preview: bool = True,
+    ):
+        await send_say(interaction, text=text, channel=channel, image=image, reply_to=reply_to)
+
+    async def send_say(
+        interaction, *, text=None, channel=None, image=None, reply_to=None, request_id=None,
     ):
         if interaction.user.id not in ALLOWED_HOST_IDS:
             return await interaction_send(interaction, "❌ 你沒有權限使用此指令！", ephemeral=True)
@@ -384,7 +350,7 @@ def register_fun_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
 
         upload = None
         audit = getattr(bot, "message_audit", None)
-        request_id = f"say:{interaction.id}"
+        request_id = request_id or f"say:{interaction.id}"
         audit_saved = False
 
         async def record_rejection():
@@ -408,19 +374,6 @@ def register_fun_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                 original = await target_channel.fetch_message(message_id)
                 kwargs["reference"] = original.to_reference(fail_if_not_exists=True)
                 kwargs["mention_author"] = False
-            if preview:
-                embed = discord.Embed(title="機器人發話預覽", description=content or "（只有圖片）")
-                embed.add_field(name="目標頻道", value=target_channel.mention, inline=False)
-                if message_id is not None:
-                    embed.add_field(name="回覆原訊息", value=f"[查看原訊息]({original.jump_url})", inline=False)
-                if image is not None:
-                    embed.add_field(name="圖片", value=image.filename, inline=False)
-                    if not image.is_spoiler():
-                        embed.set_image(url=image.url)
-                embed.set_footer(text="120 秒內確認才會發送；逾時請重新使用 /say。")
-                arguments = dict(text=text, channel=target_channel, image=image, reply_to=reply_to)
-                return await interaction_send(interaction, embed=embed,
-                                              view=SayPreview(interaction.user.id, arguments), ephemeral=True)
             if image is not None:
                 upload = await image.to_file(spoiler=image.is_spoiler())
                 kwargs["file"] = upload

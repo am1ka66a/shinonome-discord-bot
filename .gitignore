@@ -11,6 +11,7 @@ venv/
 env/
 ENV/
 .venv/
+.local-state/
 
 # IDE files
 .vscode/

@@ -15,6 +15,38 @@ _mysql_pool = None
 _mysql_pool_lock = threading.Lock()
 
 
+class _RecentMySQLConnection(pymysql.connections.Connection):
+    """Avoid a separate network ping after a recent successful query."""
+
+    def query(self, *args, **kwargs):
+        try:
+            result = super().query(*args, **kwargs)
+        except BaseException:
+            self._last_verified_query = None
+            raise
+        self._last_verified_query = time.monotonic()
+        return result
+
+    def ping(self, reconnect=True):
+        verified = getattr(self, "_last_verified_query", None)
+        interval = float(os.getenv("MYSQL_HEALTHCHECK_IDLE_SECONDS", "15"))
+        if self._sock is not None and verified is not None and time.monotonic() - verified < interval:
+            return
+        result = super().ping(reconnect=reconnect)
+        self._last_verified_query = time.monotonic()
+        return result
+
+
+class _PooledMySQLDriver:
+    # DBUtils accepts a DB-API provider; expose the original exception classes
+    # so its failure detection remains identical to the PyMySQL module.
+    connect = _RecentMySQLConnection
+    threadsafety = pymysql.threadsafety
+    OperationalError = pymysql.OperationalError
+    InterfaceError = pymysql.InterfaceError
+    InternalError = pymysql.InternalError
+
+
 def _mysql_connect_kwargs() -> dict:
     """供連線池建立時傳入 pymysql.connect 的參數。"""
     mysql_url = os.getenv("MYSQL_URL") or os.getenv("DATABASE_URL")
@@ -30,6 +62,8 @@ def _mysql_connect_kwargs() -> dict:
                 "charset": "utf8mb4",
                 "init_command": "SET time_zone = '+08:00'",
                 "connect_timeout": int(os.getenv("MYSQL_CONNECT_TIMEOUT", "10")),
+                "read_timeout": int(os.getenv("MYSQL_READ_TIMEOUT", "30")),
+                "write_timeout": int(os.getenv("MYSQL_WRITE_TIMEOUT", "30")),
             }
     return {
         "host": os.getenv("MYSQLHOST") or os.getenv("DB_HOST"),
@@ -40,6 +74,8 @@ def _mysql_connect_kwargs() -> dict:
         "charset": "utf8mb4",
         "init_command": "SET time_zone = '+08:00'",
         "connect_timeout": int(os.getenv("MYSQL_CONNECT_TIMEOUT", "10")),
+        "read_timeout": int(os.getenv("MYSQL_READ_TIMEOUT", "30")),
+        "write_timeout": int(os.getenv("MYSQL_WRITE_TIMEOUT", "30")),
     }
 
 
@@ -62,12 +98,13 @@ def _get_mysql_pool() -> PooledDB:
                 _ensure_mysql_auth_deps()
                 kw = _mysql_connect_kwargs()
                 _mysql_pool = PooledDB(
-                    creator=pymysql,
+                    creator=_PooledMySQLDriver,
                     mincached=int(os.getenv("MYSQL_POOL_MINCACHED", "1")),
                     maxcached=int(os.getenv("MYSQL_POOL_MAXCACHED", "8")),
                     maxconnections=int(os.getenv("MYSQL_POOL_MAX", "16")),
-                    # 用到一定次數就丟，避免連線活超過 MySQL wait_timeout / proxy idle
-                    maxusage=int(os.getenv("MYSQL_POOL_MAXUSAGE", "50")),
+                    # Keep healthy connections; recycling every 50 statements
+                    # adds repeated remote authentication and connection setup.
+                    maxusage=int(os.getenv("MYSQL_POOL_MAXUSAGE", "0")),
                     blocking=True,
                     # ping=2（建立游標時檢查）而非預設的 1（自池中取出時檢查）：
                     # DBUtils 重連失敗時會靜默發出死連線，之後 query 才炸成
@@ -156,7 +193,10 @@ def db_cursor(commit: bool = False, connect=None):
 
 
 def init_db():
-    with db_conn() as conn:
+    # Legacy migrations deliberately catch duplicate-column/index errors.
+    # DBUtils treats MySQL's OperationalError for those as a lost connection
+    # and reconnects/replays DDL. Use one direct connection for schema setup.
+    with db_conn(connect=lambda: pymysql.connect(**_mysql_connect_kwargs())) as conn:
         c = conn.cursor()
         from bot_modules.state_repo import init_state_tables
         init_state_tables(c)

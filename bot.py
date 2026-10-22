@@ -405,7 +405,8 @@ except discord.errors.PrivilegedIntentsRequired:
         sys.stdout.flush()
         sys.stderr.flush()
         try:
-            os.execv(sys.executable, [sys.executable, os.path.abspath(sys.argv[0]), *sys.argv[1:]])
+            entrypoint = os.environ.get("SHINONOME_LOCAL_LAUNCHER") or os.path.abspath(sys.argv[0])
+            os.execv(sys.executable, [sys.executable, entrypoint, *sys.argv[1:]])
         except OSError:
             logger.exception("降級重啟失敗，只能結束程序。")
     raise

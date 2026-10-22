@@ -9,6 +9,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from bot_modules.db import is_transient_db_error
+
 
 def setup_bot_logging() -> logging.Logger:
     """主程序日誌：主控台必出；若設定 BOT_LOG_FILE 或 LOG_FILE 則同步寫入檔案。"""
@@ -174,15 +176,22 @@ def register_on_ready(
     async def initialize_ready():
         nonlocal initialized
         discord_log_register(bot, logger, default_channel_id=dm_relay_channel_id)
-        if not initialized:
+        retry_delay = 5
+        while not initialized and not bot.is_closed():
             try:
                 await asyncio.to_thread(init_db)
                 initialized = True
                 bot._db_ready_event.set()
                 logger.info("資料庫初始化完成")
             except Exception as e:
-                logger.exception("init_db 失敗: %s", e)
-                return
+                if not is_transient_db_error(e):
+                    logger.exception("init_db 失敗: %s", e)
+                    return
+                logger.warning("資料庫暫時無法連線，%s 秒後重試初始化（%s）", retry_delay, type(e).__name__)
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(30, retry_delay * 2)
+        if not initialized:
+            return
         try:
             synced = await bot.tree.sync()
             logger.info("Slash 指令同步完成: %s 個", len(synced))

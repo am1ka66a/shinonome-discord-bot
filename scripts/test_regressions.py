@@ -150,6 +150,18 @@ class AsyncRegressions(unittest.IsolatedAsyncioTestCase):
         await self.bot.on_ready()
         job.assert_not_called()
 
+    async def test_transient_initialization_failure_retries_and_becomes_ready(self):
+        from bot_modules.db import pymysql
+        init = Mock(side_effect=[pymysql.OperationalError(2003, 'DNS unavailable'), None])
+        bot_core.register_on_ready(self.bot, logger=Mock(), dm_relay_channel_id=0,
+            init_db=init, discord_log_register=Mock(), event_tasks={}, snapshot_cache_tasks={})
+        with patch.object(bot_core.asyncio, 'sleep', new=AsyncMock()) as sleep, \
+                patch.object(self.bot.tree, 'sync', new=AsyncMock(return_value=[])):
+            await self.bot.on_ready()
+        self.assertEqual(init.call_count, 2)
+        sleep.assert_awaited_once_with(5)
+        self.assertTrue(self.bot._db_ready_event.is_set())
+
     async def test_duel_invite_accept_and_timeout_do_not_both_settle(self):
         duel.register_duel_commands(self.bot, self.ctx)
         cls = nested_class(self.bot, 'duel', 'EDuelInviteView')

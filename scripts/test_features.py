@@ -15,7 +15,6 @@ from bot_modules.commands import blackjack, duel, economy, fun
 from bot_modules.runtime import policy
 from test_regressions import context, interaction, nested_class, ROOT
 
-
 class FeatureTests(unittest.TestCase):
     def setUp(self):
         self.bot = commands.Bot(command_prefix="!", intents=discord.Intents.none())
@@ -94,40 +93,6 @@ class FeatureTests(unittest.TestCase):
         self.run_now(view.children[0].callback(interaction()))
         self.ctx["try_deduct_balance_async"].assert_not_awaited()
 
-    def test_say_preview_does_not_send_until_owner_confirms(self):
-        fun.register_fun_commands(self.bot, self.ctx)
-        inter = interaction(command="say")
-        inter.guild = SimpleNamespace(id=111111111111111111)
-        channel = Mock(spec=discord.TextChannel)
-        channel.guild = inter.guild
-        channel.id = 222222222222222222
-        channel.mention = "<#222222222222222222>"
-        channel.send = AsyncMock(return_value=SimpleNamespace(id=30, jump_url="https://discord.com/channels/1/2/30"))
-        inter.channel = channel
-        self.run_now(self.bot.tree.get_command("say").callback(inter, text="公告"))
-        channel.send.assert_not_awaited()
-        preview = inter.followup.send.call_args.kwargs["view"]
-        self.addCleanup(preview.stop)
-        confirmation = interaction(iid=101, command="say")
-        confirmation.guild, confirmation.channel = inter.guild, channel
-        self.run_now(preview.children[0].callback(confirmation))
-        self.run_now(preview.children[0].callback(interaction(iid=102)))
-        channel.send.assert_awaited_once_with("公告")
-
-    def test_say_cancel_removes_preview_without_sending(self):
-        fun.register_fun_commands(self.bot, self.ctx)
-        inter = interaction(command="say")
-        inter.guild = SimpleNamespace(id=1)
-        channel = Mock(spec=discord.TextChannel)
-        channel.guild, channel.id, channel.mention = inter.guild, 2, "<#2>"
-        channel.send = AsyncMock()
-        inter.channel = channel
-        self.run_now(self.bot.tree.get_command("say").callback(inter, text="取消"))
-        preview = inter.followup.send.call_args.kwargs["view"]
-        self.run_now(preview.children[1].callback(interaction(iid=101)))
-        channel.send.assert_not_awaited()
-        self.assertTrue(preview.used)
-
     def audit_case(self, audit):
         self.bot.message_audit = audit
         fun.register_fun_commands(self.bot, self.ctx)
@@ -140,7 +105,7 @@ class FeatureTests(unittest.TestCase):
         async def direct(function, *args):
             return function(*args)
         with patch.object(fun.asyncio, "to_thread", new=direct):
-            self.run_now(self.bot.tree.get_command("say").callback(inter, text="公告", preview=False))
+            self.run_now(self.bot.tree.get_command("say").callback(inter, text="announcement"))
         return inter, channel
 
     def test_say_audit_unavailable_prevents_unrecorded_send(self):
@@ -194,7 +159,6 @@ class FeatureTests(unittest.TestCase):
             inter.command.qualified_name = "russian_roulette stats me"
             self.assertTrue(self.run_now(self.bot.tree.interaction_check(inter)))
             previous.assert_awaited_once()
-
 
 if __name__ == "__main__":
     unittest.main()
