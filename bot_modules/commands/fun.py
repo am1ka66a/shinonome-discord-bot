@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 import random
+import re
 import typing
 
 import discord
@@ -8,6 +9,21 @@ from discord import app_commands
 
 from bot_modules.db import db_cursor
 from bot_modules.discord_helpers import interaction_defer_if_needed, interaction_send
+
+
+def parse_say_reply_target(value: str) -> typing.Tuple[typing.Optional[int], typing.Optional[int], int]:
+    """Accept a message ID or a server message link; never fetch arbitrary URLs."""
+    raw = value.strip().removeprefix("<").removesuffix(">")
+    if re.fullmatch(r"[0-9]{15,20}", raw):
+        return None, None, int(raw)
+    match = re.fullmatch(
+        r"https://(?:(?:ptb|canary)\.)?discord(?:app)?\.com/channels/"
+        r"([0-9]{15,20})/([0-9]{15,20})/([0-9]{15,20})(?:[?#][^\s]*)?",
+        raw,
+    )
+    if not match:
+        raise ValueError("請貼上 Discord 訊息連結，或指定頻道內的訊息 ID。")
+    return tuple(int(part) for part in match.groups())
 
 
 def register_fun_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
@@ -275,13 +291,87 @@ def register_fun_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             )
         return await interaction_send(interaction, outcome)
 
-    @bot.tree.command(name="say", description="[管理員] 指定機器人對特定頻道發送內容")
-    @app_commands.describe(text="你要機器人說什麼？", channel="指定發送到哪個頻道？(選填)")
+    @bot.tree.command(name="say", description="[管理員] 讓機器人發送文字、圖片，或回覆指定訊息")
+    @app_commands.describe(
+        text="要發送的文字（可留空，只發圖片）",
+        channel="目標文字頻道／討論串（未填時使用訊息連結的頻道，或目前頻道）",
+        image="要上傳的圖片（可與文字一起發送）",
+        reply_to="要回覆的訊息連結，或目標頻道內的訊息 ID（選填）",
+    )
+    @app_commands.guild_only()
     @app_commands.default_permissions(manage_messages=True)
-    async def say_slash(interaction: discord.Interaction, text: str, channel: discord.TextChannel = None):
-        await interaction_defer_if_needed(interaction)
+    async def say_slash(
+        interaction: discord.Interaction,
+        text: typing.Optional[str] = None,
+        channel: typing.Optional[typing.Union[discord.TextChannel, discord.Thread]] = None,
+        image: typing.Optional[discord.Attachment] = None,
+        reply_to: typing.Optional[str] = None,
+    ):
         if interaction.user.id not in ALLOWED_HOST_IDS:
             return await interaction_send(interaction, "❌ 你沒有權限使用此指令！", ephemeral=True)
+        if interaction.guild is None:
+            return await interaction_send(interaction, "請在伺服器頻道使用此指令。", ephemeral=True)
+        await interaction_defer_if_needed(interaction, ephemeral=True)
+        content = text if text and text.strip() else None
+        if content is None and image is None:
+            return await interaction_send(interaction, "請至少填寫文字或上傳一張圖片。", ephemeral=True)
+        if content is not None and len(content) > 2000:
+            return await interaction_send(interaction, "文字長度不能超過 2,000 字。", ephemeral=True)
+        if image is not None:
+            mime = (image.content_type or "").lower()
+            extension = image.filename.rsplit(".", 1)[-1].lower()
+            if not mime.startswith("image/") and not (
+                not mime and extension in {"png", "jpg", "jpeg", "gif", "webp", "avif"}
+            ):
+                return await interaction_send(interaction, "image 欄位只接受圖片檔案。", ephemeral=True)
+            if image.size > interaction.guild.filesize_limit:
+                return await interaction_send(interaction, "圖片超過這個伺服器的附件大小上限。", ephemeral=True)
+
         target_channel = channel or interaction.channel
-        await target_channel.send(text)
-        await interaction_send(interaction, f"✅ 訊息已發送到 {target_channel.mention}！", ephemeral=True)
+        message_id = None
+        linked_channel_id = None
+        if reply_to is not None:
+            try:
+                guild_id, linked_channel_id, message_id = parse_say_reply_target(reply_to)
+            except ValueError as exc:
+                return await interaction_send(interaction, str(exc), ephemeral=True)
+            if guild_id is not None and guild_id != interaction.guild.id:
+                return await interaction_send(interaction, "請使用目前伺服器內的訊息連結。", ephemeral=True)
+            if channel is not None and linked_channel_id is not None and channel.id != linked_channel_id:
+                return await interaction_send(interaction, "訊息連結與指定頻道不同，請確認 channel 或移除它。", ephemeral=True)
+
+        upload = None
+        try:
+            if linked_channel_id is not None and channel is None:
+                target_channel = bot.get_channel(linked_channel_id)
+                if target_channel is None:
+                    target_channel = await bot.fetch_channel(linked_channel_id)
+            if not isinstance(target_channel, (discord.TextChannel, discord.Thread)):
+                return await interaction_send(interaction, "請指定文字頻道或討論串。", ephemeral=True)
+            if target_channel.guild.id != interaction.guild.id:
+                return await interaction_send(interaction, "只能在目前伺服器內發話。", ephemeral=True)
+
+            kwargs: typing.Dict[str, typing.Any] = {}
+            if message_id is not None:
+                original = await target_channel.fetch_message(message_id)
+                kwargs["reference"] = original.to_reference(fail_if_not_exists=True)
+                kwargs["mention_author"] = False
+            if image is not None:
+                upload = await image.to_file(spoiler=image.is_spoiler())
+                kwargs["file"] = upload
+            sent = await target_channel.send(content, **kwargs)
+        except discord.Forbidden:
+            return await interaction_send(
+                interaction, "❌ 機器人沒有足夠權限，請確認目標頻道的查看、發送訊息、讀取歷史訊息及附加檔案權限。", ephemeral=True,
+            )
+        except discord.NotFound:
+            return await interaction_send(interaction, "❌ 找不到指定頻道、訊息或圖片，可能已刪除。", ephemeral=True)
+        except discord.HTTPException:
+            return await interaction_send(interaction, "❌ Discord 未能完成發送；請先確認目標頻道是否已收到，再決定是否重試。", ephemeral=True)
+        finally:
+            if upload is not None:
+                upload.close()
+        action = "回覆" if message_id is not None else "發送"
+        await interaction_send(
+            interaction, f"✅ 已{action}到 {target_channel.mention}！[查看訊息]({sent.jump_url})", ephemeral=True,
+        )

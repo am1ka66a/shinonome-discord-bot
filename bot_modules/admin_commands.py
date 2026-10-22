@@ -377,7 +377,7 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
 `/lock` - 開關賭場營業狀態
 `/resetall_zero` - 全服餘額清零（含統計重置）
 `/resetall_default` - 全服重置為 50,000（含統計重置）
-`/say` - 指定機器人到頻道發言
+`/say` - 指定頻道／討論串發送文字或圖片；reply_to 可貼訊息連結或 ID 來回覆
 `/share_stats` - 查看賭場回收分潤統計
 `/admin_balance_set` - 直接設定玩家餘額
 `/admin_user_flags` - 查看玩家關鍵狀態（通緝/監獄/良民證/黑名單等）
