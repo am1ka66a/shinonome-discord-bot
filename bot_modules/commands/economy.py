@@ -12,7 +12,6 @@ from bot_modules.runtime.policy import require_allowed
 def register_economy_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
     FEATURE_TOGGLES = ctx["FEATURE_TOGGLES"]
     MAX_LEVEL = ctx["MAX_LEVEL"]
-    LEVEL_MILESTONE_COINS = ctx["LEVEL_MILESTONE_COINS"]
     RED_PACKET_MIN_SECONDS = ctx["RED_PACKET_MIN_SECONDS"]
     red_packet_seq_ref = ctx["red_packet_seq_ref"]
     resolve_slash_target = ctx["resolve_slash_target"]
@@ -26,7 +25,6 @@ def register_economy_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
     get_user_stats_async = ctx["get_user_stats_async"]
     get_level_stats_async = ctx["get_level_stats_async"]
     calc_level_from_exp = ctx["calc_level_from_exp"]
-    get_claimed_milestones_async = ctx["get_claimed_milestones_async"]
     build_exp_progress_bar = ctx["build_exp_progress_bar"]
     transfer_sync_async = ctx["transfer_sync_async"]
     try_deduct_balance_async = ctx["try_deduct_balance_async"]
@@ -288,17 +286,8 @@ def register_economy_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         level_num = int(lv_row[1] or 1)
         calc_lv, cur_progress, next_need = calc_level_from_exp(exp)
         level_num = max(level_num, calc_lv)
-        claimed = await get_claimed_milestones_async(target.id)
         bar = build_exp_progress_bar(cur_progress, next_need) if level_num < MAX_LEVEL else "▓" * 12 + "  100%"
         need_more = (next_need - cur_progress) if level_num < MAX_LEVEL and next_need > 0 else 0
-        ms_lines = []
-        for m, coins in sorted(LEVEL_MILESTONE_COINS.items()):
-            if m in claimed:
-                ms_lines.append(f"**Lv.{m}** — ✅ 已領 {coins:,} 幣")
-            elif level_num < m:
-                ms_lines.append(f"**Lv.{m}** — 💰 達到 Lv.{m} 領 {coins:,} 幣")
-            else:
-                ms_lines.append(f"**Lv.{m}** — 已達此級（獎勵僅在**升級當下首次跨過**時發放，不事後補發）")
         emb = discord.Embed(title="🏅 等級與經驗", color=0x2b2d31)
         av = target.display_avatar.url if getattr(target, "display_avatar", None) else None
         emb.set_author(name=target.display_name, icon_url=av)
@@ -311,11 +300,6 @@ def register_economy_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                 f"📈 本級累積 **{cur_progress:,} / {next_need:,}** EXP，尚餘 **{need_more:,}** EXP 可升 Lv.{level_num + 1}\n"
                 f"`{bar}`"
             )
-        emb.add_field(
-            name="階段里程碑 Lv.20／40／60／80／100",
-            value="\n".join(ms_lines) or "未設定",
-            inline=False,
-        )
         await interaction_send(interaction, embed=emb)
 
     @bot.tree.command(name="transfer", description="轉帳給其他玩家")

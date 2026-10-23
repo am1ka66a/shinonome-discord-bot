@@ -21,15 +21,14 @@ class DatabaseStartupTests(unittest.TestCase):
                 raise db.pymysql.OperationalError(1061, "Duplicate key")
         cursor.execute.side_effect = execute
         with patch.object(db, "_get_mysql_pool", side_effect=AssertionError("DDL must not use pool")), \
-                patch.object(db.pymysql, "connect", return_value=conn) as connect, \
-                patch("bot_modules.milestone_guild_repo.seed_milestone_guild_whitelist_from_env"), \
-                patch("bot_modules.milestone_guild_repo.reload_milestone_guild_whitelist_cache"):
+                patch.object(db.pymysql, "connect", return_value=conn) as connect:
             db.init_db()
         connect.assert_called_once()
         ddl = [call.args[0] for call in cursor.execute.call_args_list
                if call.args[0].startswith("ALTER TABLE")]
         self.assertTrue(ddl)
         self.assertEqual(len(ddl), len(set(ddl)))
+        self.assertFalse(any("milestone" in call.args[0].lower() for call in cursor.execute.call_args_list))
         conn.commit.assert_called_once()
         conn.close.assert_called_once()
 

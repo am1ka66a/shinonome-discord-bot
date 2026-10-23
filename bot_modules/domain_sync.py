@@ -7,7 +7,6 @@ from bot_modules import economy_repo
 from bot_modules import economy_service
 from bot_modules import game_repo
 from bot_modules import lottery_repo
-from bot_modules import milestone_guild_repo
 from bot_modules import rr_repo
 from bot_modules import rr_match_repo
 from bot_modules import rob_repo
@@ -438,11 +437,6 @@ def get_level_stats(user_id):
 def add_user_exp(user_id, amount):
     return game_repo.add_user_exp(get_db_connection, calc_level_from_exp, user_id, amount)
 
-def get_claimed_milestones(user_id) -> set:
-    return game_repo.get_claimed_milestones(get_db_connection, user_id)
-
-def try_claim_milestone(user_id, milestone, coin_amount) -> int:
-    return game_repo.try_claim_milestone(get_db_connection, log_transaction_in_tx, user_id, milestone, coin_amount)
 
 def build_exp_progress_bar(cur: int, need: int, width: int = 12) -> str:
     return game_repo.build_exp_progress_bar(cur, need, width)
@@ -588,18 +582,6 @@ def fetch_rr_stats_sync(user_id: int):
 
 def fetch_rr_leaderboard_sync(limit: int = 10):
     return rr_repo.fetch_rr_leaderboard_sync(limit=limit)
-
-
-def add_milestone_guild_sync(guild_id: int, added_by: typing.Optional[int] = None):
-    return milestone_guild_repo.add_milestone_guild_sync(guild_id, added_by)
-
-
-def remove_milestone_guild_sync(guild_id: int):
-    return milestone_guild_repo.remove_milestone_guild_sync(guild_id)
-
-
-def list_milestone_guilds_sync():
-    return milestone_guild_repo.list_milestone_guilds_sync()
 
 
 def save_rr_match_sync(

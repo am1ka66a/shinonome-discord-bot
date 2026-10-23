@@ -20,7 +20,6 @@ def register_events(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Dict[str, 
     relay_staff_reply_to_dm_user = ctx["relay_staff_reply_to_dm_user"]
     relay_user_message_to_staff_channel = ctx["relay_user_message_to_staff_channel"]
     process_on_message_activity_sync = ctx["process_on_message_activity_sync"]
-    process_level_ups = ctx["process_level_ups"]
     cleanup_local_caches = ctx.get("cleanup_local_caches")
     finalize_due_lottery_rounds_async = ctx.get("finalize_due_lottery_rounds_async")
     lottery_draw_check_seconds = float(ctx.get("LOTTERY_DRAW_CHECK_SECONDS", 3600))
@@ -33,7 +32,6 @@ def register_events(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Dict[str, 
     chat_exp_multiplier = int(ctx["CHAT_EXP_MULTIPLIER"])
     log_retention_days = int(ctx["LOG_RETENTION_DAYS"])
     log_purge_interval_seconds = int(ctx["LOG_PURGE_INTERVAL_SECONDS"])
-    level_mile_tiers = tuple(ctx["LEVEL_MILE_TIERS"])
 
     pending_msg_counts = ctx["_pending_msg_counts"]
     last_msg_flush_ts = ctx["_last_msg_flush_ts"]
@@ -239,12 +237,6 @@ def register_events(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Dict[str, 
                 last_msg_flush_ts[user_id] = now_ts
                 if result.get("exp_awarded"):
                     last_exp_award_ts[user_id] = now_ts
-                    o = int(result.get("old_level") or 1)
-                    n = int(result.get("new_level") or 1)
-                    if n > o and any(o < m <= n for m in level_mile_tiers):
-                        asyncio.create_task(
-                            process_level_ups(message.author, o, n, guild_id=message.guild.id)
-                        )
         except Exception as e:
             logger.exception("on_message 錯誤: %s", e)
         finally:

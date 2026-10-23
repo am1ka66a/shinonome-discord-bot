@@ -59,30 +59,6 @@ def add_user_exp(get_db_connection, calc_level_from_exp_func, user_id, amount):
     return old_level, new_level, new_exp
 
 
-def get_claimed_milestones(get_db_connection, user_id) -> set:
-    with db_cursor(connect=get_db_connection) as c:
-        c.execute("SELECT milestone FROM level_milestone_claims WHERE user_id=%s", (str(user_id),))
-        rows = c.fetchall()
-    return {int(r[0]) for r in rows} if rows else set()
-
-
-def try_claim_milestone(get_db_connection, log_transaction_in_tx, user_id, milestone, coin_amount) -> int:
-    with db_cursor(commit=True, connect=get_db_connection) as c:
-        c.execute("SELECT user_id FROM users WHERE user_id=%s FOR UPDATE", (str(user_id),))
-        if not c.fetchone():
-            return -1
-        c.execute("SELECT 1 FROM level_milestone_claims WHERE user_id=%s AND milestone=%s", (str(user_id), milestone))
-        if c.fetchone():
-            return -1
-        c.execute("INSERT INTO level_milestone_claims (user_id, milestone) VALUES (%s, %s)", (str(user_id), milestone))
-        added = 0
-        if coin_amount and coin_amount > 0:
-            c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (coin_amount, str(user_id)))
-            log_transaction_in_tx(c, user_id, coin_amount, f"等級里程碑 Lv.{milestone}")
-            added = coin_amount
-    return added
-
-
 def build_exp_progress_bar(cur: int, need: int, width: int = 12) -> str:
     if need <= 0:
         return "▓" * width + " 100%"

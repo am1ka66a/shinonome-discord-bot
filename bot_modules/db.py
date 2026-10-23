@@ -415,35 +415,14 @@ def init_db():
             c.execute("CREATE INDEX idx_users_level_exp ON users (level, exp)")
         except Exception:
             pass
-        c.execute(
-            """CREATE TABLE IF NOT EXISTS level_milestone_claims (
-                     user_id VARCHAR(255) NOT NULL,
-                     milestone INT NOT NULL,
-                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                     PRIMARY KEY (user_id, milestone)
-                     )"""
-        )
-        # 清除舊版里程碑（10/25/50），改為 20/40/60/80/100 後不再使用
-        try:
-            c.execute("DELETE FROM level_milestone_claims WHERE milestone IN (10, 25, 50)")
-        except Exception:
-            pass
         from bot_modules.lottery_repo import init_lottery_tables
-        from bot_modules.milestone_guild_repo import (
-            init_milestone_guild_whitelist_table,
-            reload_milestone_guild_whitelist_cache,
-            seed_milestone_guild_whitelist_from_env,
-        )
         from bot_modules.rr_repo import init_rr_stats_table
         from bot_modules.rr_match_repo import init_rr_match_table
 
         init_lottery_tables(c)
         init_rr_stats_table(c)
         init_rr_match_table(c)
-        init_milestone_guild_whitelist_table(c)
         conn.commit()
-    seed_milestone_guild_whitelist_from_env()
-    reload_milestone_guild_whitelist_cache()
 
 
 def log_transaction(user_id, amount, reason):

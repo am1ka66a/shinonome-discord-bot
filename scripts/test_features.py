@@ -143,6 +143,29 @@ class FeatureTests(unittest.TestCase):
         self.assertIsNotNone(bot.blacklist_checker)
         self.assertIsNotNone(bot.message_audit)
         self.assertIn("game_recovery_task", namespace["_event_tasks"])
+        self.assertIsNone(bot.tree.get_command("admin_milestone_guild"))
+        self.assertIsNotNone(bot.tree.get_command("level"))
+        self.assertIsNotNone(bot.tree.get_command("setlevel"))
+
+    def test_level_query_keeps_progress_without_milestone_rewards(self):
+        self.ctx["resolve_slash_target"].return_value = (None, None)
+        self.ctx["get_level_stats_async"].return_value = (12345, 20)
+        self.ctx["calc_level_from_exp"] = lambda exp: (20, 45, 100)
+        self.ctx["build_exp_progress_bar"] = lambda cur, need: "progress"
+        retired_query = AsyncMock(side_effect=AssertionError("retired rewards must not be queried"))
+        self.ctx["get_claimed_milestones_async"] = retired_query
+        economy.register_economy_commands(self.bot, self.ctx)
+        inter = interaction(command="level")
+        inter.user.display_name = "player"
+        inter.user.mention = "<@2>"
+        self.run_now(self.bot.tree.get_command("level").callback(inter))
+        self.ctx["get_level_stats_async"].assert_awaited_once_with(2)
+        retired_query.assert_not_awaited()
+        embed = inter.followup.send.call_args.kwargs["embed"]
+        self.assertIn("Lv.20", embed.description)
+        self.assertIn("12,345", embed.description)
+        self.assertIn("45 / 100", embed.description)
+        self.assertEqual(len(embed.fields), 0)
 
     def test_policy_blocks_financial_command_but_allows_stats(self):
         self.bot.tree.interaction_check = AsyncMock(return_value=True)

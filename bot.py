@@ -11,8 +11,6 @@ from dotenv import load_dotenv
 
 from bot_modules import config
 from bot_modules import domain_sync
-from bot_modules import level_rewards
-from bot_modules import milestone_guild_repo
 from bot_modules import discord_helpers
 from bot_modules import discord_logging
 from bot_modules import assembly
@@ -95,8 +93,6 @@ GOOD_CITIZEN_DESTROY_COST = domain_sync.GOOD_CITIZEN_DESTROY_COST
 COP_HUNT_CAPTURE_BASE_PCT = domain_sync.COP_HUNT_CAPTURE_BASE_PCT
 COP_HUNT_CAPTURE_PER_STAR_PCT = domain_sync.COP_HUNT_CAPTURE_PER_STAR_PCT
 COP_HUNT_FEE = 300_000
-LEVEL_MILE_TIERS = level_rewards.LEVEL_MILE_TIERS
-LEVEL_MILESTONE_COINS = level_rewards.LEVEL_MILESTONE_COINS
 
 # --- async / sync 橋接 ---
 _async = build_async_wrappers(domain_sync)
@@ -143,24 +139,6 @@ def now_tw_naive() -> datetime.datetime:
 
 def is_host():
     return discord_helpers.make_host_check(ALLOWED_HOST_IDS)
-
-
-async def process_level_ups(
-    member: typing.Union[discord.Member, discord.User],
-    old_lv: int,
-    new_lv: int,
-    guild_id: typing.Optional[int] = None,
-):
-    if not await policy.allowed(bot, member.id):
-        return
-    await level_rewards.process_level_ups(
-        member,
-        old_lv,
-        new_lv,
-        guild_id=guild_id,
-        try_claim_milestone=domain_sync.try_claim_milestone,
-        is_milestone_guild_allowed=milestone_guild_repo.is_milestone_guild_allowed,
-    )
 
 
 def get_share_enabled() -> bool:
@@ -247,7 +225,6 @@ _event_tasks = register_events(
         "relay_staff_reply_to_dm_user": _relay_handlers["relay_staff_reply_to_dm_user"],
         "relay_user_message_to_staff_channel": _relay_handlers["relay_user_message_to_staff_channel"],
         "process_on_message_activity_sync": process_on_message_activity_sync,
-        "process_level_ups": process_level_ups,
         "cleanup_local_caches": snapshot_cache.cleanup_local_caches,
         "DM_RELAY_CHANNEL_ID": DM_RELAY_CHANNEL_ID,
         "DELETE_LOG_CHANNEL_ID": DELETE_LOG_CHANNEL_ID,
@@ -257,7 +234,6 @@ _event_tasks = register_events(
         "CHAT_EXP_MULTIPLIER": CHAT_EXP_MULTIPLIER,
         "LOG_RETENTION_DAYS": LOG_RETENTION_DAYS,
         "LOG_PURGE_INTERVAL_SECONDS": LOG_PURGE_INTERVAL_SECONDS,
-        "LEVEL_MILE_TIERS": LEVEL_MILE_TIERS,
         "_pending_msg_counts": _pending_msg_counts,
         "_last_msg_flush_ts": _last_msg_flush_ts,
         "_last_exp_award_ts": _last_exp_award_ts,
@@ -283,8 +259,6 @@ assembly.register_all_commands(
     {
         "ALLOWED_HOST_IDS": ALLOWED_HOST_IDS,
         "MAX_LEVEL": MAX_LEVEL,
-        "LEVEL_MILE_TIERS": LEVEL_MILE_TIERS,
-        "LEVEL_MILESTONE_COINS": LEVEL_MILESTONE_COINS,
         "FEATURE_TOGGLES": FEATURE_TOGGLES,
         "RED_PACKET_MIN_SECONDS": RED_PACKET_MIN_SECONDS,
         "red_packet_seq_ref": red_packet_seq_ref,
@@ -319,7 +293,6 @@ assembly.register_all_commands(
         "interaction_defer_if_needed": interaction_defer_if_needed,
         "get_level_stats": get_level_stats,
         "exp_required_for_level": exp_required_for_level,
-        "process_level_ups": process_level_ups,
         "get_db_connection": get_db_connection,
         "logger": logger,
         "log_transaction": log_transaction,
@@ -336,7 +309,6 @@ assembly.register_all_commands(
         "claim_rescue_sync_async": claim_rescue_sync_async,
         "get_user_stats_async": get_user_stats_async,
         "get_level_stats_async": get_level_stats_async,
-        "get_claimed_milestones_async": get_claimed_milestones_async,
         "build_exp_progress_bar": build_exp_progress_bar,
         "transfer_sync_async": transfer_sync_async,
         "fetch_record_rows_async": fetch_record_rows_async,
@@ -378,9 +350,6 @@ assembly.register_all_commands(
         "save_rr_match_async": save_rr_match_async,
         "delete_rr_match_async": delete_rr_match_async,
         "fetch_active_rr_matches_async": fetch_active_rr_matches_async,
-        "add_milestone_guild_async": add_milestone_guild_async,
-        "remove_milestone_guild_async": remove_milestone_guild_async,
-        "list_milestone_guilds_async": list_milestone_guilds_async,
     },
 )
 

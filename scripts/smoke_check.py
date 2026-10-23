@@ -29,7 +29,6 @@ def import_modules() -> None:
         discord_helpers,
         discord_logging,
         domain_sync,
-        level_rewards,
     )
     from bot_modules.runtime import app_lock, relay, snapshot_cache, events
     from bot_modules.commands import (

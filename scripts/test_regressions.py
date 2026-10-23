@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT))
 
 import discord
 from discord.ext import commands
-from bot_modules import admin_commands, bot_core, config, economy_service, economy_repo, lottery_repo, rr_match_repo
+from bot_modules import admin_commands, bot_core, config, economy_service, economy_repo, game_repo, lottery_repo, rr_match_repo
 from bot_modules.commands import economy, duel, blackjack, russian_roulette, wanted
 from bot_modules.discord_helpers import interaction_defer_if_needed, interaction_send
 from bot_modules.runtime import app_lock
@@ -51,9 +51,9 @@ class Context(dict):
 
 
 def context():
-    return Context(FEATURE_TOGGLES={}, MAX_LEVEL=100, LEVEL_MILESTONE_COINS={},
+    return Context(FEATURE_TOGGLES={}, MAX_LEVEL=100,
         RED_PACKET_MIN_SECONDS=10, red_packet_seq_ref=[0], logger=Mock(),
-        SIDE_BET_RATIO=0.5, LEVEL_MILE_TIERS=(20, 40, 60, 80, 100),
+        SIDE_BET_RATIO=0.5,
         get_is_event_active=lambda: True, RUSSIAN_ROULETTE_CHAMBERS=6,
         COINFLIP_MIN_BET=100, COINFLIP_MAX_BET=10_000_000,
         interaction_defer_if_needed=interaction_defer_if_needed,
@@ -359,6 +359,18 @@ class DatabaseRegressions(unittest.TestCase):
 
     def tearDown(self):
         self.conn.db.close()
+
+    def test_exp_crosses_former_milestones_without_extra_money_or_tables(self):
+        self.conn.db.execute('ALTER TABLE users ADD COLUMN exp INTEGER DEFAULT 0')
+        self.conn.db.execute("INSERT INTO users (user_id,balance) VALUES ('1',1234)")
+        self.conn.db.commit()
+        calculate = lambda exp: game_repo.calc_level_from_exp(100, exp)
+        target_exp = game_repo.exp_required_for_level(100, 100)
+        result = game_repo.add_user_exp(lambda: self.conn, calculate, 1, target_exp)
+        self.assertEqual(result, (1, 100, target_exp))
+        self.assertEqual(self.conn.db.execute('SELECT balance,exp,level FROM users').fetchone(),
+                         (1234, target_exp, 100))
+        self.assertEqual(self.conn.db.execute('SELECT COUNT(*) FROM logs').fetchone()[0], 0)
 
     def log(self, c, uid, amount, reason):
         c.execute('INSERT INTO logs (user_id,amount,reason) VALUES (%s,%s,%s)', (str(uid), amount, reason))

@@ -13,13 +13,11 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
     feature_toggles = ctx["FEATURE_TOGGLES"]
     get_is_event_active = ctx["get_is_event_active"]
     side_bet_ratio = float(ctx["SIDE_BET_RATIO"])
-    level_mile_tiers = tuple(ctx["LEVEL_MILE_TIERS"])
     ensure_user_exists_async = ctx["ensure_user_exists_async"]
     get_user_stats_async = ctx["get_user_stats_async"]
     try_deduct_balance_async = ctx["try_deduct_balance_async"]
     update_game_result_async = ctx["update_game_result_async"]
     add_user_exp_async = ctx["add_user_exp_async"]
-    process_level_ups = ctx["process_level_ups"]
     roll_gamble_exp_from_bet = ctx["roll_gamble_exp_from_bet"]
     interaction_send = ctx["interaction_send"]
     interaction_defer_if_needed = ctx["interaction_defer_if_needed"]
@@ -460,18 +458,7 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
 
             if exp_gain > 0 and await allowed(bot, self.user.id):
                 await ensure_user_exists_async(self.user.id, 50000)
-                exp_result = await add_user_exp_async(self.user.id, exp_gain)
-                if exp_result and exp_result[1] > exp_result[0]:
-                    old_lv, new_lv = exp_result[0], exp_result[1]
-                    if any(old_lv < m <= new_lv for m in level_mile_tiers):
-                        guild_id = None
-                        if message_obj and getattr(message_obj, "guild", None):
-                            guild_id = message_obj.guild.id
-                        elif interaction and interaction.guild:
-                            guild_id = interaction.guild.id
-                        asyncio.create_task(
-                            process_level_ups(self.user, old_lv, new_lv, guild_id=guild_id)
-                        )
+                await add_user_exp_async(self.user.id, exp_gain)
                 res = f"{res}\n✨ 經驗值 `+{exp_gain}`"
             else:
                 res = f"{res}\n🧊 本局失利，不獲得 EXP"

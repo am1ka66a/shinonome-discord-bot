@@ -37,8 +37,6 @@ def build_async_wrappers(domain) -> typing.Dict[str, typing.Any]:
     async def get_level_stats_async(user_id):
         return await db_to_thread(domain.get_level_stats, user_id)
 
-    async def get_claimed_milestones_async(user_id):
-        return await db_to_thread(domain.get_claimed_milestones, user_id)
 
     async def try_deduct_balance_async(user_id, amount, reason):
         return await db_to_thread(domain.try_deduct_balance, user_id, amount, reason)
@@ -171,14 +169,6 @@ def build_async_wrappers(domain) -> typing.Dict[str, typing.Any]:
     async def fetch_active_rr_matches_async():
         return await db_to_thread(domain.fetch_active_rr_matches_sync)
 
-    async def add_milestone_guild_async(guild_id, added_by=None):
-        return await db_to_thread(domain.add_milestone_guild_sync, guild_id, added_by)
-
-    async def remove_milestone_guild_async(guild_id):
-        return await db_to_thread(domain.remove_milestone_guild_sync, guild_id)
-
-    async def list_milestone_guilds_async():
-        return await db_to_thread(domain.list_milestone_guilds_sync)
 
     async def transfer_sync_async(sender_id, receiver_id, amount, note_text):
         return await db_to_thread(domain.transfer_sync, sender_id, receiver_id, amount, note_text)
@@ -193,7 +183,6 @@ def build_async_wrappers(domain) -> typing.Dict[str, typing.Any]:
         "claim_hourly_reward_async": claim_hourly_reward_async,
         "ensure_user_exists_async": ensure_user_exists_async,
         "get_level_stats_async": get_level_stats_async,
-        "get_claimed_milestones_async": get_claimed_milestones_async,
         "try_deduct_balance_async": try_deduct_balance_async,
         "update_game_result_async": update_game_result_async,
         "add_user_exp_async": add_user_exp_async,
@@ -227,8 +216,5 @@ def build_async_wrappers(domain) -> typing.Dict[str, typing.Any]:
         "save_rr_match_async": save_rr_match_async,
         "delete_rr_match_async": delete_rr_match_async,
         "fetch_active_rr_matches_async": fetch_active_rr_matches_async,
-        "add_milestone_guild_async": add_milestone_guild_async,
-        "remove_milestone_guild_async": remove_milestone_guild_async,
-        "list_milestone_guilds_async": list_milestone_guilds_async,
         "transfer_sync_async": transfer_sync_async,
     }
