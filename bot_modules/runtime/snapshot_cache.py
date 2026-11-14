@@ -325,7 +325,7 @@ def register_snapshot_cache(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Di
                     return "n/a"
                 return f"{(hit * 100.0 / total):.1f}% ({hit}/{total})"
 
-            logger.info(
+            logger.debug(
                 "cache-metrics 120s | wanted_status=%s | wanted_list=%s | good_citizen=%s | guild_member=%s",
                 _ratio("wanted_status_hit", "wanted_status_miss"),
                 _ratio("wanted_list_hit", "wanted_list_miss"),

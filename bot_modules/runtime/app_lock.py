@@ -8,6 +8,7 @@ from discord import app_commands
 
 DEFAULT_READ_ONLY_APP_COMMANDS: typing.Set[str] = {
     "help",
+    "kill",  # Sends a Minecraft-style message without changing player data.
     "balance",
     "level",
     "record",
@@ -39,6 +40,9 @@ def register_app_command_lock(
     guard = asyncio.Lock()
 
     async def enforce_single_active_app_command(interaction: discord.Interaction) -> bool:
+        # Suggestions never dispatch app_command_completion, so they must not acquire a lock.
+        if getattr(interaction, "type", None) is discord.InteractionType.autocomplete:
+            return True
         user = getattr(interaction, "user", None)
         if user is None:
             return True

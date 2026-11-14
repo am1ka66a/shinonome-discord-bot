@@ -18,9 +18,9 @@ sys.path.insert(0, str(ROOT))
 import discord
 from discord.ext import commands
 from bot_modules import admin_commands, bot_core, config, economy_service, economy_repo, game_repo, lottery_repo, rr_match_repo
-from bot_modules.commands import economy, duel, blackjack, russian_roulette, wanted
+from bot_modules.commands import economy, duel, blackjack, fun, russian_roulette, wanted
 from bot_modules.discord_helpers import interaction_defer_if_needed, interaction_send
-from bot_modules.runtime import app_lock
+from bot_modules.runtime import app_lock, policy
 from bot_modules.runtime.locks import KeyedLocks
 
 sqlite3.register_adapter(datetime.datetime, lambda value: value.isoformat(' '))
@@ -113,6 +113,37 @@ class AsyncRegressions(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await self.bot.tree.interaction_check(interaction(iid=3)))
         await self.bot.on_app_command_completion(interaction(iid=1), None)
         self.assertTrue(await self.bot.tree.interaction_check(interaction(iid=4)))
+
+    async def test_kill_suggestions_do_not_lock_the_next_command(self):
+        self.ctx["MINECRAFT_DEATH_MESSAGES"] = ["{target} fell"]
+        fun.register_fun_commands(self.bot, self.ctx)
+        app_lock.register_app_command_lock(self.bot, Mock())
+        policy.install_policy(self.bot, [], Mock())
+        self.bot.blacklist_checker = AsyncMock(return_value=False)
+
+        suggestion = interaction(iid=1, command="kill")
+        suggestion.type = discord.InteractionType.autocomplete
+        suggestion.command = self.bot.tree.get_command("kill")
+        suggestion.guild_id = None
+        suggestion._state = self.bot._connection
+        suggestion.data = {
+            "name": "kill",
+            "options": [{"name": "death", "type": 3, "value": "fell", "focused": True}],
+        }
+        suggestion.response.autocomplete = AsyncMock()
+        await self.bot.tree._call(suggestion)
+
+        suggestion.response.autocomplete.assert_awaited_once()
+        self.bot.blacklist_checker.assert_not_awaited()
+        self.assertTrue(await self.bot.tree.interaction_check(interaction(iid=2)))
+
+    async def test_kill_can_run_while_transfer_is_locked(self):
+        app_lock.register_app_command_lock(self.bot, Mock())
+        self.assertTrue(await self.bot.tree.interaction_check(interaction(iid=1)))
+        kill = interaction(iid=2, command="kill")
+        self.assertTrue(await self.bot.tree.interaction_check(kill))
+        await self.bot.on_app_command_completion(kill, None)
+        self.assertFalse(await self.bot.tree.interaction_check(interaction(iid=3)))
 
     async def test_expired_command_cannot_release_replacement_lock(self):
         app_lock.register_app_command_lock(self.bot, Mock(), timeout_seconds=5)

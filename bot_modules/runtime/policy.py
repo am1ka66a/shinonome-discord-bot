@@ -2,6 +2,8 @@
 import asyncio
 import logging
 
+import discord
+
 from bot_modules.user_repo import is_blacklisted
 from bot_modules.discord_helpers import interaction_defer_if_needed, interaction_send
 
@@ -32,6 +34,9 @@ def install_policy(bot, host_ids, logger):
     previous = bot.tree.interaction_check
 
     async def check(interaction):
+        # Suggestions have their own response type and do not run the command.
+        if getattr(interaction, "type", None) is discord.InteractionType.autocomplete:
+            return await previous(interaction)
         ready = getattr(bot, "_db_ready_event", None)
         if ready is not None and not ready.is_set():
             await interaction_send(interaction, "機器人正在初始化，請稍後再試。", ephemeral=True)
