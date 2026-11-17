@@ -77,5 +77,3 @@ def resolve_hand(player, dealer, bet):
 
 def experience_award(base, profit):
     return base if profit > 0 else max(1, base // 2) if profit == 0 else 0
-
-

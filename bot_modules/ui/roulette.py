@@ -147,5 +147,3 @@ def build_history_embed(self) -> discord.Embed:
     if truncated:
         emb.set_footer(text="歷程過長，僅顯示最近的部分")
     return emb
-
-

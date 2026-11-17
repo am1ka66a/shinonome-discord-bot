@@ -232,5 +232,3 @@ class RouletteState:
         if was_turn and self.alive_ids:
             self.turn_uid = next_turn if next_turn in self.alive_ids else self.alive_ids[0]
         return None
-
-
