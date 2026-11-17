@@ -165,6 +165,9 @@ class FeatureTests(unittest.TestCase):
         self.assertIsNone(bot.tree.get_command("admin_milestone_guild"))
         self.assertIsNotNone(bot.tree.get_command("level"))
         self.assertIsNotNone(bot.tree.get_command("setlevel"))
+        audit = bot.tree.get_command("admin_audit")
+        self.assertEqual({cmd.name for cmd in audit.commands}, {"account", "resets", "pending"})
+        self.assertEqual(audit.default_permissions, discord.Permissions(administrator=True))
 
     def test_level_query_keeps_progress_without_milestone_rewards(self):
         self.ctx["resolve_slash_target"].return_value = (None, None)

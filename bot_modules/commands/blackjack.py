@@ -4,6 +4,9 @@ import typing
 
 import discord
 from discord import app_commands
+from bot_modules.games.blackjack import get_deck, calculate_score, resolve_hand, experience_award
+from bot_modules.ui import blackjack as blackjack_ui
+from bot_modules.ui.blackjack import check_sidebets
 from bot_modules.ui.guards import serialized_action
 from bot_modules.runtime.policy import allowed
 
@@ -30,16 +33,6 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             return await store.call("debit", sid or f"bj:{inter.id}", "bj", uid, amount, str(inter.id), reason=reason)
         return await try_deduct_balance_async(uid, amount, reason)
 
-    def get_deck(num_decks=6):
-        suits = ["♥️", "♦️", "♣️", "♠️"]
-        ranks = ["2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"]
-        return [{"rank": r, "suit": s} for s in suits for r in ranks] * num_decks
-
-    def card_to_emoji(card, guild_id=None) -> str:
-        return f"**[{card['rank']} {card['suit']}]**"
-
-    def card_back_emoji(guild_id=None) -> str:
-        return "**[??]**"
 
     async def _send_game(
         channel,
@@ -134,62 +127,6 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         gv.message = message
         return message
 
-    def calculate_score(hand):
-        score, aces = 0, 0
-        values = {"2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8, "9": 9, "10": 10, "J": 10, "Q": 10, "K": 10, "A": 11}
-        for c in hand:
-            score += values[c["rank"]]
-            if c["rank"] == "A":
-                aces += 1
-        while score > 21 and aces:
-            score -= 10
-            aces -= 1
-        return score
-
-    def check_sidebets(player_hand, dealer_up, p_bet, s_bet):
-        res_msg, total_p = "", 0
-        if p_bet > 0:
-            c1, c2 = player_hand[0], player_hand[1]
-            if c1["rank"] == c2["rank"]:
-                if c1["suit"] == c2["suit"]:
-                    mult, m = 30, "同花對子"
-                else:
-                    mult, m = 5, "混合對子"
-                total_p += p_bet * mult
-                res_msg += f"🧧 {m}！+{p_bet*mult} "
-            else:
-                total_p -= p_bet
-                res_msg += f"🧧 對子未中 -{p_bet} "
-        if s_bet > 0:
-            cards = [player_hand[0], player_hand[1], dealer_up]
-            suits = [c["suit"] for c in cards]
-            rv = {"2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8, "9": 9, "10": 10, "J": 11, "Q": 12, "K": 13, "A": 14}
-            v = sorted([rv[c["rank"]] for c in cards])
-            if v == [2, 3, 14]:
-                v = [1, 2, 3]
-            is_flush = len(set(suits)) == 1
-            is_straight = v[2] - v[1] == 1 and v[1] - v[0] == 1
-            is_triplet = len(set([c["rank"] for c in cards])) == 1
-            if is_flush and is_triplet:
-                mult, m = 50, "同花三條"
-            elif is_flush and is_straight:
-                mult, m = 25, "同花順"
-            elif is_triplet:
-                mult, m = 25, "三條"
-            elif is_straight:
-                mult, m = 10, "順子"
-            elif is_flush:
-                mult, m = 5, "同花"
-            else:
-                mult, m = -1, "未中"
-
-            if mult > 0:
-                total_p += s_bet * mult
-                res_msg += f"🎯 21+3 {m}！+{s_bet*mult} "
-            else:
-                total_p -= s_bet
-                res_msg += f"🎯 21+3 未中 -{s_bet} "
-        return total_p, res_msg
 
     class BetModal(discord.ui.Modal, title="自訂下注金額"):
         def __init__(self, view):
@@ -351,44 +288,9 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             except Exception:
                 logger.exception("21點渲染錯誤 user=%s", self.user.id)
 
-        async def _build_embed_async(self, done=False, res="", profit=0, animating=False, extra_msg="", guild_id=None):
+        async def _build_embed_async(self, **kwargs):
             stats = await get_user_stats_async(self.user.id)
-            if stats:
-                bal, total, wins, t_prof = stats
-            else:
-                bal, total, wins, t_prof = 0, 0, 0, 0
-            wr = (wins / total * 100) if total > 0 else 0
-            embed = discord.Embed(title="🃏 21點大賽", color=0x2B2D31)
-            main_ui = f"💰 餘額：{bal} | 🏆 勝場：{wins} | 🎲 總局數：{total} | 📈 勝率：{wr:.1f}% | 💸 總盈虧：{t_prof}\n"
-            if extra_msg:
-                main_ui += f"**{extra_msg}**\n"
-            for i, hand in enumerate(self.hands):
-                indicator = "👉 " if i == self.current_hand and not done else ""
-                title_text = f"{indicator}👤 {self.user.display_name} 的手牌"
-                if len(self.hands) > 1:
-                    title_text += f" (第 {i+1} 手)"
-                p_cards = " ".join([card_to_emoji(c, guild_id) for c in hand])
-                main_ui += f"### {title_text}\n### {p_cards} (點數: **{calculate_score(hand)}**)\n"
-            if done or animating:
-                d_cards = " ".join([card_to_emoji(c, guild_id) for c in self.d_hand])
-                main_ui += f"### 🤖 莊家手牌\n### {d_cards} (點數: **{calculate_score(self.d_hand)}**)\n"
-                if done:
-                    side_profit = self.side_p
-                    total_profit = profit + side_profit
-                    res_line = f"### 🏆 {res}\n{self.side_m}\n"
-                    side_text = f"+{side_profit}" if side_profit > 0 else str(side_profit)
-                    res_line += f"🧾 主局淨損益：`{profit:+d}` | 旁注淨損益：`{side_text}`\n"
-                    if total_profit > 0:
-                        res_line += f"📈 本局淨損益：`+{total_profit}` | 💰 餘額：`{bal}`\n"
-                    elif total_profit < 0:
-                        res_line += f"📉 本局淨損益：`{total_profit}` | 💰 餘額：`{bal}`\n"
-                    else:
-                        res_line += f"➖ 本局淨損益：`0` | 💰 餘額：`{bal}`\n"
-                    main_ui += res_line
-            else:
-                main_ui += f"### 🤖 莊家手牌\n### {card_to_emoji(self.d_hand[0], guild_id)} {card_back_emoji(guild_id)} (點數: **❓**)\n"
-            embed.description = main_ui
-            return embed
+            return blackjack_ui.build_game_embed(self, stats, **kwargs)
 
         @property
         def p_hand(self):
@@ -509,9 +411,6 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             total_prof, final_res_texts = 0, []
             total_exp_gain = 0
             exp_detail_texts = []
-            ds = calculate_score(self.d_hand)
-            dealer_bj = len(self.d_hand) == 2 and ds == 21
-            dealer_5_card = len(self.d_hand) == 5 and ds <= 21
             for i, hand in enumerate(self.hands):
                 if self.hand_results[i] is not None:
                     r, p, w = self.hand_results[i]
@@ -519,53 +418,16 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                     hand_profit = p
                     total_prof += hand_profit
                     hand_exp_base = roll_gamble_exp_from_bet(self.hand_bets[i])
-                    if hand_profit > 0:
-                        hand_exp_award = hand_exp_base
-                    elif hand_profit == 0:
-                        hand_exp_award = max(1, hand_exp_base // 2)
-                    else:
-                        hand_exp_award = 0
+                    hand_exp_award = experience_award(hand_exp_base, hand_profit)
                     total_exp_gain += hand_exp_award
                     if len(self.hands) > 1:
                         exp_detail_texts.append(f"第 {i+1} 手 EXP `+{hand_exp_award}`")
                     continue
-                ps = calculate_score(hand)
-                player_bj, player_5_card = (len(hand) == 2 and ps == 21), (len(hand) == 5 and ps <= 21)
-                if player_5_card and dealer_5_card:
-                    final_res_texts.append("🤝 雙方皆過五關！平手")
-                    hand_profit = 0
-                elif player_5_card:
-                    final_res_texts.append("🐉 你過五關啦！爽贏 2.5 倍！")
-                    hand_profit = int(self.hand_bets[i] * 2.5)
-                elif dealer_5_card:
-                    final_res_texts.append("🐉 老子過五關啦！你這低能兒～")
-                    hand_profit = -self.hand_bets[i]
-                elif player_bj and dealer_bj:
-                    final_res_texts.append("🤝 雙方皆為 BlackJack！平手")
-                    hand_profit = 0
-                elif player_bj:
-                    final_res_texts.append("🌟 BlackJack！1.5倍賠率！")
-                    hand_profit = int(self.hand_bets[i] * 1.5)
-                elif dealer_bj:
-                    final_res_texts.append("💀 莊家 BlackJack！你輸啦～雜魚～")
-                    hand_profit = -self.hand_bets[i]
-                elif ds > 21 or ps > ds:
-                    final_res_texts.append("🎉 這次算你贏啦，腦殘！")
-                    hand_profit = self.hand_bets[i]
-                elif ps < ds:
-                    final_res_texts.append("💀 你輸啦～雜魚～")
-                    hand_profit = -self.hand_bets[i]
-                else:
-                    final_res_texts.append("🤝 就這點技術阿腦殘？")
-                    hand_profit = 0
+                outcome, hand_profit = resolve_hand(hand, self.d_hand, self.hand_bets[i])
+                final_res_texts.append(blackjack_ui.OUTCOME_MESSAGES[outcome])
                 total_prof += hand_profit
                 hand_exp_base = roll_gamble_exp_from_bet(self.hand_bets[i])
-                if hand_profit > 0:
-                    hand_exp_award = hand_exp_base
-                elif hand_profit == 0:
-                    hand_exp_award = max(1, hand_exp_base // 2)
-                else:
-                    hand_exp_award = 0
+                hand_exp_award = experience_award(hand_exp_base, hand_profit)
                 total_exp_gain += hand_exp_award
                 if len(self.hands) > 1:
                     exp_detail_texts.append(f"第 {i+1} 手 EXP `+{hand_exp_award}`")

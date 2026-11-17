@@ -11,6 +11,7 @@ READ_COMMANDS = {
     "help", "adminhelp", "balance", "level", "record", "leaderboard", "lvleaderboard",
     "casino_stats", "share_stats", "wanted_status", "wanted_list", "good_citizen_list",
     "profile", "cooldowns", "compare", "rank",
+    "admin_audit account", "admin_audit resets", "admin_audit pending",
 }
 
 

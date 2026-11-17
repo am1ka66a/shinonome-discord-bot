@@ -38,6 +38,13 @@ MySQL 測試只會在明確啟用且資料庫名稱為 `shinonome_test`、主機
 - Discord 日誌預設只送 WARNING 以上，每 5 秒合併發送，最多保留 200 種待送訊息；重複訊息合併次數。完整 INFO 記錄保留於 Railway 主控台。可用 `LOG_DISCORD_LEVEL` 調整。
 - 重置資料快照不是資料庫外部備份。正式資料仍需另行設定 Railway 備份並定期演練還原；還原前必須停機、核對操作後新增的交易，避免覆蓋新資料。
 
+## 遊戲與查帳模組
+
+- `bot_modules/games/blackjack.py` 與 `games/roulette.py`：純規則、賠率、狀態及序列化；不連線 Discord 或資料庫。
+- `bot_modules/ui/blackjack.py` 與 `ui/roulette.py`：訊息與遊戲畫面。指令模組負責互動、鎖定、持久化及付款，既有結算服務不變。
+- `bot_modules/admin_audit_repo.py`：有筆數上限的只讀查帳查詢；`commands/admin_audit.py` 負責白名單、私人面板與翻頁。
+- 新增規則請先在純規則層驗證；付款、退款、失敗重試仍需另外檢查交易與控制流程。管理員查帳使用方式見 [admin-audit.md](admin-audit.md)。
+
 ## Railway 設定
 
 `.railway/railway.ts` 僅管理 Bot 服務的設定，變數維持由 Railway 管理；資料庫與磁碟不在這份設定的管理範圍。

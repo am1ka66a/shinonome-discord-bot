@@ -121,7 +121,19 @@ def maintenance_tables(c):
         snapshot_json TEXT NOT NULL, PRIMARY KEY(request_id,user_id))""")
 
 
-MIGRATIONS = ((1, baseline_schema), (2, maintenance_tables))
+def audit_indexes(c):
+    for sql in (
+        'CREATE INDEX idx_casino_logs_user_id ON casino_logs (user_id, id)',
+        'CREATE INDEX idx_admin_operations_created ON bot_admin_operations (created_at, request_id)',
+    ):
+        try:
+            c.execute(sql)
+        except pymysql.MySQLError as error:
+            if not error.args or error.args[0] != 1061:
+                raise
+
+
+MIGRATIONS = ((1, baseline_schema), (2, maintenance_tables), (3, audit_indexes))
 
 
 def run_migrations(conn):

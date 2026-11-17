@@ -410,6 +410,9 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
 `/admin_unjail` - 強制釋放玩家（可選清債/清通緝）
 `/admin_revert_tx` - 依流水 ID 進行反向沖正
 `/admin_logs` - 查詢含流水 ID 的最近帳務紀錄
+`/admin_audit account` - 私人查詢玩家帳戶及完整總帳（可翻頁）
+`/admin_audit resets` - 查詢重置操作者及重置前快照
+`/admin_audit pending` - 查詢待結算或逾時遊戲
 `/admin_reward_grant` - 全體活動獎勵（可同時發幣 + 發 EXP）
 `/admin_feature_toggle` - 線上開關功能（rob/bj/duel/redpacket/share）
 """

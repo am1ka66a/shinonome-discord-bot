@@ -1,6 +1,7 @@
 import typing
 
 from bot_modules.admin_commands import register_admin_commands
+from bot_modules.commands.admin_audit import register_admin_audit_commands
 from bot_modules.commands import (
     register_blackjack_commands,
     register_casino_light_commands,
@@ -16,6 +17,7 @@ from bot_modules.commands import (
 
 def register_all_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
     """集中註冊 admin / economy / fun / stats / wanted / 賭場指令。"""
+    register_admin_audit_commands(bot, ctx)
     register_admin_commands(
         bot,
         {

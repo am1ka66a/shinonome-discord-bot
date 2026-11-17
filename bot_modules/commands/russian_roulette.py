@@ -9,14 +9,13 @@ from functools import wraps
 import discord
 from discord import app_commands
 
+from bot_modules.games.roulette import (
+    RouletteState, RR_ROYALE_MIN_PLAYERS, RR_ROYALE_MAX_PLAYERS,
+    RR_ROYALE_BASE_PLAYERS, RR_ROYALE_CHAMBERS_PER_EXTRA_PLAYER,
+)
+from bot_modules.ui import roulette as roulette_ui
 from bot_modules import rr_match_repo
 
-RR_ROYALE_MIN_PLAYERS = 3
-RR_ROYALE_MAX_PLAYERS = 6
-# 子彈數＝玩家人數 − 1（全部擊發後剛好剩一名生還者）；
-# 彈膛以 2 人為基準，每多 1 人 +3 膛（結果等於人數的 3 倍）。
-RR_ROYALE_BASE_PLAYERS = 2
-RR_ROYALE_CHAMBERS_PER_EXTRA_PLAYER = 3
 DECLINE_REASONS = (
     "好了啦 你愛肛交",
     "不跟菜雞打",
@@ -69,199 +68,24 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
                 return
             return await callback(self, *args, **kwargs)
 
-    def _hit_prob_pct(remaining_chambers: int, remaining_bullets: int) -> float:
-        if remaining_chambers <= 0 or remaining_bullets <= 0:
-            return 0.0
-        return remaining_bullets * 100.0 / remaining_chambers
-
-    def _royale_bullet_count(player_count: int) -> int:
-        return max(1, int(player_count) - 1)
-
-    def _royale_chamber_count(player_count: int, bullet_count: int) -> int:
-        extra_players = max(0, int(player_count) - RR_ROYALE_BASE_PLAYERS)
-        chambers = RUSSIAN_ROULETTE_CHAMBERS + extra_players * RR_ROYALE_CHAMBERS_PER_EXTRA_PLAYER
-        # 膛數不得少於子彈數，否則 random.sample 會炸
-        return max(chambers, bullet_count)
 
     def _busy_msg(uid: int) -> str:
         return f"<@{uid}> 已有進行中的俄羅斯輪盤，請先完成或等待該場結束。"
 
-    class RrMatch:
-        def __init__(
-            self,
-            *,
-            match_id: str,
-            mode: str,
-            guild_id: int,
-            channel_id: int,
-            bet_base: int,
-            participant_ids: typing.List[int],
-            stakes: typing.Dict[int, int],
-            chambers: int = RUSSIAN_ROULETTE_CHAMBERS,
-            bullet_positions: typing.Optional[typing.Iterable[int]] = None,
-            bullet_at: typing.Optional[int] = None,
-            trigger_index: int = 0,
-            turn_uid: typing.Optional[int] = None,
-            alive_ids: typing.Optional[typing.List[int]] = None,
-            history: typing.Optional[typing.List[str]] = None,
-            settled: bool = False,
-            invite_resolved: bool = False,
-            lobby_started: bool = False,
-            host_id: typing.Optional[int] = None,
-            challenger_id: typing.Optional[int] = None,
-            opponent_id: typing.Optional[int] = None,
-        ):
-            self.match_id = match_id
-            self.mode = mode
-            self.guild_id = guild_id
-            self.channel_id = channel_id
-            self.bet_base = int(bet_base)
-            self.chambers = int(chambers)
-            if bullet_positions is not None:
-                self.bullet_positions = {int(x) for x in bullet_positions}
-            elif bullet_at is not None:
-                self.bullet_positions = {int(bullet_at)}
-            elif mode == "royale" and not lobby_started:
-                self.bullet_positions = set()
-            else:
-                self.bullet_positions = {random.randrange(self.chambers)}
-            self.trigger_index = int(trigger_index)
-            self.participant_ids = [int(x) for x in participant_ids]
-            self.stakes = {int(k): int(v) for k, v in stakes.items()}
-            self.alive_ids = list(alive_ids if alive_ids is not None else self.participant_ids)
-            self.history = list(history or [])
-            self.settled = bool(settled)
-            self.invite_resolved = bool(invite_resolved)
-            self.lobby_started = bool(lobby_started)
-            self.host_id = host_id
-            self.challenger_id = challenger_id
-            self.opponent_id = opponent_id
-            self.turn_uid = turn_uid
-            if self.turn_uid is None and self.mode == "duel" and self.invite_resolved:
-                self.turn_uid = random.choice(self.participant_ids)
-            self.message: typing.Optional[discord.Message] = None
-            self.view: typing.Optional[discord.ui.View] = None
-            # 報名階段的加入／退賽／解散／開始會同時改名單與退款，必須互斥
+    class RrMatch(RouletteState):
+        default_chambers = RUSSIAN_ROULETTE_CHAMBERS
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.message = None
+            self.view = None
             self.lock = asyncio.Lock()
 
-        @property
-        def pot(self) -> int:
-            return sum(self.stakes.values())
+        def build_embed(self, interaction=None, **kwargs):
+            return roulette_ui.build_embed(self, interaction, **kwargs)
 
-        @property
-        def remaining_chambers(self) -> int:
-            return max(0, self.chambers - self.trigger_index)
-
-        def remaining_bullets(self) -> int:
-            return sum(1 for pos in self.bullet_positions if pos >= self.trigger_index)
-
-        def configure_royale_gun(self, *, use_alive: bool = False) -> None:
-            player_count = len(self.alive_ids) if use_alive else len(self.participant_ids)
-            bullet_count = _royale_bullet_count(player_count)
-            self.chambers = _royale_chamber_count(player_count, bullet_count)
-            self.bullet_positions = set(random.sample(range(self.chambers), bullet_count))
-            self.trigger_index = 0
-
-        def ensure_chambers_for_royale(self) -> bool:
-            """若膛室打空但尚未分出勝負，重新装弹。"""
-            if self.mode != "royale" or len(self.alive_ids) <= 1:
-                return False
-            if self.trigger_index < self.chambers:
-                return False
-            self.history.append("🔄 膛室打空，重新装弹！")
-            self.configure_royale_gun(use_alive=True)
-            return True
-
-        def stake_of(self, uid: int) -> int:
-            return int(self.stakes.get(int(uid), 0))
-
-        def remove_participant(self, uid: int) -> int:
-            """把玩家移出報名名單，回傳應退還的金額。"""
-            uid = int(uid)
-            refund = self.stake_of(uid)
-            self.participant_ids = [x for x in self.participant_ids if x != uid]
-            self.stakes.pop(uid, None)
-            self.alive_ids = list(self.participant_ids)
-            return refund
-
-        def mention_line(self) -> str:
-            return " ".join(f"<@{uid}>" for uid in self.participant_ids)
-
-        def other_uid_duel(self, uid: int) -> int:
-            return self.participant_ids[1] if uid == self.participant_ids[0] else self.participant_ids[0]
-
-        def next_alive_uid(self, after_uid: int) -> int:
-            if not self.alive_ids:
-                return after_uid
-            if after_uid not in self.alive_ids:
-                return self.alive_ids[0]
-            idx = self.alive_ids.index(after_uid)
-            return self.alive_ids[(idx + 1) % len(self.alive_ids)]
-
-        def to_payload(self) -> typing.Dict[str, typing.Any]:
-            return {
-                "bet_base": self.bet_base,
-                "chambers": self.chambers,
-                "bullet_positions": sorted(self.bullet_positions),
-                "trigger_index": self.trigger_index,
-                "turn_uid": self.turn_uid,
-                "participant_ids": self.participant_ids,
-                "stakes": {str(k): v for k, v in self.stakes.items()},
-                "alive_ids": self.alive_ids,
-                "history": self.history,
-                "settled": self.settled,
-                "invite_resolved": self.invite_resolved,
-                "lobby_started": self.lobby_started,
-                "host_id": self.host_id,
-                "challenger_id": self.challenger_id,
-                "opponent_id": self.opponent_id,
-            }
-
-        @classmethod
-        def from_record(cls, record: typing.Dict[str, typing.Any]) -> "RrMatch":
-            payload = record.get("payload") or {}
-            stakes_raw = payload.get("stakes") or {}
-            stakes = {int(k): int(v) for k, v in stakes_raw.items()}
-            bullet_positions = payload.get("bullet_positions")
-            legacy_bullet_at = payload.get("bullet_at")
-            m = cls(
-                match_id=str(record["match_id"]),
-                mode=str(record["mode"]),
-                guild_id=int(record["guild_id"]),
-                channel_id=int(record["channel_id"]),
-                bet_base=int(payload.get("bet_base") or 0),
-                participant_ids=[int(x) for x in payload.get("participant_ids") or []],
-                stakes=stakes,
-                chambers=int(payload.get("chambers") or RUSSIAN_ROULETTE_CHAMBERS),
-                bullet_positions=bullet_positions if bullet_positions is not None else None,
-                bullet_at=int(legacy_bullet_at) if legacy_bullet_at is not None else None,
-                trigger_index=int(payload.get("trigger_index") or 0),
-                turn_uid=payload.get("turn_uid"),
-                alive_ids=[int(x) for x in payload.get("alive_ids") or []],
-                history=list(payload.get("history") or []),
-                settled=bool(payload.get("settled")),
-                invite_resolved=bool(payload.get("invite_resolved")),
-                lobby_started=bool(payload.get("lobby_started")),
-                host_id=payload.get("host_id"),
-                challenger_id=payload.get("challenger_id"),
-                opponent_id=payload.get("opponent_id"),
-            )
-            if m.turn_uid is not None:
-                m.turn_uid = int(m.turn_uid)
-            if m.host_id is not None:
-                m.host_id = int(m.host_id)
-            if m.challenger_id is not None:
-                m.challenger_id = int(m.challenger_id)
-            if m.opponent_id is not None:
-                m.opponent_id = int(m.opponent_id)
-            if (
-                m.mode == "royale"
-                and m.lobby_started
-                and not m.bullet_positions
-                and not m.settled
-            ):
-                m.configure_royale_gun(use_alive=True)
-            return m
+        def build_history_embed(self):
+            return roulette_ui.build_history_embed(self)
 
         async def persist(self, phase: str) -> None:
             # 結算後才落盤會留下幽靈對局，把玩家永久卡在「進行中」
@@ -278,154 +102,10 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
                 payload=self.to_payload(),
             )
 
+
         async def clear_persist(self) -> None:
             await delete_rr_match_async(self.match_id, self.to_payload())
 
-        def build_embed(
-            self,
-            interaction: typing.Optional[discord.Interaction] = None,
-            *,
-            finished: bool = False,
-            loser_uid: typing.Optional[int] = None,
-            awaiting_choice: bool = False,
-            timeout_loss: bool = False,
-            winner_uid: typing.Optional[int] = None,
-        ) -> discord.Embed:
-            if finished:
-                if self.mode == "royale" and winner_uid is not None:
-                    loss_line = ""
-                    if loser_uid is not None:
-                        if timeout_loss:
-                            loss_line = f"<@{loser_uid}> 逾時未行動，淘汰。\n"
-                        else:
-                            loss_line = f"<@{loser_uid}> 中彈出局。\n"
-                    emb = discord.Embed(
-                        title="💥 俄羅斯輪盤淘汰賽 — 結束",
-                        description=(
-                            f"{loss_line}"
-                            f"🏆 最後倖存者 <@{winner_uid}> 贏得 **`{self.pot:,}`** 東雲幣！"
-                        ),
-                        color=0xED4245,
-                    )
-                elif loser_uid is not None:
-                    win_uid = self.other_uid_duel(loser_uid)
-                    if timeout_loss:
-                        loss_line = f"<@{loser_uid}> 逾時未扣扳機，視同落敗。"
-                    else:
-                        loss_line = f"<@{loser_uid}> 扣下扳機，當場出局。"
-                    emb = discord.Embed(
-                        title="💥 俄羅斯輪盤 — 對決結束",
-                        description=(
-                            f"{loss_line}\n"
-                            f"🏆 勝者 <@{win_uid}> 贏得 **`{self.pot:,}`** 東雲幣！"
-                        ),
-                        color=0xED4245,
-                    )
-                else:
-                    emb = discord.Embed(title="💥 俄羅斯輪盤 — 結束", color=0xED4245)
-            elif self.mode == "royale" and not self.lobby_started:
-                n = len(self.participant_ids)
-                bullets = _royale_bullet_count(n)
-                chambers = _royale_chamber_count(n, bullets)
-                emb = discord.Embed(
-                    title="👥 俄羅斯輪盤淘汰賽 — 報名中",
-                    description=(
-                        f"主持人 <@{self.host_id}>｜入場費 **`{self.bet_base:,}`** 東雲幣\n"
-                        f"目前 **`{n}` / {RR_ROYALE_MAX_PLAYERS}** 人"
-                        f"（至少 {RR_ROYALE_MIN_PLAYERS} 人開局）\n"
-                        f"開局配置：**`{chambers}`** 膛 **`{bullets}`** 彈"
-                        f"（子彈＝人數 − 1；{RR_ROYALE_BASE_PLAYERS} 人 {RUSSIAN_ROULETTE_CHAMBERS} 膛，"
-                        f"每多 1 人 +{RR_ROYALE_CHAMBERS_PER_EXTRA_PLAYER} 膛）\n"
-                        f"參加者：{self.mention_line()}"
-                    ),
-                    color=0xFEE75C,
-                )
-            else:
-                title = "👥 俄羅斯輪盤淘汰賽" if self.mode == "royale" else "🔫 俄羅斯輪盤對決"
-                desc = f"彩池：**`{self.pot:,}`** 東雲幣\n"
-                if self.mode == "duel":
-                    desc = (
-                        f"<@{self.participant_ids[0]}> vs <@{self.participant_ids[1]}>\n"
-                        f"彩池：**`{self.pot:,}`** 東雲幣"
-                    )
-                elif self.mode == "royale":
-                    alive_line = " ".join(f"<@{uid}>" for uid in self.alive_ids)
-                    desc += f"倖存：**{alive_line}**"
-                emb = discord.Embed(title=title, description=desc, color=0x5865F2)
-                if self.turn_uid is not None:
-                    emb.add_field(name="輪到", value=f"<@{self.turn_uid}>", inline=True)
-                remaining = self.remaining_chambers
-                rem_bullets = self.remaining_bullets()
-                emb.add_field(name="剩餘膛室", value=str(remaining), inline=True)
-                if self.mode == "royale":
-                    emb.add_field(
-                        name="彈倉",
-                        value=f"`{len(self.bullet_positions)}` 彈 / `{self.chambers}` 膛",
-                        inline=True,
-                    )
-                prob = _hit_prob_pct(remaining, rem_bullets)
-                if remaining and rem_bullets:
-                    prob_text = f"`{prob:.1f}%`（{rem_bullets}/{remaining}）"
-                elif remaining:
-                    prob_text = f"`0%`（0/{remaining}）"
-                else:
-                    prob_text = "`0%`"
-                emb.add_field(name="下一發中彈機率", value=prob_text, inline=True)
-                if awaiting_choice:
-                    emb.set_footer(text="空膛！可繼續射、加注繼續，或停手換人")
-            if self.history:
-                emb.add_field(name="歷程", value="\n".join(self.history[-8:]), inline=False)
-            return emb
-
-        def build_history_embed(self) -> discord.Embed:
-            """完整歷程，給歷程按鈕以私人訊息回覆用。"""
-            emb = discord.Embed(
-                title="📜 本場俄羅斯輪盤歷程",
-                description=(
-                    f"模式：**{'淘汰賽' if self.mode == 'royale' else '1v1 對決'}**"
-                    f"｜彩池：**`{self.pot:,}`** 東雲幣\n"
-                    f"參加者：{self.mention_line()}"
-                ),
-                color=0x5865F2,
-            )
-            if not self.history:
-                emb.add_field(name="歷程", value="（這場還沒有任何動作）", inline=False)
-                return emb
-            # 單一 field 上限 1024 字，超過就拆成多個
-            chunks: typing.List[str] = []
-            buf = ""
-            for idx, text in enumerate(self.history, start=1):
-                line = f"`{idx:>2}.` {text}"
-                candidate = f"{buf}\n{line}" if buf else line
-                if len(candidate) > 1024:
-                    chunks.append(buf)
-                    buf = line
-                else:
-                    buf = candidate
-            if buf:
-                chunks.append(buf)
-            truncated = len(chunks) > 5
-            if truncated:
-                chunks = chunks[-5:]
-            total = len(chunks)
-            for i, chunk in enumerate(chunks, start=1):
-                emb.add_field(
-                    name="歷程" if total == 1 else f"歷程（{i}/{total}）",
-                    value=chunk,
-                    inline=False,
-                )
-            if truncated:
-                emb.set_footer(text="歷程過長，僅顯示最近的部分")
-            return emb
-
-        # 勝負判定（同步、瞬間完成）與金流結算（多次 DB 往返、很慢）刻意分開：
-        # 互動必須在 3 秒內回覆，所以先算出結果並更新畫面，錢和戰績之後再補。
-        def mark_settled(self) -> bool:
-            """同步搶下結算權，回傳 True 代表由這次呼叫負責付錢。"""
-            if self.settled:
-                return False
-            self.settled = True
-            return True
 
         async def payout_duel(self, loser_uid: int, winner_uid: int) -> None:
             pot = self.pot
@@ -436,25 +116,13 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
                 results={winner_uid: (True, pot - win_stake), loser_uid: (False, -lose_stake)},
                 reason="俄羅斯輪盤勝利", payload=self.to_payload(), finished=True)
 
+
         async def settle_duel(self, loser_uid: int) -> int:
             winner_uid = self.other_uid_duel(loser_uid)
             if self.mark_settled():
                 await self.payout_duel(loser_uid, winner_uid)
             return winner_uid
 
-        def apply_royale_elimination(self, uid: int) -> typing.Optional[int]:
-            """同步淘汰玩家並推進輪次，回傳勝者（尚未分出勝負則為 None）。"""
-            uid = int(uid)
-            was_turn = self.turn_uid == uid
-            next_turn = self.next_alive_uid(uid) if was_turn else self.turn_uid
-            if uid in self.alive_ids:
-                self.alive_ids = [x for x in self.alive_ids if x != uid]
-            if len(self.alive_ids) == 1:
-                self.settled = True
-                return self.alive_ids[0]
-            if was_turn and self.alive_ids:
-                self.turn_uid = next_turn if next_turn in self.alive_ids else self.alive_ids[0]
-            return None
 
         async def payout_royale(self, loser_uid: int, winner_uid: typing.Optional[int]) -> None:
             lose_stake = self.stake_of(loser_uid)
@@ -468,10 +136,12 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
                 results=results, reason="俄羅斯輪盤淘汰賽勝利", payload=self.to_payload(),
                 finished=winner_uid is not None)
 
+
         async def eliminate_royale(self, uid: int, *, timeout: bool = False) -> typing.Optional[int]:
             winner_uid = self.apply_royale_elimination(uid)
             await self.payout_royale(int(uid), winner_uid)
             return winner_uid
+
 
         async def refund_participants(self, reason: str, uids: typing.Iterable[int]) -> None:
             if self.settled:
@@ -481,6 +151,7 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
             await asyncio.to_thread(rr_match_repo.settle_event_sync,
                 match_id=self.match_id, event_key="refund", credits=credits, results={},
                 reason=reason, payload=self.to_payload(), finished=True)
+
 
     async def _finish_turn_timeout(view: discord.ui.View, *, reason: str) -> None:
         m: RrMatch = view.match  # type: ignore[attr-defined]

@@ -31,6 +31,32 @@ class MySQLStateTests(unittest.TestCase):
             c.execute("SELECT balance FROM users ORDER BY user_id")
             return [int(row[0]) for row in c.fetchall()]
 
+    def test_audit_indexes_and_ledger_pagination_on_mysql(self):
+        from bot_modules import admin_audit_repo as audit
+        with db.db_cursor(commit=True) as c:
+            for n in range(23):
+                c.execute("INSERT INTO casino_logs (user_id,amount,reason) VALUES ('1',%s,'audit test')", (n,))
+            c.execute("INSERT INTO casino_logs (user_id,amount,reason) VALUES ('2',999,'other player')")
+        snapshot = audit.account_snapshot(1)
+        self.assertEqual(snapshot['account'][0], 1000)
+        page = snapshot['page']
+        ids = [r[0] for r in page.rows]
+        with db.db_cursor(commit=True) as c:
+            c.execute("INSERT INTO casino_logs (user_id,amount,reason) VALUES ('1',999,'new entry')")
+            new_id = c.lastrowid
+        while page.has_more:
+            page = audit.ledger_page(1, page.upper_id, page.rows[-1][0])
+            ids.extend(r[0] for r in page.rows)
+        self.assertEqual(len(ids), 23)
+        self.assertEqual(len(set(ids)), 23)
+        self.assertNotIn(new_id, ids)
+        self.assertEqual(self.balances(), [1000, 1000])
+        with db.db_cursor() as c:
+            c.execute("SELECT version FROM bot_schema_migrations ORDER BY version")
+            self.assertEqual([r[0] for r in c.fetchall()], [1, 2, 3])
+            c.execute("SHOW INDEX FROM casino_logs WHERE Key_name='idx_casino_logs_user_id'")
+            self.assertEqual([r[4] for r in c.fetchall()], ['user_id', 'id'])
+
     def test_concurrent_payout_credits_once(self):
         self.store.debit("ci:bj", "bj", 1, 100, "open")
         self.store.prepare("ci:bj", {"1": 200}, {"1": [True, 100, False]})
