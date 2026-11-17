@@ -3,6 +3,7 @@ import logging
 import random
 import typing
 from bot_modules.runtime.policy import allowed
+from bot_modules.maintenance import active_game_action
 from functools import wraps
 
 import discord
@@ -37,7 +38,7 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
     async def try_deduct_balance_async(uid, *args):
         if not await allowed(bot, uid):
             return False
-        return await original_debit(uid, *args)
+        return await original_debit(uid, *args, require_casino_open=True)
     credit_balance_with_log_async = ctx["credit_balance_with_log_async"]
     fetch_rr_stats_async = ctx["fetch_rr_stats_async"]
     fetch_rr_leaderboard_async = ctx["fetch_rr_leaderboard_async"]
@@ -54,15 +55,19 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
             interaction = args[0] if args else None
             if interaction is not None:
                 await interaction_defer_if_needed(interaction, thinking=False)
-            async with m.lock:
-                # Ignore queued callbacks from an earlier phase of the match.
-                view = self.view if isinstance(self, discord.ui.Select) else self
-                if m.view is not None and m.view is not view:
-                    if interaction is not None:
-                        await interaction_send(interaction, "畫面已更新，請使用目前的按鈕。", ephemeral=True)
-                    return
-                return await callback(self, *args, **kwargs)
+            with active_game_action(bot):
+                return await locked_action(self, interaction, m, callback, args, kwargs)
         return guarded
+
+    async def locked_action(self, interaction, m, callback, args, kwargs):
+        async with m.lock:
+            # Ignore queued callbacks from an earlier phase of the match.
+            view = self.view if isinstance(self, discord.ui.Select) else self
+            if m.view is not None and m.view is not view:
+                if interaction is not None:
+                    await interaction_send(interaction, "畫面已更新，請使用目前的按鈕。", ephemeral=True)
+                return
+            return await callback(self, *args, **kwargs)
 
     def _hit_prob_pct(remaining_chambers: int, remaining_bullets: int) -> float:
         if remaining_chambers <= 0 or remaining_bullets <= 0:

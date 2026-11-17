@@ -2,6 +2,8 @@ import datetime
 import random
 import typing
 
+import pymysql
+
 from bot_modules import config
 from bot_modules.db import db_conn, db_cursor
 from bot_modules.social_repo import lottery_day_key
@@ -31,8 +33,9 @@ def init_lottery_tables(cursor) -> None:
     )
     try:
         cursor.execute("CREATE INDEX idx_lottery_entries_week ON lottery_entries (week_key)")
-    except Exception:
-        pass
+    except pymysql.MySQLError as exc:
+        if not exc.args or exc.args[0] != 1061:
+            raise
 
 
 def _day_sort_key(day_key: str) -> typing.Tuple[int, int, int]:

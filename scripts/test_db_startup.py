@@ -29,8 +29,42 @@ class DatabaseStartupTests(unittest.TestCase):
         self.assertTrue(ddl)
         self.assertEqual(len(ddl), len(set(ddl)))
         self.assertFalse(any("milestone" in call.args[0].lower() for call in cursor.execute.call_args_list))
-        conn.commit.assert_called_once()
+        self.assertEqual(conn.commit.call_count, 2)
         conn.close.assert_called_once()
+
+    def test_migrations_run_once_and_do_not_rebuild_history(self):
+        from bot_modules import migrations
+        conn = MagicMock()
+        cursor = conn.cursor.return_value
+        versions = set()
+        def execute(sql, args=()):
+            if sql.startswith("INSERT INTO bot_schema_migrations"):
+                versions.add(args[0])
+        cursor.execute.side_effect = execute
+        cursor.fetchone.return_value = (1,)
+        cursor.fetchall.side_effect = lambda: [(v,) for v in versions]
+        migrations.run_migrations(conn)
+        first_calls = len(cursor.execute.call_args_list)
+        migrations.run_migrations(conn)
+        repeated = [call.args[0] for call in cursor.execute.call_args_list[first_calls:]]
+        self.assertEqual(versions, {1, 2})
+        self.assertFalse(any(sql.startswith("ALTER TABLE") for sql in repeated))
+        all_sql = [call.args[0].upper() for call in cursor.execute.call_args_list]
+        self.assertFalse(any("TRUNCATE" in sql or "DELETE FROM CASINO_LOGS" in sql for sql in all_sql))
+
+    def test_unexpected_schema_error_aborts_without_marking_version(self):
+        from bot_modules import migrations
+        conn = MagicMock()
+        cursor = conn.cursor.return_value
+        cursor.fetchone.return_value = (1,)
+        cursor.fetchall.return_value = []
+        def execute(sql, *args):
+            if sql.startswith("ALTER TABLE"):
+                raise db.pymysql.OperationalError(1142, "permission denied")
+        cursor.execute.side_effect = execute
+        with self.assertRaises(db.pymysql.OperationalError):
+            migrations.run_migrations(conn)
+        conn.commit.assert_not_called()
 
     def test_socket_timeouts_apply_to_both_configuration_formats(self):
         for url in ("", "mysql://test:test@localhost/test"):

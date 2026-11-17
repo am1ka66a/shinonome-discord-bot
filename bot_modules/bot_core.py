@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import datetime
 import logging
 import os
@@ -126,6 +127,10 @@ def create_shinonome_bot(
 
     class ShinonomeBot(commands.Bot):
         async def setup_hook(self) -> None:
+            from bot_modules.runtime.instance_lease import InstanceLease
+            self.instance_lease = InstanceLease()
+            await asyncio.to_thread(self.instance_lease.acquire)
+            self.lease_task = asyncio.create_task(self.watch_instance_lease(), name="instance-lease")
             env_override = (os.getenv("DEV_RELAY_GUILD_ID") or "").strip()
             gid: typing.Optional[int] = int(env_override) if env_override else None
             if gid is None:
@@ -149,6 +154,30 @@ def create_shinonome_bot(
             except Exception as e:
                 logger.exception("註冊 dev_list_guilds 失敗，改為全域: %s", e)
                 self.tree.add_command(dev_list_guilds_command)
+
+        async def watch_instance_lease(self):
+            while not self.is_closed():
+                await asyncio.sleep(5)
+                try:
+                    await asyncio.to_thread(self.instance_lease.verify)
+                except Exception:
+                    logger.exception("機器人執行權遺失，停止服務以避免重複操作")
+                    ready = getattr(self, "_db_ready_event", None)
+                    if ready is not None:
+                        ready.clear()
+                    await self.close()
+                    return
+
+        async def close(self):
+            task = getattr(self, "lease_task", None)
+            if task and task is not asyncio.current_task():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            await super().close()
+            lease = getattr(self, "instance_lease", None)
+            if lease is not None:
+                await asyncio.to_thread(lease.close)
 
     return ShinonomeBot(command_prefix="!", intents=intents)
 

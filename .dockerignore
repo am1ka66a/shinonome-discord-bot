@@ -13,3 +13,9 @@ ENV/
 logs/
 .env
 .env.*
+
+# Infrastructure is evaluated by the CLI, not by the Python service
+node_modules/
+package.json
+package-lock.json
+.railway/

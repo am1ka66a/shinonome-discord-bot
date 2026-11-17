@@ -67,6 +67,9 @@ class GameStore:
             raise ValueError("注金必須大於零")
         try:
             with db_cursor(commit=True) as c:
+                from bot_modules.maintenance import casino_open
+                if not casino_open(c):
+                    return False
                 c.execute("INSERT IGNORE INTO bot_game_sessions (session_id,kind,owner_id,phase,escrow,payload,expires_at) VALUES (%s,%s,%s,'active','{}','{}',%s)",
                           (sid, kind, self.owner_id, int(time.time()) + seconds))
                 phase, escrow, data, _, expires = self._read(c, sid)

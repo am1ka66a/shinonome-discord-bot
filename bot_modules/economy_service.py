@@ -10,6 +10,7 @@ def debit_user(
     user_id: typing.Union[int, str],
     amount: int,
     reason: str,
+    require_casino_open: bool = False,
 ) -> bool:
     """Single-user debit with row lock, non-negative invariant, and transaction log."""
     amount = int(amount or 0)
@@ -17,6 +18,10 @@ def debit_user(
         return True
     with db_conn(get_db_connection) as conn:
         c = conn.cursor()
+        if require_casino_open:
+            from bot_modules.maintenance import casino_open
+            if not casino_open(c):
+                return False
         balance = get_locked_user_balance(c, user_id)
         if balance < amount:
             return False

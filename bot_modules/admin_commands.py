@@ -6,6 +6,7 @@ import typing
 import discord
 from discord import app_commands
 
+from bot_modules import maintenance
 from bot_modules.db import db_cursor
 from bot_modules.tx_ops import log_transaction_in_tx
 from bot_modules.discord_helpers import interaction_defer_if_needed, interaction_send
@@ -17,9 +18,8 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
     feature_toggles = ctx["FEATURE_TOGGLES"]
 
     resolve_slash_target = ctx["resolve_slash_target"]
-    ensure_user_exists = ctx["ensure_user_exists"]
     ensure_user_exists_async = ctx["ensure_user_exists_async"]
-    get_level_stats = ctx["get_level_stats"]
+    get_level_stats_async = ctx["get_level_stats_async"]
     exp_required_for_level = ctx["exp_required_for_level"]
     get_db_connection = ctx["get_db_connection"]
     log_transaction = ctx["log_transaction"]
@@ -165,8 +165,8 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
             return await interaction_send(interaction, err, ephemeral=True)
         member = m_user
 
-        ensure_user_exists(member.id, 0)
-        lv_row = get_level_stats(member.id)
+        await ensure_user_exists_async(member.id, 0)
+        lv_row = await get_level_stats_async(member.id)
         old_exp = int(lv_row[0] or 0) if lv_row else 0
         old_level = int(lv_row[1] or 1) if lv_row else 1
         target_exp = exp_required_for_level(level)
@@ -308,29 +308,71 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
         await asyncio.to_thread(db_work)
         await interaction_send(interaction, f"{member.mention} 已解除黑名單。", ephemeral=True)
 
-    @bot.tree.command(name="resetall_zero", description="[管理員] 全伺服器餘額清零")
+    class ResetConfirmation(discord.ui.View):
+        def __init__(self, owner_id, request_id, target, reset_stats):
+            super().__init__(timeout=60)
+            self.owner_id, self.request_id = owner_id, request_id
+            self.target, self.reset_stats = target, reset_stats
+            self.done = False
+            self.guard = asyncio.Lock()
+
+        @discord.ui.button(label="確認重置所有伺服器共用帳戶", style=discord.ButtonStyle.danger)
+        async def confirm(self, interaction, button):
+            await interaction_defer_if_needed(interaction, ephemeral=True, thinking=False)
+            if interaction.user.id != self.owner_id or not is_slash_host(interaction):
+                return await interaction_send(interaction, "只有原操作管理者可確認。", ephemeral=True)
+            async with self.guard:
+                if self.done:
+                    return await interaction_send(interaction, "此操作已完成。", ephemeral=True)
+                try:
+                    maintenance.require_idle(bot)
+                    result = await asyncio.to_thread(maintenance.reset_balances,
+                        self.request_id, self.owner_id, self.target, self.reset_stats)
+                except ValueError as error:
+                    return await interaction_send(interaction, str(error), ephemeral=True)
+                except Exception:
+                    logger.exception("重置失敗或結果待核對 op=%s", self.request_id)
+                    return await interaction_send(interaction,
+                        "重置結果尚待核對；可在這個確認畫面重試，請勿另開新重置。", ephemeral=True)
+                self.done = True
+                self.stop()
+                await interaction.edit_original_response(content=
+                    f"已重置 {result['accounts']} 個共用帳戶。每戶餘額：{self.target:,}。\n"
+                    f"調整前資料與流水已保存，操作編號：{self.request_id}", view=None)
+
+        @discord.ui.button(label="取消", style=discord.ButtonStyle.secondary)
+        async def cancel(self, interaction, button):
+            if interaction.user.id != self.owner_id:
+                return await interaction.response.send_message("只有原操作管理者可取消。", ephemeral=True)
+            async with self.guard:
+                self.done = True
+                self.stop()
+                await interaction.response.edit_message(content="已取消重置。", view=None)
+
+    async def show_reset(interaction, target, reset_stats):
+        await interaction_defer_if_needed(interaction, ephemeral=True)
+        if not is_slash_host(interaction):
+            return await interaction_send(interaction, "你沒有權限使用此指令。", ephemeral=True)
+        try:
+            count, balance = await asyncio.to_thread(maintenance.preview_reset)
+        except ValueError as error:
+            return await interaction_send(interaction, str(error), ephemeral=True)
+        suffix = "；並清除救濟次數與遊戲戰績" if reset_stats else "；保留遊戲戰績"
+        await interaction_send(interaction,
+            f"影響範圍：**全部伺服器共用的 {count} 個帳戶**，目前總餘額 {balance:,}。\n"
+            f"將每戶餘額改為 {target:,}{suffix}。\n"
+            "確認後會保存調整前資料與流水；60 秒內未確認即失效。",
+            view=ResetConfirmation(interaction.user.id, str(interaction.id), target, reset_stats), ephemeral=True)
+
+    @bot.tree.command(name="resetall_zero", description="[管理員] 預覽並確認所有共用帳戶餘額清零")
     @app_commands.default_permissions(administrator=True)
     async def resetall_zero_slash(interaction: discord.Interaction):
-        await interaction_defer_if_needed(interaction)
-        if not is_slash_host(interaction):
-            return await interaction_send(interaction, "❌ 你沒有權限使用此指令！", ephemeral=True)
-        def db_work():
-            with db_cursor(commit=True, connect=get_db_connection) as c:
-                c.execute("UPDATE users SET balance=0")
-        await asyncio.to_thread(db_work)
-        await interaction_send(interaction, "💥 全伺服器帳戶餘額已清零。")
+        await show_reset(interaction, 0, False)
 
-    @bot.tree.command(name="resetall_default", description="[管理員] 全伺服器重置為 50,000")
+    @bot.tree.command(name="resetall_default", description="[管理員] 預覽並確認所有共用帳戶重置為 50,000")
     @app_commands.default_permissions(administrator=True)
     async def resetall_default_slash(interaction: discord.Interaction):
-        await interaction_defer_if_needed(interaction)
-        if not is_slash_host(interaction):
-            return await interaction_send(interaction, "❌ 你沒有權限使用此指令！", ephemeral=True)
-        def db_work():
-            with db_cursor(commit=True, connect=get_db_connection) as c:
-                c.execute("UPDATE users SET balance=50000, rescue_count=0, total_games=0, wins=0, total_profit=0")
-        await asyncio.to_thread(db_work)
-        await interaction_send(interaction, "🔄 全服已重置為 50,000，並重置統計。")
+        await show_reset(interaction, 50000, True)
 
     @bot.tree.command(name="lock", description="[管理員] 開關賭場營業狀態")
     @app_commands.default_permissions(administrator=True)
@@ -359,8 +401,8 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
 `/ban` - 將玩家加入黑名單
 `/unban` - 將玩家移出黑名單
 `/lock` - 開關賭場營業狀態
-`/resetall_zero` - 全服餘額清零（含統計重置）
-`/resetall_default` - 全服重置為 50,000（含統計重置）
+`/resetall_zero` - 全部共用帳戶餘額清零（保留戰績，需關閉賭場並確認）
+`/resetall_default` - 全部共用帳戶重置為 50,000（含戰績，需關閉賭場並確認）
 `/say` - 指定頻道／討論串發送文字或圖片；reply_to 可貼訊息連結或 ID 來回覆
 `/share_stats` - 查看賭場回收分潤統計
 `/admin_balance_set` - 直接設定玩家餘額

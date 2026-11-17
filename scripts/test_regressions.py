@@ -197,7 +197,7 @@ class AsyncRegressions(unittest.IsolatedAsyncioTestCase):
         duel.register_duel_commands(self.bot, self.ctx)
         cls = nested_class(self.bot, 'duel', 'EDuelInviteView')
         view = cls(SimpleNamespace(id=1), SimpleNamespace(id=2), 100)
-        async def debit(*args):
+        async def debit(*args, **kwargs):
             await asyncio.sleep(0.01)
             return True
         self.ctx['try_deduct_balance_async'].side_effect = debit
@@ -251,7 +251,7 @@ class AsyncRegressions(unittest.IsolatedAsyncioTestCase):
             challenger_id=1, opponent_id=2)
         view = classes['RrInviteView'](match)
         match.view = view
-        async def debit(*args):
+        async def debit(*args, **kwargs):
             await asyncio.sleep(0.01)
             return True
         self.ctx['try_deduct_balance_async'].side_effect = debit

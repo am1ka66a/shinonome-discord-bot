@@ -362,7 +362,7 @@ def transfer_sync(sender_id: int, receiver_id: int, amount: int, note_text: str)
     )
 
 
-def try_deduct_balance(user_id, amount, reason):
+def try_deduct_balance(user_id, amount, reason, require_casino_open=False):
     return economy_service.debit_user(
         get_db_connection,
         get_locked_user_balance,
@@ -370,6 +370,7 @@ def try_deduct_balance(user_id, amount, reason):
         user_id,
         amount,
         reason,
+        require_casino_open=require_casino_open,
     )
 
 

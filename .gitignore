@@ -23,3 +23,7 @@ ENV/
 # Runtime log file (see BOT_LOG_FILE in bot)
 logs/
 *.log
+
+# Infrastructure SDK and local Railway cutover snapshot
+node_modules/
+.railway/.cac-migration.json

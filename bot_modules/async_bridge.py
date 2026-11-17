@@ -38,8 +38,8 @@ def build_async_wrappers(domain) -> typing.Dict[str, typing.Any]:
         return await db_to_thread(domain.get_level_stats, user_id)
 
 
-    async def try_deduct_balance_async(user_id, amount, reason):
-        return await db_to_thread(domain.try_deduct_balance, user_id, amount, reason)
+    async def try_deduct_balance_async(user_id, amount, reason, require_casino_open=False):
+        return await db_to_thread(domain.try_deduct_balance, user_id, amount, reason, require_casino_open)
 
     async def update_game_result_async(
         user_id, balance_delta, profit_delta, is_win, is_push=False, share_recovery=True

@@ -61,7 +61,7 @@ root = pathlib.Path(".")
 files = [
     p
     for p in root.rglob("*.py")
-    if not any(part in {".venv", "__pycache__", ".git"} for part in p.parts)
+    if not any(part in {".venv", "__pycache__", ".git", ".local-state", ".local-runtime", "node_modules"} for part in p.parts)
 ]
 
 # Derive the acquirer set from the code itself: any function whose body opens a connection,

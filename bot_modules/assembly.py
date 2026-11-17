@@ -25,7 +25,7 @@ def register_all_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             "resolve_slash_target": ctx["resolve_slash_target"],
             "ensure_user_exists": ctx["ensure_user_exists"],
             "ensure_user_exists_async": ctx["ensure_user_exists_async"],
-            "get_level_stats": ctx["get_level_stats"],
+            "get_level_stats_async": ctx["get_level_stats_async"],
             "exp_required_for_level": ctx["exp_required_for_level"],
             "get_db_connection": ctx["get_db_connection"],
             "logger": ctx["logger"],

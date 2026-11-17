@@ -132,6 +132,25 @@ class FeatureTests(unittest.TestCase):
             self.run_now(self.bot.tree.get_command("admin_feature_toggle").callback(interaction(), "bj", False))
         self.assertTrue(self.ctx["FEATURE_TOGGLES"]["bj"])
 
+    def test_reset_requires_owner_confirmation_and_runs_once(self):
+        from bot_modules import maintenance
+        admin_commands.register_admin_commands(self.bot, self.ctx)
+        async def direct(function, *args):
+            return function(*args)
+        with patch.object(admin_commands.asyncio, "to_thread", new=direct), \
+                patch.object(maintenance, "preview_reset", return_value=(2, 3000)), \
+                patch.object(maintenance, "reset_balances", return_value={"accounts": 2}) as reset:
+            inter = interaction(command="resetall_zero")
+            self.run_now(self.bot.tree.get_command("resetall_zero").callback(inter))
+            view = inter.followup.send.call_args.kwargs["view"]
+            self.addCleanup(view.stop)
+            reset.assert_not_called()
+            self.run_now(view.children[0].callback(interaction(uid=99)))
+            reset.assert_not_called()
+            self.run_now(view.children[0].callback(interaction()))
+            self.run_now(view.children[0].callback(interaction()))
+            reset.assert_called_once_with(str(inter.id), 2, 0, False)
+
     def test_full_registration_installs_durable_services_without_connecting(self):
         source = (ROOT / "bot.py").read_text(encoding="utf-8").split("MEMBERS_INTENT_FALLBACK_FLAG =")[0]
         namespace = {"__name__": "offline_registration_test", "__file__": str(ROOT / "bot.py")}

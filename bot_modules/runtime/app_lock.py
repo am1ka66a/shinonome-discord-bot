@@ -38,6 +38,7 @@ def register_app_command_lock(
     read_only = read_only_commands if read_only_commands is not None else DEFAULT_READ_ONLY_APP_COMMANDS
     locks: typing.Dict[int, typing.Tuple[int, float]] = {}
     guard = asyncio.Lock()
+    bot._active_mutating_commands = locks
 
     async def enforce_single_active_app_command(interaction: discord.Interaction) -> bool:
         # Suggestions never dispatch app_command_completion, so they must not acquire a lock.
