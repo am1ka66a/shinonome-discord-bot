@@ -126,6 +126,14 @@ def create_shinonome_bot(
         )
 
     class ShinonomeBot(commands.Bot):
+        async def start(self, token: str, *, reconnect: bool = True) -> None:
+            await super().start(token, reconnect=reconnect)
+            # Client.close() makes Client.start() return normally. Surface a
+            # watchdog failure here so run() exits nonzero and ON_FAILURE works.
+            error = getattr(self, "_instance_lease_error", None)
+            if error is not None:
+                raise RuntimeError("機器人執行權檢查失敗，需要自動重啟") from error
+
         async def setup_hook(self) -> None:
             from bot_modules.runtime.instance_lease import InstanceLease
             self.instance_lease = InstanceLease()
@@ -160,8 +168,9 @@ def create_shinonome_bot(
                 await asyncio.sleep(5)
                 try:
                     await asyncio.to_thread(self.instance_lease.verify)
-                except Exception:
-                    logger.exception("機器人執行權遺失，停止服務以避免重複操作")
+                except Exception as error:
+                    self._instance_lease_error = error
+                    logger.exception("無法確認機器人執行權，停止服務並回報異常以觸發平台重啟")
                     ready = getattr(self, "_db_ready_event", None)
                     if ready is not None:
                         ready.clear()
@@ -174,10 +183,12 @@ def create_shinonome_bot(
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
-            await super().close()
-            lease = getattr(self, "instance_lease", None)
-            if lease is not None:
-                await asyncio.to_thread(lease.close)
+            try:
+                await super().close()
+            finally:
+                lease = getattr(self, "instance_lease", None)
+                if lease is not None:
+                    await asyncio.to_thread(lease.close)
 
     return ShinonomeBot(command_prefix="!", intents=intents)
 
