@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bot_modules.discord_logging import DiscordLogHandler
-from bot_modules.runtime.instance_lease import InstanceLease
+from bot_modules.runtime.instance_lease import InstanceLease, LeaseBusyError, LEASE_IDLE_TIMEOUT_SECONDS
 from bot_modules.bot_core import create_shinonome_bot
 import discord
 from discord.ext import commands
@@ -23,6 +23,7 @@ class LeaseTests(unittest.TestCase):
         conn.cursor.return_value.fetchone.side_effect = [(1,), (42,), (42,), (None,)]
         lease = InstanceLease(connect=Mock(return_value=conn))
         lease.acquire()
+        conn.cursor.return_value.execute.assert_any_call("SET SESSION wait_timeout=%s", (LEASE_IDLE_TIMEOUT_SECONDS,))
         lease.verify()
         conn.ping.assert_called_once_with(reconnect=False)
         with self.assertRaises(RuntimeError):
@@ -52,6 +53,86 @@ class LeaseTests(unittest.TestCase):
         conn.ping.assert_called_once_with(reconnect=False)
         connect.assert_called_once()
         lease.close()
+
+
+class LeaseStartupRetryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_database_outage_then_busy_lock_recovers_using_fresh_connections(self):
+        import pymysql
+        busy, healthy = Mock(), Mock()
+        busy.cursor.return_value.fetchone.return_value = (0,)
+        healthy.cursor.return_value.fetchone.side_effect = [(1,), (42,)]
+        connect = Mock(side_effect=[pymysql.OperationalError(2003, 'connection timed out'), busy, healthy])
+        lease, logger = InstanceLease(connect=connect), Mock()
+        self.addCleanup(lease.close)
+        with patch('bot_modules.runtime.instance_lease.asyncio.sleep', new=AsyncMock()) as sleep:
+            await lease.acquire_with_retry(logger)
+        self.assertEqual([call.args[0] for call in sleep.await_args_list], [5, 10])
+        self.assertEqual(connect.call_count, 3)
+        busy.close.assert_called_once()
+        healthy.close.assert_not_called()
+        self.assertIs(lease.connection, healthy)
+        logger.warning.assert_called_once()
+        logger.info.assert_called_once()
+
+    async def test_long_lock_wait_exceeds_platform_retry_budget_without_crashing(self):
+        lease, logger = InstanceLease(), Mock()
+        with patch.object(lease, 'acquire', side_effect=[LeaseBusyError('busy')]*15+[None]) as acquire, \
+                patch('bot_modules.runtime.instance_lease.asyncio.sleep', new=AsyncMock()) as sleep:
+            await lease.acquire_with_retry(logger)
+        self.assertEqual(acquire.call_count, 16)
+        self.assertEqual([c.args[0] for c in sleep.await_args_list], [5,10,20]+[30]*12)
+        logger.warning.assert_called_once()
+
+    async def test_authentication_and_unknown_lock_result_are_not_retried(self):
+        import pymysql
+        for error in (pymysql.OperationalError(1045, 'access denied'), RuntimeError('unknown lock result')):
+            with self.subTest(error=type(error).__name__):
+                lease = InstanceLease()
+                with patch.object(lease, 'acquire', side_effect=error) as acquire, \
+                        patch('bot_modules.runtime.instance_lease.asyncio.sleep', new=AsyncMock()) as sleep:
+                    with self.assertRaises(type(error)):
+                        await lease.acquire_with_retry(Mock())
+                acquire.assert_called_once()
+                sleep.assert_not_awaited()
+
+    async def test_cancelling_an_inflight_acquire_cleans_up_a_late_lock(self):
+        import threading
+        entered, release = threading.Event(), threading.Event()
+        conn = Mock()
+        conn.cursor.return_value.fetchone.side_effect = [(1,), (42,)]
+        def delayed_connect(**kwargs):
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError('test did not release worker')
+            return conn
+        lease = InstanceLease(connect=delayed_connect)
+        task = asyncio.create_task(lease.acquire_with_retry(Mock()))
+        try:
+            self.assertTrue(await asyncio.to_thread(entered.wait, 3))
+            task.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(task.done())
+        finally:
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        conn.close.assert_called_once()
+        self.assertIsNone(lease.connection)
+
+    async def test_cancel_while_sleeping_stops_retries_immediately(self):
+        lease, sleeping = InstanceLease(), asyncio.Event()
+        async def wait(_):
+            sleeping.set()
+            await asyncio.Future()
+        with patch.object(lease, 'acquire', side_effect=LeaseBusyError('healthy owner')) as acquire, \
+                patch('bot_modules.runtime.instance_lease.asyncio.sleep', new=wait):
+            task = asyncio.create_task(lease.acquire_with_retry(Mock()))
+            await asyncio.wait_for(sleeping.wait(), timeout=3)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        acquire.assert_called_once()
+        self.assertIsNone(lease.connection)
 
 
 def offline_bot():

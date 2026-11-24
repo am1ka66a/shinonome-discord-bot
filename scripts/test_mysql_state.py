@@ -102,6 +102,35 @@ class MySQLStateTests(unittest.TestCase):
             first.close()
             second.close()
 
+    def test_abandoned_lock_expires_and_waiting_bot_acquires_without_restart(self):
+        import asyncio
+        from unittest.mock import Mock
+        import pymysql
+        from bot_modules.runtime.instance_lease import InstanceLease, LEASE_IDLE_TIMEOUT_SECONDS
+        first, waiting = InstanceLease(), InstanceLease()
+        try:
+            first.acquire()
+            c = first.connection.cursor()
+            c.execute("SELECT @@session.wait_timeout,@@global.wait_timeout")
+            session_timeout, global_timeout = c.fetchone()
+            self.assertEqual(session_timeout, LEASE_IDLE_TIMEOUT_SECONDS)
+            # Accelerate only this disposable owner's expiry. No close(), KILL,
+            # RELEASE_LOCK or heartbeat: MySQL must release the stale lock itself.
+            c.execute("SET SESSION wait_timeout=2")
+            async def recover():
+                await asyncio.wait_for(waiting.acquire_with_retry(Mock(), initial_delay=0.1, max_delay=0.25), timeout=10)
+            asyncio.run(recover())
+            waiting.verify()
+            with self.assertRaises(pymysql.MySQLError):
+                first.verify()
+            with db.db_cursor() as c:
+                c.execute("SELECT @@global.wait_timeout")
+                self.assertEqual(c.fetchone()[0], global_timeout)
+            self.assertEqual(self.balances(), [1000, 1000])
+        finally:
+            first.close()
+            waiting.close()
+
     def test_reset_retry_after_lost_commit_response_does_not_pay_twice(self):
         import contextlib
         from bot_modules import maintenance

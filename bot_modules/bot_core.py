@@ -137,7 +137,7 @@ def create_shinonome_bot(
         async def setup_hook(self) -> None:
             from bot_modules.runtime.instance_lease import InstanceLease
             self.instance_lease = InstanceLease()
-            await asyncio.to_thread(self.instance_lease.acquire)
+            await self.instance_lease.acquire_with_retry(logger)
             self.lease_task = asyncio.create_task(self.watch_instance_lease(), name="instance-lease")
             env_override = (os.getenv("DEV_RELAY_GUILD_ID") or "").strip()
             gid: typing.Optional[int] = int(env_override) if env_override else None
@@ -164,8 +164,9 @@ def create_shinonome_bot(
                 self.tree.add_command(dev_list_guilds_command)
 
         async def watch_instance_lease(self):
+            from bot_modules.runtime.instance_lease import LEASE_HEARTBEAT_SECONDS
             while not self.is_closed():
-                await asyncio.sleep(5)
+                await asyncio.sleep(LEASE_HEARTBEAT_SECONDS)
                 try:
                     await asyncio.to_thread(self.instance_lease.verify)
                 except Exception as error:
