@@ -122,6 +122,28 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ConsoleLogTests(unittest.TestCase):
+    def test_discord_default_null_handler_does_not_hide_connection_errors(self):
+        output,errors=io.StringIO(),io.StringIO()
+        application=logging.getLogger('shinonome_bot')
+        discord_log=logging.getLogger('discord')
+        old=(application.level,application.propagate,discord_log.level,discord_log.propagate)
+        try:
+            with patch.object(application,'handlers',[]),patch.object(discord_log,'handlers',[logging.NullHandler()]), \
+                    patch.object(bot_core.sys,'stdout',output),patch.object(bot_core.sys,'stderr',errors), \
+                    patch.dict('os.environ',{'LOG_LEVEL':'INFO','BOT_LOG_FILE':'','LOG_FILE':''}):
+                bot_core.setup_bot_logging()
+                discord_log.info('gateway connected')
+                discord_log.error('gateway failure')
+                self.assertIn('gateway connected',output.getvalue())
+                self.assertIn('gateway failure',errors.getvalue())
+                for handler in [*application.handlers,*discord_log.handlers]:
+                    handler.close()
+        finally:
+            application.setLevel(old[0])
+            application.propagate=old[1]
+            discord_log.setLevel(old[2])
+            discord_log.propagate=old[3]
+
     def test_info_goes_to_stdout_and_actual_errors_to_stderr(self):
         output,errors=io.StringIO(),io.StringIO()
         logger=logging.getLogger('console-routing-regression')

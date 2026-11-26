@@ -48,7 +48,7 @@ def setup_bot_logging() -> logging.Logger:
     for handler in _console_handlers(fmt, level):
         log.addHandler(handler)
     discord_log = logging.getLogger("discord")
-    if not discord_log.handlers:
+    if not any(not isinstance(h, logging.NullHandler) for h in discord_log.handlers):
         discord_log.setLevel(level)
         discord_log.propagate = False
         for handler in _console_handlers(fmt, level):
