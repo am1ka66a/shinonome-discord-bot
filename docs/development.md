@@ -60,3 +60,13 @@ MySQL 測試只會在明確啟用且資料庫名稱為 `shinonome_test`、主機
 匯出格式是 gzip 壓縮的 JSONL，每筆 SQL 以 JSON 保存，不會因文字包含分號或換行而截斷。
 CI 會將合成測試資料匯出，再還原到全新的 `127.0.0.1/shinonome_restore_test`，核對餘額與文字內容。還原工具會拒絕遠端、正式名稱或已有資料的資料庫。
 目前 Railway 工作區方案不提供手動與排程備份；這次上線前已有本機一致性匯出。每日雲端備份尚待使用支援該功能的方案，並未自動升級付費方案。
+
+## 測試 AI 指令
+
+`/ask` 預設停用。啟用時只同步到指定的 Discord 伺服器，且僅指定帳號能在指定文字頻道使用。回覆只有提問者看得見。
+
+1. 為 Shinonome 建立專用的 OpenClaw Gateway。執行 `openclaw models auth login --provider openai --method siwc`，在瀏覽器授權使用 ChatGPT 方案額度，並將預設代理的模型設為該登入可用的模型。Gateway 使用該登入時，無需配置 `OPENAI_API_KEY`。依照 [OpenClaw 的登入文件](https://docs.openclaw.ai/providers/openai/setup) 操作。
+2. 啟用 `gateway.http.endpoints.chatCompletions.enabled`，使用 Gateway Token 驗證，並將預設代理的工具設定為最小權限。可設 `tools.profile: "minimal"`，再以 `tools.deny: ["session_status", "gateway"]` 停用此設定檔的工具。此 Gateway 專供文字問答，請避免接入其他帳號或工具。Gateway Token 具有操作員權限，請只允許本機或私有網路連線。參考 [端點文件](https://docs.openclaw.ai/gateway/openai-http-api) 與 [工具權限文件](https://docs.openclaw.ai/gateway/config-tools/tool-policy)。
+3. 在 Bot 的執行環境填寫 `.env.example` 中的 `SHINONOME_AI_*` 變數。本機 Gateway 可用 `http://127.0.0.1:18789`。若兩個服務在同一個 Railway 環境，請填入 Gateway 的私有網域及連接埠，例如 `http://openclaw.railway.internal:8080`。填好後設定 `SHINONOME_AI_ENABLED=true`，重啟 Bot，再於測試頻道使用 `/ask`。
+
+將 `SHINONOME_AI_ENABLED` 設為 `false` 並重啟後，Bot 會在伺服器指令同步時移除 `/ask`。
