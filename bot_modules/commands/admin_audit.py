@@ -198,7 +198,10 @@ def register_admin_audit_commands(bot, ctx):
         for sid, kind, phase, expires in data["rows"]:
             status = "等待結算" if phase == "settling" else "已逾時待退款"
             lines.append(f"`{safe_text(sid,96)}`｜{safe_text(kind,24)}｜{status}\n截止：<t:{int(expires)}:R>")
-        await send_panel(interaction, f"待處理結算：{data['total']} 筆",
+        roulette_pending = data.get("roulette_pending",0)
+        if roulette_pending:
+            lines.append(f"俄羅斯輪盤：{roulette_pending} 場待結算，系統會按已保存結果自動重試。")
+        await send_panel(interaction, f"待處理結算：{data['total']+roulette_pending} 筆",
             lines or ["目前沒有待結算或逾時款項。"],
             f"輪盤對局 {data['roulette_count']} 場（可能正常進行中）｜最多 100 筆｜不會觸發付款")
 

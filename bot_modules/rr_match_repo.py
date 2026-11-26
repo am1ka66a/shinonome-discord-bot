@@ -34,9 +34,9 @@ def init_rr_match_table(cursor) -> None:
     )
 
 
-def settle_event_sync(*, match_id: str, event_key: str, credits: typing.Dict[int, int],
+def _apply_event_sync(*, match_id: str, event_key: str, credits: typing.Dict[int, int],
                       results: typing.Dict[int, typing.Tuple[bool, int]], reason: str,
-                      payload: typing.Dict[str, typing.Any], finished: bool) -> bool:
+                      payload: typing.Dict[str, typing.Any], finished: bool, next_phase="playing") -> bool:
     """Commit payouts, both stat tables, and the match checkpoint exactly once together."""
     with db_cursor(commit=True) as c:
         c.execute("SELECT match_id FROM russian_roulette_active_matches WHERE match_id=%s FOR UPDATE", (str(match_id),))
@@ -74,12 +74,87 @@ def settle_event_sync(*, match_id: str, event_key: str, credits: typing.Dict[int
             c.execute("DELETE FROM russian_roulette_active_matches WHERE match_id=%s", (str(match_id),))
         else:
             c.execute(
-                "UPDATE russian_roulette_active_matches SET phase='playing', payload=%s WHERE match_id=%s",
-                (json.dumps(payload, ensure_ascii=False), str(match_id)),
+                "UPDATE russian_roulette_active_matches SET phase=%s, payload=%s WHERE match_id=%s",
+                (next_phase, json.dumps(payload, ensure_ascii=False), str(match_id)),
             )
     if finished:
         unregister_match_users(match_id, _payload_participants(payload))
+    else:
+        sync_match_users(match_id, _payload_participants(payload))
     return True
+
+
+PENDING_EVENT_KEY = "pending_settlement"
+
+
+def _decode_payload(raw):
+    if isinstance(raw, (str, bytes, bytearray)):
+        return json.loads(raw)
+    return raw or {}
+
+
+def prepare_event_sync(*, match_id, event_key, credits, results, reason, payload, finished, next_phase="playing"):
+    """Durably choose one result before any payout; retries retain that result."""
+    with db_cursor(commit=True) as c:
+        c.execute("SELECT payload FROM russian_roulette_active_matches WHERE match_id=%s FOR UPDATE", (str(match_id),))
+        row = c.fetchone()
+        if row is None:
+            return False
+        current = _decode_payload(row[0])
+        pending = current.get(PENDING_EVENT_KEY)
+        if pending:
+            if pending["event_key"] != event_key:
+                raise ValueError("輪盤仍有結算等待處理，不能覆蓋結果")
+            return True
+        c.execute("SELECT 1 FROM russian_roulette_settlements WHERE match_id=%s AND event_key=%s", (str(match_id), event_key))
+        if c.fetchone():
+            return False
+        credits = {str(uid): int(amount) for uid, amount in credits.items()}
+        if any(amount < 0 for amount in credits.values()):
+            raise ValueError("Settlement credits must be nonnegative")
+        state = dict(payload)
+        state[PENDING_EVENT_KEY] = dict(event_key=event_key, credits=credits,
+            results={str(uid): value for uid,value in results.items()}, reason=reason,
+            finished=bool(finished), next_phase=next_phase)
+        c.execute("UPDATE russian_roulette_active_matches SET phase='settling',payload=%s WHERE match_id=%s",
+                  (json.dumps(state,ensure_ascii=False),str(match_id)))
+    return True
+
+
+def apply_pending_event_sync(match_id):
+    with db_cursor() as c:
+        c.execute("SELECT payload FROM russian_roulette_active_matches WHERE match_id=%s", (str(match_id),))
+        row = c.fetchone()
+        if row is None:
+            return False
+        state = dict(_decode_payload(row[0]))
+    pending = state.pop(PENDING_EVENT_KEY,None)
+    if not pending:
+        return False
+    return _apply_event_sync(match_id=str(match_id),event_key=pending["event_key"],
+        credits={int(uid):amount for uid,amount in pending["credits"].items()},
+        results={int(uid):value for uid,value in pending["results"].items()},reason=pending["reason"],
+        payload=state,finished=pending["finished"],next_phase=pending.get("next_phase","playing"))
+
+
+def settle_event_sync(**kwargs):
+    if not prepare_event_sync(**kwargs):
+        return False
+    return apply_pending_event_sync(kwargs["match_id"])
+
+
+def recover_pending_events_sync():
+    with db_cursor() as c:
+        c.execute("SELECT match_id FROM russian_roulette_active_matches WHERE phase='settling' LIMIT 100")
+        ids = [row[0] for row in c.fetchall()]
+    recovered = 0
+    for match_id in ids:
+        try:
+            recovered += int(apply_pending_event_sync(match_id))
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception("輪盤結算保留待重試 match=%s", match_id)
+    return recovered
 
 
 def new_match_id() -> str:
@@ -135,7 +210,7 @@ def rebuild_user_cache_from_rows(rows: typing.List[typing.Dict[str, typing.Any]]
         for row in rows:
             match_id = str(row["match_id"])
             payload = row.get("payload") or {}
-            if payload.get("settled"):
+            if payload.get("settled") and not payload.get(PENDING_EVENT_KEY):
                 continue
             for uid in _payload_participants(payload):
                 _user_active[uid] = match_id
@@ -153,6 +228,10 @@ def save_match_sync(
 ) -> None:
     participant_ids = _payload_participants(payload)
     with db_cursor(commit=True) as c:
+        c.execute("SELECT payload FROM russian_roulette_active_matches WHERE match_id=%s FOR UPDATE",(str(match_id),))
+        prior = c.fetchone()
+        if prior and _decode_payload(prior[0]).get(PENDING_EVENT_KEY):
+            raise ValueError("輪盤仍有待結算結果，不能覆蓋存檔")
         c.execute(
             """INSERT INTO russian_roulette_active_matches
                (match_id, guild_id, channel_id, message_id, mode, phase, payload)
@@ -177,6 +256,59 @@ def save_match_sync(
     sync_match_users(match_id, participant_ids)
 
 
+class _InsufficientStake(ValueError):
+    pass
+
+
+def fund_match_sync(*, charges, event_key, reason, match_id, guild_id, channel_id,
+                    message_id, mode, phase, payload):
+    """A stake and its canonical match state either both commit or both roll back."""
+    from bot_modules.maintenance import casino_open
+    charges = {int(uid):int(amount) for uid,amount in charges.items()}
+    if not charges or any(amount <= 0 for amount in charges.values()):
+        raise ValueError("注金必須大於零")
+    participants = _payload_participants(payload)
+    if not set(charges).issubset(participants):
+        raise ValueError("下注者必須在對局名單中")
+    try:
+        with db_cursor(commit=True) as c:
+            if not casino_open(c):
+                return False
+            c.execute("SELECT payload FROM russian_roulette_active_matches WHERE match_id=%s FOR UPDATE",(str(match_id),))
+            prior = c.fetchone()
+            c.execute("INSERT IGNORE INTO russian_roulette_settlements (match_id,event_key) VALUES (%s,%s)",
+                      (str(match_id),f"stake:{event_key}"))
+            if c.rowcount == 0:
+                if prior is None:
+                    return False
+                participants = _payload_participants(_decode_payload(prior[0])) if prior else []
+            else:
+                if prior and _decode_payload(prior[0]).get(PENDING_EVENT_KEY):
+                    raise ValueError("這場輪盤仍在結算，不能繼續下注")
+                if len(lock_user_rows(c,participants)) != len(set(participants)):
+                    raise _InsufficientStake()
+                c.execute("SELECT match_id,payload FROM russian_roulette_active_matches WHERE match_id<>%s",(str(match_id),))
+                for other_id,raw in c.fetchall():
+                    if set(participants).intersection(_payload_participants(_decode_payload(raw))):
+                        raise ValueError("玩家已有進行中的輪盤，不能重複下注")
+                for uid,amount in charges.items():
+                    c.execute("SELECT COALESCE(balance,0) FROM users WHERE user_id=%s",(str(uid),))
+                    row = c.fetchone()
+                    if row is None or int(row[0]) < amount:
+                        raise _InsufficientStake()
+                    c.execute("UPDATE users SET balance=balance-%s WHERE user_id=%s",(amount,str(uid)))
+                    log_transaction_in_tx(c,uid,-amount,reason)
+                c.execute("""INSERT INTO russian_roulette_active_matches
+                    (match_id,guild_id,channel_id,message_id,mode,phase,payload) VALUES (%s,%s,%s,%s,%s,%s,%s)
+                    ON DUPLICATE KEY UPDATE message_id=VALUES(message_id),phase=VALUES(phase),payload=VALUES(payload)""",
+                    (str(match_id),str(guild_id),str(channel_id),str(message_id) if message_id else None,
+                     mode,phase,json.dumps(payload,ensure_ascii=False)))
+    except _InsufficientStake:
+        return False
+    sync_match_users(match_id,participants)
+    return True
+
+
 def delete_match_sync(match_id: str, payload: typing.Optional[typing.Dict[str, typing.Any]] = None) -> None:
     if payload is None:
         row = fetch_match_sync(match_id)
@@ -186,11 +318,11 @@ def delete_match_sync(match_id: str, payload: typing.Optional[typing.Dict[str, t
     unregister_match_users(match_id, _payload_participants(payload))
 
 
-def fetch_match_sync(match_id: str) -> typing.Optional[typing.Dict[str, typing.Any]]:
-    with db_cursor() as c:
+def fetch_match_sync(match_id: str, *, lock=False) -> typing.Optional[typing.Dict[str, typing.Any]]:
+    with db_cursor(commit=lock) as c:
         c.execute(
             """SELECT match_id, guild_id, channel_id, message_id, mode, phase, payload
-               FROM russian_roulette_active_matches WHERE match_id=%s""",
+               FROM russian_roulette_active_matches WHERE match_id=%s""" + (" FOR UPDATE" if lock else ""),
             (str(match_id),),
         )
         row = c.fetchone()
@@ -212,7 +344,7 @@ def fetch_match_sync(match_id: str) -> typing.Optional[typing.Dict[str, typing.A
     }
 
 
-def fetch_active_matches_sync() -> typing.List[typing.Dict[str, typing.Any]]:
+def fetch_active_matches_sync(*, rebuild_cache=True) -> typing.List[typing.Dict[str, typing.Any]]:
     with db_cursor() as c:
         c.execute(
             """SELECT match_id, guild_id, channel_id, message_id, mode, phase, payload
@@ -226,7 +358,7 @@ def fetch_active_matches_sync() -> typing.List[typing.Dict[str, typing.Any]]:
             payload = payload.decode("utf-8")
         if isinstance(payload, str):
             payload = json.loads(payload)
-        if payload.get("settled"):
+        if payload.get("settled") and not payload.get(PENDING_EVENT_KEY):
             continue
         out.append(
             {
@@ -239,5 +371,6 @@ def fetch_active_matches_sync() -> typing.List[typing.Dict[str, typing.Any]]:
                 "payload": payload,
             }
         )
-    rebuild_user_cache_from_rows(out)
+    if rebuild_cache:
+        rebuild_user_cache_from_rows(out)
     return out

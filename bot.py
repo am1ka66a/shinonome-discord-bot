@@ -201,6 +201,22 @@ async def game_recovery_task():
             logger.exception("遊戲結算恢復失敗，保留紀錄等待下次重試")
         await asyncio.sleep(20)
 
+
+async def roulette_recovery_task():
+    from bot_modules import rr_match_repo
+    await bot._db_ready_event.wait()
+    while not bot.is_closed():
+        try:
+            recovery = getattr(bot, "recover_rr_matches", None)
+            if recovery is not None:
+                await recovery()
+            recovered = await asyncio.to_thread(rr_match_repo.recover_pending_events_sync)
+            if recovered:
+                logger.info("已恢復 %s 筆輪盤待結算款項", recovered)
+        except Exception:
+            logger.exception("輪盤結算恢復失敗，保留結果等待重試")
+        await asyncio.sleep(20)
+
 _relay_handlers = relay.register_relay(
     bot,
     {
@@ -243,6 +259,7 @@ _event_tasks = register_events(
 )
 
 _event_tasks["game_recovery_task"] = game_recovery_task
+_event_tasks["roulette_recovery_task"] = roulette_recovery_task
 
 register_on_ready(
     bot,

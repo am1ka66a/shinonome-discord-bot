@@ -254,9 +254,9 @@ class AsyncRegressions(unittest.IsolatedAsyncioTestCase):
         async def debit(*args, **kwargs):
             await asyncio.sleep(0.01)
             return True
-        self.ctx['try_deduct_balance_async'].side_effect = debit
-        await asyncio.gather(view.accept.callback(interaction()), view.accept.callback(interaction()))
-        self.ctx['try_deduct_balance_async'].assert_awaited_once()
+        with patch.object(match,'fund',new=AsyncMock(side_effect=debit)) as fund:
+            await asyncio.gather(view.accept.callback(interaction()), view.accept.callback(interaction()))
+            fund.assert_awaited_once()
         match.view.stop()
         view.stop()
 

@@ -93,4 +93,6 @@ def pending_settlements(connect=None):
         rows = c.fetchall()
         c.execute("SELECT COUNT(*) FROM russian_roulette_active_matches")
         roulette_count = int(c.fetchone()[0])
-        return {"total": total, "rows": rows, "roulette_count": roulette_count}
+        c.execute("SELECT COUNT(*) FROM russian_roulette_active_matches WHERE phase='settling'")
+        roulette_pending = int(c.fetchone()[0])
+        return {"total": total, "rows": rows, "roulette_count": roulette_count, "roulette_pending": roulette_pending}

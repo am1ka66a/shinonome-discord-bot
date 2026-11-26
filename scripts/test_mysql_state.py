@@ -21,7 +21,7 @@ class MySQLStateTests(unittest.TestCase):
 
     def setUp(self):
         with db.db_cursor(commit=True) as c:
-            for table in ("bot_admin_snapshots", "bot_admin_operations", "bot_settings", "bot_game_events", "bot_game_sessions", "casino_logs", "logs", "activity_stats", "blacklist", "users"):
+            for table in ("bot_admin_snapshots", "bot_admin_operations", "bot_settings", "bot_game_events", "bot_game_sessions", "russian_roulette_active_matches", "russian_roulette_settlements", "russian_roulette_stats", "casino_logs", "logs", "activity_stats", "blacklist", "users"):
                 c.execute("DELETE FROM " + table)
             c.execute("INSERT INTO users (user_id,balance) VALUES ('1',1000),('2',1000)")
         self.store = state_repo.GameStore()
@@ -85,6 +85,56 @@ class MySQLStateTests(unittest.TestCase):
             results = list(pool.map(lambda _: self.store.claim("ci:packet", 2)[0], range(2)))
         self.assertEqual(results, [100, 100])
         self.assertEqual(self.balances(), [900, 1100])
+
+    def test_concurrent_roulette_recovery_pays_saved_result_once(self):
+        import json
+        from bot_modules import rr_match_repo as rr
+        with db.db_cursor(commit=True) as c:
+            c.execute("INSERT INTO russian_roulette_active_matches (match_id,guild_id,channel_id,mode,phase,payload) VALUES ('ci:rr','1','2','duel','playing',%s)",
+                      (json.dumps(dict(participant_ids=[1,2])),))
+        args=dict(match_id='ci:rr',event_key='duel',credits={1:200},results={1:(True,100),2:(False,-100)},
+            reason='ci rr payout',payload=dict(participant_ids=[1,2],settled=True),finished=True)
+        rr.prepare_event_sync(**args)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results=list(pool.map(lambda _:rr.recover_pending_events_sync(),range(2)))
+        self.assertEqual(sum(results),1)
+        self.assertEqual(self.balances(),[1200,1000])
+        with db.db_cursor() as c:
+            c.execute("SELECT COUNT(*) FROM russian_roulette_settlements WHERE match_id='ci:rr'")
+            self.assertEqual(c.fetchone()[0],1)
+
+    def test_roulette_rematch_funds_both_players_or_neither(self):
+        from bot_modules import rr_match_repo as rr
+        args=dict(charges={1:100,2:1100},event_key='123',reason='ci stakes',match_id='ci:fund',
+            guild_id=1,channel_id=2,message_id=None,mode='duel',phase='playing',
+            payload=dict(participant_ids=[1,2],stakes={'1':100,'2':1100}))
+        self.assertFalse(rr.fund_match_sync(**args))
+        self.assertEqual(self.balances(),[1000,1000])
+        args['charges']={1:100,2:100}
+        args['payload']['stakes']={'1':100,'2':100}
+        self.assertTrue(rr.fund_match_sync(**args))
+        self.assertTrue(rr.fund_match_sync(**args))
+        self.assertEqual(self.balances(),[900,900])
+
+    def test_roulette_stake_retry_after_lost_commit_response_is_once(self):
+        import contextlib
+        from bot_modules import rr_match_repo as rr
+        args=dict(charges={1:100,2:100},event_key='123',reason='ci stakes',match_id='ci:fund',
+            guild_id=1,channel_id=2,message_id=None,mode='duel',phase='playing',
+            payload=dict(participant_ids=[1,2],stakes={'1':100,'2':100}))
+        real_cursor=rr.db_cursor
+        @contextlib.contextmanager
+        def lost_response(**kwargs):
+            with real_cursor(**kwargs) as c:
+                yield c
+            raise ConnectionError('response lost after commit')
+        with patch.object(rr,'db_cursor',lost_response),self.assertRaises(ConnectionError):
+            rr.fund_match_sync(**args)
+        self.assertTrue(rr.fund_match_sync(**args))
+        self.assertEqual(self.balances(),[900,900])
+        with db.db_cursor() as c:
+            c.execute('SELECT COUNT(*) FROM logs')
+            self.assertEqual(c.fetchone()[0],2)
 
     def test_payout_response_lost_then_retry_does_not_duplicate_experience(self):
         import contextlib
