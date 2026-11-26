@@ -70,7 +70,7 @@ async def resolve_slash_target(
         return member, None
     uid = parse_discord_user_id(user_id)
     if uid is None:
-        if not required:
+        if not required and not str(user_id or "").strip():
             return None, None
         return None, "請選擇成員，或在「使用者 ID」填寫 17～19 位數字（亦可貼 `<@...>` 提及）。"
     guild = interaction.guild

@@ -93,29 +93,30 @@ def register_wanted_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         member: typing.Optional[discord.Member] = None,
         user_id: typing.Optional[str] = None,
     ):
+        await interaction_defer_if_needed(interaction)
         if not FEATURE_TOGGLES.get("rob", True):
-            return await interaction.response.send_message("⛔ `/rob` 目前暫時關閉中。", ephemeral=True)
+            return await interaction_send(interaction, "⛔ `/rob` 目前暫時關閉中。", ephemeral=True)
         m_user, err = await resolve_slash_target(
             interaction, member, user_id, required=True, in_guild_only=True
         )
         if err:
-            return await interaction.response.send_message(err, ephemeral=True)
+            return await interaction_send(interaction, err, ephemeral=True)
         if not isinstance(m_user, discord.Member):
-            return await interaction.response.send_message("搶劫目標必須是此伺服器成員。", ephemeral=True)
+            return await interaction_send(interaction, "搶劫目標必須是此伺服器成員。", ephemeral=True)
         member = m_user
         if member.bot:
-            return await interaction.response.send_message("不能搶劫機器人。", ephemeral=True)
+            return await interaction_send(interaction, "不能搶劫機器人。", ephemeral=True)
         if member.id == interaction.user.id:
-            return await interaction.response.send_message("你不能搶劫自己。", ephemeral=True)
+            return await interaction_send(interaction, "你不能搶劫自己。", ephemeral=True)
 
         await ensure_user_exists_async(interaction.user.id, 50000)
         await ensure_user_exists_async(member.id, 0)
 
         ctx = await load_rob_context_async(interaction.user.id, member.id)
         if ctx["in_prison"]:
-            return await interaction.response.send_message("🔒 你在監獄裡無法搶劫。", ephemeral=True)
+            return await interaction_send(interaction, "🔒 你在監獄裡無法搶劫。", ephemeral=True)
         if ctx["robber_role"] != "criminal":
-            return await interaction.response.send_message(
+            return await interaction_send(interaction,
                 "❌ 只有**搶匪**可以搶劫。請先用 `/role_choose` 選擇搶匪（criminal）。",
                 ephemeral=True,
             )
@@ -131,26 +132,25 @@ def register_wanted_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         if last_rob and (now - last_rob).total_seconds() < ROB_COOLDOWN_SECONDS:
             remain = ROB_COOLDOWN_SECONDS - int((now - last_rob).total_seconds())
             mins = max(1, remain // 60)
-            return await interaction.response.send_message(f"⏳ 你剛搶過，請再等 `{mins}` 分鐘。", ephemeral=True)
+            return await interaction_send(interaction, f"⏳ 你剛搶過，請再等 `{mins}` 分鐘。", ephemeral=True)
 
         if target_balance < 50000:
-            return await interaction.response.send_message("對方太窮了，沒有東西可以搶。", ephemeral=True)
+            return await interaction_send(interaction, "對方太窮了，沒有東西可以搶。", ephemeral=True)
         if robber_balance < 50000:
-            return await interaction.response.send_message("你的餘額低於 50,000，無法發起搶劫。", ephemeral=True)
+            return await interaction_send(interaction, "你的餘額低於 50,000，無法發起搶劫。", ephemeral=True)
         if target_good_cert:
-            return await interaction.response.send_message(
+            return await interaction_send(interaction,
                 "🪪 對方已啟用良民證，無法被搶劫。",
                 ephemeral=True,
             )
         if target_last_robbed and (now - target_last_robbed).total_seconds() < ROB_VICTIM_PROTECT_SECONDS:
             remain = ROB_VICTIM_PROTECT_SECONDS - int((now - target_last_robbed).total_seconds())
             mins = max(1, remain // 60)
-            return await interaction.response.send_message(
+            return await interaction_send(interaction,
                 f"對方目前有保護，請 `{mins}` 分鐘後再試。",
                 ephemeral=True,
             )
 
-        await interaction_defer_if_needed(interaction)
 
         # /rob 基礎成功率 ROB_BASE_SUCCESS_RATE；每差 1 等調整 1%
         level_gap = robber_level - target_level
@@ -174,8 +174,6 @@ def register_wanted_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             steal_amount = int(success_result["steal_amount"])
             wanted_info = success_result["wanted_info"]
             counter_note = success_result.get("counter_note", "")
-            await db_to_thread(log_transaction, interaction.user.id, steal_amount, f"搶劫成功（目標:{member.id}）")
-            await db_to_thread(log_transaction, member.id, -steal_amount, f"被搶劫（搶匪:{interaction.user.id}）")
             return await interaction_send(
                 interaction,
                 f"{robber_name}搶了{victim_name}`{steal_amount:,}`東雲幣!!（本次成功率約 {success_rate_pct}%）{wanted_info}{counter_note}"
@@ -185,8 +183,6 @@ def register_wanted_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         fail_penalty = int(fail_result["fail_penalty"])
         deducted = bool(fail_result["deducted"])
         if deducted:
-            await db_to_thread(log_transaction, interaction.user.id, -fail_penalty, f"搶劫失敗反噬（目標:{member.id}）")
-            await db_to_thread(log_transaction, member.id, fail_penalty, f"反制搶劫獲賠（搶匪:{interaction.user.id}）")
             return await interaction_send(
                 interaction,
                 f"{robber_name}失手了! 反而被{victim_name}搶了`{fail_penalty:,}`東雲幣!（本次成功率約 {success_rate_pct}%）"
@@ -303,12 +299,12 @@ def register_wanted_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         member: typing.Optional[discord.Member] = None,
         user_id: typing.Optional[str] = None,
     ):
+        await interaction_defer_if_needed(interaction)
         criminal_user, err = await resolve_slash_target(
             interaction, member, user_id, required=True, in_guild_only=False
         )
         if err:
-            return await interaction.response.send_message(err, ephemeral=True)
-        await interaction_defer_if_needed(interaction)
+            return await interaction_send(interaction, err, ephemeral=True)
 
         await ensure_user_exists_async(interaction.user.id, 50000)
         await ensure_user_exists_async(criminal_user.id, 0)
@@ -686,35 +682,36 @@ def register_wanted_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         member: typing.Optional[discord.Member] = None,
         user_id: typing.Optional[str] = None,
     ):
+        await interaction_defer_if_needed(interaction)
         target_user, err = await resolve_slash_target(
             interaction, member, user_id, required=True, in_guild_only=False
         )
         if err:
-            return await interaction.response.send_message(err, ephemeral=True)
+            return await interaction_send(interaction, err, ephemeral=True)
         if target_user.id == interaction.user.id:
-            return await interaction.response.send_message("❌ 不能對自己使用。", ephemeral=True)
+            return await interaction_send(interaction, "❌ 不能對自己使用。", ephemeral=True)
         now = now_tw_naive()
         result = await break_citizen_sync_async(interaction.user.id, target_user.id, now)
         if not result.get("ok"):
             reason = result.get("reason")
             if reason == "insufficient":
                 attacker_bal = int(result.get("balance") or 0)
-                return await interaction.response.send_message(
+                return await interaction_send(interaction,
                     f"❌ 需要 `{GOOD_CITIZEN_DESTROY_COST:,}` 東雲幣，你的餘額不足（目前 `{attacker_bal:,}`）。",
                     ephemeral=True,
                 )
             if reason == "target_not_found":
-                return await interaction.response.send_message("找不到目標資料。", ephemeral=True)
+                return await interaction_send(interaction, "找不到目標資料。", ephemeral=True)
             if reason == "target_not_active":
                 target_broken_until = result.get("target_broken_until")
                 if target_broken_until and now < target_broken_until:
                     ts = tw_naive_to_discord_ts(target_broken_until)
-                    return await interaction.response.send_message(
+                    return await interaction_send(interaction,
                         f"ℹ️ 目標目前未啟用良民證，且已被封鎖至 <t:{ts}:F>（<t:{ts}:R>）。",
                         ephemeral=True,
                     )
-                return await interaction.response.send_message("ℹ️ 目標目前沒有啟用良民證。", ephemeral=True)
-            return await interaction.response.send_message("扣款失敗（餘額不足）。", ephemeral=True)
+                return await interaction_send(interaction, "ℹ️ 目標目前沒有啟用良民證。", ephemeral=True)
+            return await interaction_send(interaction, "扣款失敗（餘額不足）。", ephemeral=True)
         _invalidate_wanted_caches(target_user.id)
         broken_until = result["broken_until"]
         ts = tw_naive_to_discord_ts(broken_until)
@@ -732,7 +729,7 @@ def register_wanted_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             inline=False,
         )
         _am = discord.AllowedMentions(users=[discord.Object(id=interaction.user.id), discord.Object(id=target_user.id)])
-        await interaction.response.send_message(embed=emb, ephemeral=False, allowed_mentions=_am)
+        await interaction_send(interaction, embed=emb, ephemeral=False, allowed_mentions=_am)
 
 
     @bot.tree.command(name="wanted_status", description="查看自己的陣營、通緝、監獄狀態與最近搶劫紀錄")

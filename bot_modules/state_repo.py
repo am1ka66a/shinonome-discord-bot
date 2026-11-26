@@ -102,12 +102,16 @@ class GameStore:
             c.execute("UPDATE bot_game_sessions SET payload=%s,expires_at=%s WHERE session_id=%s",
                       (json.dumps(payload), int(time.time()) + seconds, sid))
 
-    def prepare(self, sid, credits, results=None, reason="遊戲結算", refund=False):
+    def prepare(self, sid, credits, results=None, reason="遊戲結算", refund=False, experience=None):
         with db_cursor(commit=True) as c:
             phase, escrow, _, intent, _ = self._read(c, sid)
             if phase == "active":
                 intent = {"credits": escrow if refund else {str(k): int(v) for k, v in credits.items()},
-                          "results": results or {}, "reason": reason}
+                          "results": {str(k): v for k, v in (results or {}).items()}, "reason": reason}
+                if experience and not refund:
+                    intent["experience"] = {str(k): int(v) for k, v in experience.items()}
+                    if any(v < 0 for v in intent["experience"].values()):
+                        raise ValueError("經驗值不得為負")
                 if any(v < 0 for v in intent["credits"].values()):
                     raise ValueError("入帳金額不得為負")
                 c.execute("UPDATE bot_game_sessions SET phase='settling',settlement=%s WHERE session_id=%s", (json.dumps(intent), sid))
@@ -119,7 +123,8 @@ class GameStore:
                 return intent
             if phase != "settling" or intent is None:
                 raise ValueError("結算尚未準備完成")
-            ids = sorted(set(intent["credits"]) | set(intent["results"]))
+            ids = sorted(set(intent["credits"]) | set(intent["results"]) | set(intent.get("experience", {})))
+            awarded_experience = {}
             # Claimants/share accounts may not have played before. Create them
             # before deterministic row locking, in the same order for every payer.
             for uid in ids:
@@ -142,11 +147,24 @@ class GameStore:
                     win, profit, push = result
                     c.execute("UPDATE users SET total_profit=total_profit+%s,total_games=total_games+%s,wins=wins+%s WHERE user_id=%s",
                               (profit, int(not push), int(win and not push), uid))
-            c.execute("UPDATE bot_game_sessions SET phase='settled',escrow='{}' WHERE session_id=%s", (sid,))
+                gain = int(intent.get("experience", {}).get(uid, 0))
+                if gain > 0 and result:
+                    # Include EXP in the same once-only payout. A crash must not
+                    # lose it, and replaying a committed payout must not add it twice.
+                    c.execute("SELECT 1 FROM blacklist WHERE user_id=%s", (uid,))
+                    if c.fetchone() is None:
+                        from bot_modules.config import MAX_LEVEL
+                        from bot_modules.game_repo import add_user_exp_in_tx, calc_level_from_exp
+                        add_user_exp_in_tx(c, lambda exp: calc_level_from_exp(MAX_LEVEL, exp), uid, gain)
+                        awarded_experience[uid] = gain
+            if "experience" in intent:
+                intent["experience"] = awarded_experience
+            c.execute("UPDATE bot_game_sessions SET phase='settled',escrow='{}',settlement=%s WHERE session_id=%s",
+                      (json.dumps(intent), sid))
             return intent
 
-    async def finish(self, sid, credits, results=None, reason="遊戲結算", refund=False):
-        await self.call("prepare", sid, credits, results, reason, refund)
+    async def finish(self, sid, credits, results=None, reason="遊戲結算", refund=False, experience=None):
+        await self.call("prepare", sid, credits, results, reason, refund, experience)
         return await self.call("apply", sid)
 
     def claim(self, sid, uid):

@@ -21,6 +21,8 @@ class StateTests(unittest.TestCase):
             CREATE TABLE bot_message_audit (request_id TEXT PRIMARY KEY,actor_id TEXT,channel_id TEXT,
                 reply_id TEXT,message_id TEXT,status TEXT);
             INSERT INTO users (user_id,balance) VALUES ('1',1000),('2',1000);
+            ALTER TABLE users ADD COLUMN exp INTEGER DEFAULT 0;
+            CREATE TABLE blacklist (user_id TEXT PRIMARY KEY);
         """)
         # The adapter preserves production commit/rollback behavior.
         self.conn.fetchall = lambda: self.conn.cur.fetchall()
@@ -73,6 +75,48 @@ class StateTests(unittest.TestCase):
         state_repo.GameStore().recover(startup=True)
         self.assertEqual(self.balance(), 1100)
         self.assertEqual(self.phase(), "settled")
+
+    def test_money_and_experience_commit_once_even_after_restart(self):
+        from bot_modules.game_repo import exp_required_for_level
+        gain = exp_required_for_level(100, 3)
+        self.store.debit('bj:exp', 'bj', 1, 100, 'open')
+        self.store.prepare('bj:exp', {1:200}, {1:(True,100,False)}, experience={1:gain})
+        restarted = state_repo.GameStore()
+        self.assertTrue(restarted.recover_one('bj:exp', startup=True))
+        receipt = restarted.apply('bj:exp')
+        self.assertEqual(receipt['experience'], {'1':gain})
+        self.assertEqual(self.conn.db.execute("SELECT balance,exp,level FROM users WHERE user_id='1'").fetchone(),
+                         (1100,gain,3))
+
+    def test_experience_failure_rolls_back_money_and_can_retry(self):
+        self.store.debit('bj:exp', 'bj', 1, 100, 'open')
+        self.store.prepare('bj:exp', {1:200}, {1:(True,100,False)}, experience={1:50})
+        from bot_modules import game_repo
+        with patch.object(game_repo,'calc_level_from_exp',side_effect=RuntimeError('injected EXP failure')):
+            with self.assertRaises(RuntimeError):
+                self.store.apply('bj:exp')
+        self.assertEqual(self.balance(), 900)
+        self.assertEqual(self.conn.db.execute("SELECT exp FROM users WHERE user_id='1'").fetchone()[0], 0)
+        self.store.apply('bj:exp')
+        self.store.apply('bj:exp')
+        self.assertEqual(self.balance(), 1100)
+        self.assertEqual(self.conn.db.execute("SELECT exp FROM users WHERE user_id='1'").fetchone()[0], 50)
+
+    def test_ban_before_payout_keeps_money_but_blocks_experience(self):
+        self.store.debit('bj:exp', 'bj', 1, 100, 'open')
+        self.store.prepare('bj:exp', {1:200}, {1:(True,100,False)}, experience={1:50})
+        self.conn.db.execute("INSERT INTO blacklist VALUES ('1')")
+        self.conn.commit()
+        receipt = self.store.apply('bj:exp')
+        self.assertEqual((self.balance(), receipt['experience']), (1100,{}))
+        self.assertEqual(self.conn.db.execute("SELECT exp FROM users WHERE user_id='1'").fetchone()[0], 0)
+
+    def test_refund_does_not_award_experience(self):
+        self.store.debit('bj:exp', 'bj', 1, 100, 'open')
+        self.store.prepare('bj:exp', {}, refund=True, experience={1:100})
+        self.store.apply('bj:exp')
+        self.assertEqual(self.balance(), 1000)
+        self.assertEqual(self.conn.db.execute("SELECT exp FROM users WHERE user_id='1'").fetchone()[0], 0)
 
     def test_player_and_share_same_account_keep_separate_logs(self):
         self.store.debit("bj:1", "bj", 1, 100, "open")

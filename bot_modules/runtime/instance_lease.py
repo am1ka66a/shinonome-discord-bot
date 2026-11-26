@@ -2,6 +2,8 @@
 import asyncio
 import hashlib
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pymysql
 
@@ -22,6 +24,16 @@ class InstanceLease:
         self.name = None
         self.owner = None
         self.lock = threading.Lock()
+        self.executor = None
+        self.last_verified_at = None
+
+    async def call(self, method):
+        # Pool exhaustion in ordinary DB jobs must not starve the heartbeat.
+        if method == "close" and self.executor is None and self.connection is None:
+            return
+        if self.executor is None:
+            self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="instance-lease")
+        return await asyncio.get_running_loop().run_in_executor(self.executor, getattr(self, method))
 
     def acquire(self):
         with self.lock:
@@ -44,6 +56,7 @@ class InstanceLease:
                 c.execute("SELECT CONNECTION_ID()")
                 self.owner = int(c.fetchone()[0])
                 self.connection = conn
+                self.last_verified_at = time.monotonic()
             except BaseException:
                 conn.close()
                 raise
@@ -54,7 +67,7 @@ class InstanceLease:
             raise ValueError("執行鎖重試間隔不正確")
         delay, failures = initial_delay, 0
         while True:
-            attempt = asyncio.create_task(asyncio.to_thread(self.acquire))
+            attempt = asyncio.create_task(self.call("acquire"))
             try:
                 # A cancelled to_thread worker can still acquire a lock. Wait for
                 # completion and close it before propagating shutdown cancellation.
@@ -64,7 +77,7 @@ class InstanceLease:
                     await attempt
                 except Exception:
                     pass
-                await asyncio.to_thread(self.close)
+                await self.call("close")
                 raise
             except Exception as error:
                 if not isinstance(error, LeaseBusyError) and not is_transient_db_error(error):
@@ -91,10 +104,17 @@ class InstanceLease:
             c.execute("SELECT IS_USED_LOCK(%s)", (self.name,))
             if c.fetchone()[0] != self.owner:
                 raise RuntimeError("機器人執行權已遺失")
+            self.last_verified_at = time.monotonic()
 
     def close(self):
-        with self.lock:
-            if self.connection is not None:
-                conn, self.connection = self.connection, None
-                self.owner = None
-                conn.close()  # MySQL releases this session's named lock.
+        try:
+            with self.lock:
+                self.last_verified_at = None
+                if self.connection is not None:
+                    conn, self.connection = self.connection, None
+                    self.owner = None
+                    conn.close()  # MySQL releases this session's named lock.
+        finally:
+            executor, self.executor = self.executor, None
+            if executor is not None:
+                executor.shutdown(wait=False, cancel_futures=True)

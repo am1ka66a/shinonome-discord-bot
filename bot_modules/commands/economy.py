@@ -61,7 +61,9 @@ def register_economy_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         def winners_text(self):
             if not self.claim_results:
                 return "尚未有人搶到紅包。"
-            lines = [f"{i+1}. <@{uid}>：`{amt}`" for i, (uid, amt) in enumerate(self.claim_results)]
+            lines = [f"{i+1}. <@{uid}>：`{amt}`" for i, (uid, amt) in enumerate(self.claim_results[:20])]
+            if len(self.claim_results) > 20:
+                lines.append(f"另有 {len(self.claim_results)-20} 位領取者；個人入帳可用 /record 查詢。")
             return "🎉 搶到紅包名單：\n" + "\n".join(lines)
 
         @discord.ui.button(label="搶紅包", style=discord.ButtonStyle.success)
@@ -239,12 +241,12 @@ def register_economy_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         member: typing.Optional[discord.Member] = None,
         user_id: typing.Optional[str] = None,
     ):
+        await interaction_defer_if_needed(interaction)
         resolved, err = await resolve_slash_target(
             interaction, member, user_id, required=False, in_guild_only=False
         )
         if err:
             return await interaction_send(interaction, err, ephemeral=True)
-        await interaction_defer_if_needed(interaction)
         target: typing.Union[discord.Member, discord.User] = resolved or interaction.user
         if target.id == interaction.user.id:
             await ensure_user_exists_async(target.id, 50000)
@@ -270,12 +272,12 @@ def register_economy_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         member: typing.Optional[discord.Member] = None,
         user_id: typing.Optional[str] = None,
     ):
+        await interaction_defer_if_needed(interaction)
         resolved, err = await resolve_slash_target(
             interaction, member, user_id, required=False, in_guild_only=False
         )
         if err:
             return await interaction_send(interaction, err, ephemeral=True)
-        await interaction_defer_if_needed(interaction)
         target: typing.Union[discord.Member, discord.User] = resolved or interaction.user
         if target.id == interaction.user.id:
             await ensure_user_exists_async(target.id, 50000)
@@ -427,12 +429,12 @@ def register_economy_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         user_id: typing.Optional[str] = None,
         page: int = 1,
     ):
+        await interaction_defer_if_needed(interaction, ephemeral=True)
         resolved, err = await resolve_slash_target(
             interaction, member, user_id, required=False, in_guild_only=False
         )
         if err:
             return await interaction_send(interaction, err, ephemeral=True)
-        await interaction_defer_if_needed(interaction, ephemeral=True)
         target: typing.Union[discord.Member, discord.User] = resolved or interaction.user
         rows = await fetch_record_rows_async(target.id, 50)
         if not rows:

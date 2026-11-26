@@ -21,7 +21,7 @@ class MySQLStateTests(unittest.TestCase):
 
     def setUp(self):
         with db.db_cursor(commit=True) as c:
-            for table in ("bot_admin_snapshots", "bot_admin_operations", "bot_settings", "bot_game_events", "bot_game_sessions", "casino_logs", "logs", "users"):
+            for table in ("bot_admin_snapshots", "bot_admin_operations", "bot_settings", "bot_game_events", "bot_game_sessions", "casino_logs", "logs", "activity_stats", "blacklist", "users"):
                 c.execute("DELETE FROM " + table)
             c.execute("INSERT INTO users (user_id,balance) VALUES ('1',1000),('2',1000)")
         self.store = state_repo.GameStore()
@@ -70,6 +70,40 @@ class MySQLStateTests(unittest.TestCase):
             results = list(pool.map(lambda _: self.store.claim("ci:packet", 2)[0], range(2)))
         self.assertEqual(results, [100, 100])
         self.assertEqual(self.balances(), [900, 1100])
+
+    def test_payout_response_lost_then_retry_does_not_duplicate_experience(self):
+        import contextlib
+        self.store.debit('ci:exp','bj',1,100,'open')
+        self.store.prepare('ci:exp',{1:200},{1:(True,100,False)},experience={1:200})
+        real_cursor=state_repo.db_cursor
+        @contextlib.contextmanager
+        def lost_response(**kwargs):
+            with real_cursor(**kwargs) as c:
+                yield c
+            raise ConnectionError('lost response after successful commit')
+        with patch.object(state_repo,'db_cursor',lost_response),self.assertRaises(ConnectionError):
+            self.store.apply('ci:exp')
+        receipt=self.store.apply('ci:exp')
+        self.assertEqual(receipt['experience'],{'1':200})
+        with db.db_cursor() as c:
+            c.execute("SELECT balance,exp FROM users WHERE user_id='1'")
+            self.assertEqual(c.fetchone(),(1100,200))
+
+    def test_concurrent_chat_messages_share_persisted_exp_cooldown(self):
+        import datetime
+        from unittest.mock import Mock
+        from bot_modules import activity_repo
+        from bot_modules.tx_ops import log_transaction_in_tx
+        now=datetime.datetime(2026,11,26,12)
+        def award(_):
+            return activity_repo.process_on_message_activity_sync(db.get_db_connection,log_transaction_in_tx,
+                lambda *a:None,Mock(side_effect=AssertionError('nested EXP connection')),'1',1,now,True,50)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results=list(pool.map(award,range(2)))
+        self.assertEqual(sum(r['exp_awarded'] for r in results),1)
+        with db.db_cursor() as c:
+            c.execute("SELECT balance,exp FROM users WHERE user_id='1'")
+            self.assertEqual(c.fetchone(),(1000,50))
 
     def test_payout_failure_rolls_back_then_retries(self):
         self.store.debit("ci:duel", "duel", 1, 100, "a")

@@ -180,6 +180,7 @@ def apply_rob_fail_db(
         robber_id,
         target_id,
         now,
+        log_transaction_in_tx=log_transaction_in_tx,
     )
 
 

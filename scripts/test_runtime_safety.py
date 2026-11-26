@@ -56,6 +56,29 @@ class LeaseTests(unittest.TestCase):
 
 
 class LeaseStartupRetryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_heartbeat_works_while_default_worker_pool_is_saturated(self):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        loop = asyncio.get_running_loop()
+        pool = ThreadPoolExecutor(max_workers=1)
+        loop.set_default_executor(pool)
+        release = threading.Event()
+        blocked = loop.run_in_executor(None, release.wait)
+        conn = Mock()
+        conn.cursor.return_value.fetchone.side_effect = [(1,), (42,), (42,)]
+        lease = InstanceLease(connect=Mock(return_value=conn))
+        try:
+            await asyncio.wait_for(lease.call('acquire'), timeout=3)
+            await asyncio.wait_for(lease.call('verify'), timeout=3)
+            self.assertIsNotNone(lease.last_verified_at)
+            conn.ping.assert_called_once_with(reconnect=False)
+            await asyncio.wait_for(lease.call('close'), timeout=3)
+            self.assertIsNone(lease.executor)
+        finally:
+            release.set()
+            await blocked
+            lease.close()
+
     async def test_database_outage_then_busy_lock_recovers_using_fresh_connections(self):
         import pymysql
         busy, healthy = Mock(), Mock()
@@ -76,6 +99,7 @@ class LeaseStartupRetryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_long_lock_wait_exceeds_platform_retry_budget_without_crashing(self):
         lease, logger = InstanceLease(), Mock()
+        self.addCleanup(lease.close)
         with patch.object(lease, 'acquire', side_effect=[LeaseBusyError('busy')]*15+[None]) as acquire, \
                 patch('bot_modules.runtime.instance_lease.asyncio.sleep', new=AsyncMock()) as sleep:
             await lease.acquire_with_retry(logger)
@@ -88,6 +112,7 @@ class LeaseStartupRetryTests(unittest.IsolatedAsyncioTestCase):
         for error in (pymysql.OperationalError(1045, 'access denied'), RuntimeError('unknown lock result')):
             with self.subTest(error=type(error).__name__):
                 lease = InstanceLease()
+                self.addCleanup(lease.close)
                 with patch.object(lease, 'acquire', side_effect=error) as acquire, \
                         patch('bot_modules.runtime.instance_lease.asyncio.sleep', new=AsyncMock()) as sleep:
                     with self.assertRaises(type(error)):
@@ -148,6 +173,7 @@ class LeaseLifecycleTests(unittest.IsolatedAsyncioTestCase):
         bot._db_ready_event.set()
         failure = pymysql.OperationalError(2013, 'timed out')
         bot.instance_lease = Mock(verify=Mock(side_effect=failure))
+        bot.instance_lease.call = AsyncMock(side_effect=lambda method: getattr(bot.instance_lease, method)())
         self.addAsyncCleanup(bot.close)
 
         async def connected(client, token, *, reconnect):
@@ -165,6 +191,7 @@ class LeaseLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_lease_is_released_even_when_discord_cleanup_fails(self):
         bot = offline_bot()
         bot.instance_lease = Mock()
+        bot.instance_lease.call = AsyncMock(side_effect=lambda method: getattr(bot.instance_lease, method)())
         with patch.object(commands.Bot, 'close', new=AsyncMock(side_effect=RuntimeError('cleanup failed'))):
             with self.assertRaisesRegex(RuntimeError, 'cleanup failed'):
                 await bot.close()
@@ -191,6 +218,7 @@ class LeaseProcessExitTests(unittest.TestCase):
                     return
                 error = pymysql.OperationalError(2013, 'timed out') if mode == 'timeout' else RuntimeError('lock owned elsewhere')
                 client.instance_lease = Mock(verify=Mock(side_effect=error))
+                client.instance_lease.call = AsyncMock(side_effect=lambda method: getattr(client.instance_lease, method)())
                 client._db_ready_event = asyncio.Event()
                 client._db_ready_event.set()
                 with patch('bot_modules.bot_core.asyncio.sleep', new=AsyncMock()):

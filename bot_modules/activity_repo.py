@@ -2,6 +2,7 @@ import datetime
 import typing
 
 from bot_modules.db import db_cursor
+from bot_modules import config, game_repo
 
 # 各函式保留 get_db_connection 參數以維持既有呼叫端簽名，連線改由 db_cursor 管理。
 
@@ -68,24 +69,26 @@ def process_on_message_activity_sync(
     old_level = None
     new_level = None
     msg_rewarded = False
-    # 這兩個呼叫各自會取得連線；若在本函式持有連線時才呼叫，併發訊息會每人佔住兩條，
-    # 連線池（上限 16）可能被佔滿而互相等待，所以先在無連線狀態下處理完 EXP。
+    # Account initialization has its own connection; EXP and its cooldown are
+    # committed below on a single connection so a failure cannot award twice.
     if exp_due:
         ensure_user_exists(user_id, 50000)
-        exp_result = add_user_exp(user_id, exp_gain)
-        if exp_result:
-            old_level, new_level = int(exp_result[0] or 1), int(exp_result[1] or 1)
-        exp_awarded = True
     with db_cursor(commit=True, connect=get_db_connection) as c:
         c.execute(
             "INSERT INTO activity_stats (user_id, msg_count) VALUES (%s, %s) ON DUPLICATE KEY UPDATE msg_count=msg_count+%s",
             (user_id, pending_count, pending_count),
         )
-        c.execute("SELECT msg_count, last_msg_reward FROM activity_stats WHERE user_id=%s", (user_id,))
+        c.execute("SELECT msg_count, last_msg_reward, last_exp_reward FROM activity_stats WHERE user_id=%s FOR UPDATE", (user_id,))
         row = c.fetchone()
-
-        if exp_due:
-            c.execute("UPDATE activity_stats SET last_exp_reward=%s WHERE user_id=%s", (now, user_id))
+        last_exp_reward = row[2] if row else None
+        if exp_due and (last_exp_reward is None or (now-last_exp_reward).total_seconds() >= config.EXP_COOLDOWN_SECONDS):
+            exp_result = game_repo.add_user_exp_in_tx(c,
+                lambda exp: game_repo.calc_level_from_exp(config.MAX_LEVEL, exp), user_id, exp_gain)
+            if exp_result:
+                old_level, new_level = exp_result[:2]
+                exp_awarded = True
+                last_exp_reward = now
+                c.execute("UPDATE activity_stats SET last_exp_reward=%s WHERE user_id=%s", (now, user_id))
 
         if row and int(row[0] or 0) >= 10:
             if row[1] is None or (now - row[1]).total_seconds() >= 1800:
@@ -104,4 +107,5 @@ def process_on_message_activity_sync(
         "old_level": old_level,
         "new_level": new_level,
         "msg_rewarded": msg_rewarded,
+        "last_exp_reward": last_exp_reward,
     }

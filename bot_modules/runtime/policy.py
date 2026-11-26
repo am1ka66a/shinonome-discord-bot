@@ -12,6 +12,7 @@ READ_COMMANDS = {
     "casino_stats", "share_stats", "wanted_status", "wanted_list", "good_citizen_list",
     "profile", "cooldowns", "compare", "rank",
     "admin_audit account", "admin_audit resets", "admin_audit pending",
+    "admin_audit health",
 }
 
 
@@ -39,7 +40,8 @@ def install_policy(bot, host_ids, logger):
         if getattr(interaction, "type", None) is discord.InteractionType.autocomplete:
             return await previous(interaction)
         ready = getattr(bot, "_db_ready_event", None)
-        if ready is not None and not ready.is_set():
+        name = getattr(interaction.command, "qualified_name", "")
+        if ready is not None and not ready.is_set() and name != "admin_audit health":
             await interaction_send(interaction, "機器人正在初始化，請稍後再試。", ephemeral=True)
             return False
         command = interaction.command

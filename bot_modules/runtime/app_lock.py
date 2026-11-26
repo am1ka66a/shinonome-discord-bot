@@ -5,6 +5,7 @@ import typing
 
 import discord
 from discord import app_commands
+from bot_modules.discord_helpers import interaction_send
 
 DEFAULT_READ_ONLY_APP_COMMANDS: typing.Set[str] = {
     "help",
@@ -23,6 +24,7 @@ DEFAULT_READ_ONLY_APP_COMMANDS: typing.Set[str] = {
     "admin_logs",
     "dev_list_guilds",
     "admin_audit account", "admin_audit resets", "admin_audit pending",
+    "admin_audit health",
     "profile", "cooldowns", "rank", "compare", "lottery status",
     "russian_roulette stats me", "russian_roulette stats wins", "russian_roulette stats rate",
 }
@@ -90,7 +92,17 @@ def register_app_command_lock(
 
     async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
         await release_lock(interaction)
-        logger.exception("app command 錯誤: %s", error)
+        logger.error("app command 錯誤 interaction=%s: %s", interaction.id, error,
+                     exc_info=(type(error), error, error.__traceback__))
         await previous_on_error(interaction, error)
+        command = getattr(interaction, "command", None)
+        has_handler = getattr(command, "_has_any_error_handlers", None)
+        if callable(has_handler) and has_handler():
+            return
+        try:
+            await interaction_send(interaction,
+                f"處理未能完成，請先查詢結果再重試。參考編號：`{interaction.id}`", ephemeral=True)
+        except discord.HTTPException:
+            logger.warning("無法送出指令錯誤通知 interaction=%s", interaction.id)
 
     bot.tree.on_error = on_app_command_error

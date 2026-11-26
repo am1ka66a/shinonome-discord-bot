@@ -915,6 +915,7 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
         member: typing.Optional[discord.Member] = None,
         user_id: typing.Optional[str] = None,
     ):
+        await interaction_defer_if_needed(interaction)
         target_user, err = await resolve_slash_target(
             interaction, member, user_id, required=False, in_guild_only=False
         )
@@ -922,7 +923,6 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
             return await interaction_send(interaction, err, ephemeral=True)
         target = target_user or interaction.user
         await ensure_user_exists_async(target.id, 50000)
-        await interaction_defer_if_needed(interaction)
         emb = await _render_personal_stats(target)
         await interaction_send(interaction, embed=emb)
 

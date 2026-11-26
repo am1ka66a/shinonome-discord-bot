@@ -125,6 +125,8 @@ def apply_rob_success_db(
             return {"ok": False, "reason": "target_hidden"}
 
         c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (steal_amount, str(robber_id)))
+        log_transaction_in_tx(c, robber_id, steal_amount, f"搶劫成功（目標:{target_id}）")
+        log_transaction_in_tx(c, target_id, -steal_amount, f"被搶劫（搶匪:{robber_id}）")
         c.execute("UPDATE users SET last_robbed=%s WHERE user_id=%s", (now, str(target_id)))
         append_rob_history_on_cursor(c, robber_id, steal_amount, now_tw_naive_func)
 
@@ -252,7 +254,10 @@ def apply_rob_fail_db(
     robber_id: int,
     target_id: int,
     now,
+    log_transaction_in_tx=None,
 ) -> typing.Dict[str, typing.Any]:
+    if log_transaction_in_tx is None:
+        from bot_modules.tx_ops import log_transaction_in_tx
     with db_cursor(commit=True, connect=get_db_connection) as c:
         lock_user_rows(c, [robber_id, target_id])
         c.execute("SELECT COALESCE(balance,0) FROM users WHERE user_id=%s FOR UPDATE", (str(robber_id),))
@@ -269,4 +274,6 @@ def apply_rob_fail_db(
             deducted = c.rowcount > 0
             if deducted:
                 c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (fail_penalty, str(target_id)))
+                log_transaction_in_tx(c, robber_id, -fail_penalty, f"搶劫失敗反噬（目標:{target_id}）")
+                log_transaction_in_tx(c, target_id, fail_penalty, f"反制搶劫獲賠（搶匪:{robber_id}）")
     return {"fail_penalty": fail_penalty, "deducted": deducted}

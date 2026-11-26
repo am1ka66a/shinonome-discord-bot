@@ -1,6 +1,8 @@
 """Private audit UI for the host allowlist. All callbacks only read data."""
 import asyncio
 import json
+import math
+import time
 import typing
 
 import discord
@@ -199,5 +201,29 @@ def register_admin_audit_commands(bot, ctx):
         await send_panel(interaction, f"待處理結算：{data['total']} 筆",
             lines or ["目前沒有待結算或逾時款項。"],
             f"輪盤對局 {data['roulette_count']} 場（可能正常進行中）｜最多 100 筆｜不會觸發付款")
+
+    @group.command(name="health", description="查看連線延遲、執行權檢查與背景任務")
+    async def health(interaction: discord.Interaction):
+        if not await authorize(interaction):
+            return
+        now = time.monotonic()
+        seconds = max(0, int(now - getattr(bot, "runtime_started_at", now)))
+        latency = bot.latency
+        latency_text = f"{latency*1000:.0f} ms" if math.isfinite(latency) else "尚未取得"
+        ready = getattr(bot, "_db_ready_event", None)
+        initialized = ready is not None and ready.is_set()
+        verified = getattr(getattr(bot, "instance_lease", None), "last_verified_at", None)
+        lease_text = f"最近確認：{max(0,int(now-verified))} 秒前" if verified is not None else "尚未建立或已釋放"
+        embed = discord.Embed(title="機器人健康狀態", color=0x5865F2)
+        embed.description = (f"運行時間：{seconds//3600} 小時 {(seconds//60)%60} 分 {seconds%60} 秒\n"
+                             f"Discord 延遲：{latency_text}\n資料庫初始化：{'完成' if initialized else '尚未完成'}\n"
+                             f"執行權：{lease_text}")
+        states = {"starting":"啟動中", "running":"運行中", "waiting":"等待恢復", "stopped":"已停止"}
+        lines = [f"`{name}`：{states.get(s['state'],s['state'])}｜重啟 {s['restarts']} 次"
+                 for name,s in getattr(bot, "background_task_status", {}).items()]
+        embed.add_field(name="背景任務", value=("\n".join(lines) or "尚未啟動")[:1000], inline=False)
+        embed.set_footer(text="執行權為最近檢查結果；此面板不會進行付款或重啟服務")
+        await interaction_send(interaction, embed=embed, ephemeral=True,
+                               allowed_mentions=discord.AllowedMentions.none())
 
     bot.tree.add_command(group)

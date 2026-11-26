@@ -69,7 +69,8 @@ def register_events(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Dict[str, 
             for guild in bot.guilds:
                 for vc in guild.voice_channels:
                     for member in vc.members:
-                        if member.bot or member.voice.self_deaf or member.voice.deaf:
+                        voice = member.voice
+                        if member.bot or voice is None or voice.self_deaf or voice.deaf:
                             continue
                         if await allowed(bot, member.id):
                             candidate_user_ids.add(str(member.id))
@@ -237,6 +238,8 @@ def register_events(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Dict[str, 
                 last_msg_flush_ts[user_id] = now_ts
                 if result.get("exp_awarded"):
                     last_exp_award_ts[user_id] = now_ts
+                elif result.get("last_exp_reward") is not None:
+                    last_exp_award_ts[user_id] = now_ts - max(0, (now-result["last_exp_reward"]).total_seconds())
         except Exception as e:
             logger.exception("on_message 錯誤: %s", e)
         finally:

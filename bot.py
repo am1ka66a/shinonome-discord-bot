@@ -356,7 +356,7 @@ assembly.register_all_commands(
 MEMBERS_INTENT_FALLBACK_FLAG = "MEMBERS_INTENT_FALLBACK_DONE"
 
 try:
-    bot.run(os.getenv("DISCORD_TOKEN"))
+    bot.run(os.getenv("DISCORD_TOKEN"), log_handler=None)
 except discord.errors.PrivilegedIntentsRequired:
     logger.critical(
         "缺少 SERVER MEMBERS INTENT。請到 Discord Developer Portal → 你的應用程式 → Bot → "

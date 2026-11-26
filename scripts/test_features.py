@@ -78,6 +78,19 @@ class FeatureTests(unittest.TestCase):
         self.assertEqual(self.bot.game_store.finish.await_args_list[0], self.bot.game_store.finish.await_args_list[1])
         self.assertNotIn("refund", self.bot.game_store.finish.call_args.kwargs)
 
+    def test_blackjack_uses_committed_experience_receipt_without_second_award(self):
+        self.bot.game_store=SimpleNamespace(finish=AsyncMock(return_value={
+            'results':{'1':[True,100,False]},'credits':{'1':200},'experience':{'1':50}}),call=AsyncMock())
+        blackjack.register_blackjack_commands(self.bot,self.ctx)
+        setup=nested_class(self.bot,'bj','SetupView')
+        game_cls=inspect.getclosurevars(setup.start.__wrapped__).nonlocals['BlackjackGame']
+        game=self.make_view(game_cls,SimpleNamespace(id=1,display_name='a'),100,0,0,upfront_cost=100,session_id='bj:exp')
+        game.message=SimpleNamespace(channel=SimpleNamespace(guild=None),edit=AsyncMock())
+        self.run_now(game.end('win',100,True,False,message_obj=game.message,exp_gain=50))
+        self.assertTrue(game._game_over)
+        self.ctx['add_user_exp_async'].assert_not_awaited()
+        self.assertEqual(self.bot.game_store.finish.call_args.kwargs['experience'],{'1':50})
+
     def test_banned_user_cannot_claim_existing_packet(self):
         self.bot.blacklist_checker = AsyncMock(return_value=True)
         economy.register_economy_commands(self.bot, self.ctx)
@@ -166,7 +179,7 @@ class FeatureTests(unittest.TestCase):
         self.assertIsNotNone(bot.tree.get_command("level"))
         self.assertIsNotNone(bot.tree.get_command("setlevel"))
         audit = bot.tree.get_command("admin_audit")
-        self.assertEqual({cmd.name for cmd in audit.commands}, {"account", "resets", "pending"})
+        self.assertEqual({cmd.name for cmd in audit.commands}, {"account", "resets", "pending", "health"})
         self.assertEqual(audit.default_permissions, discord.Permissions(administrator=True))
 
     def test_level_query_keeps_progress_without_milestone_rewards(self):

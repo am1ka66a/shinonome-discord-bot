@@ -45,17 +45,24 @@ def add_user_exp(get_db_connection, calc_level_from_exp_func, user_id, amount):
     if amount <= 0:
         return None
     with db_cursor(commit=True, connect=get_db_connection) as c:
-        c.execute("SELECT exp, level FROM users WHERE user_id=%s FOR UPDATE", (str(user_id),))
-        row = c.fetchone()
-        if not row:
-            return None
-        old_exp, old_level = int(row[0] or 0), int(row[1] or 1)
-        new_exp = old_exp + int(amount)
-        new_level, _, _ = calc_level_from_exp_func(new_exp)
-        if new_level != old_level:
-            c.execute("UPDATE users SET exp=%s, level=%s WHERE user_id=%s", (new_exp, new_level, str(user_id)))
-        else:
-            c.execute("UPDATE users SET exp=%s WHERE user_id=%s", (new_exp, str(user_id)))
+        return add_user_exp_in_tx(c, calc_level_from_exp_func, user_id, amount)
+
+
+def add_user_exp_in_tx(c, calc_level_from_exp_func, user_id, amount):
+    """Award EXP using the caller's transaction, without opening another connection."""
+    if amount <= 0:
+        return None
+    c.execute("SELECT exp, level FROM users WHERE user_id=%s FOR UPDATE", (str(user_id),))
+    row = c.fetchone()
+    if not row:
+        return None
+    old_exp, old_level = int(row[0] or 0), int(row[1] or 1)
+    new_exp = old_exp + int(amount)
+    new_level, _, _ = calc_level_from_exp_func(new_exp)
+    if new_level != old_level:
+        c.execute("UPDATE users SET exp=%s, level=%s WHERE user_id=%s", (new_exp, new_level, str(user_id)))
+    else:
+        c.execute("UPDATE users SET exp=%s WHERE user_id=%s", (new_exp, str(user_id)))
     return old_level, new_level, new_exp
 
 

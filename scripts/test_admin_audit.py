@@ -111,6 +111,19 @@ class AuditUITests(unittest.IsolatedAsyncioTestCase):
             worker.assert_not_awaited()
         self.ctx['resolve_slash_target'].assert_not_awaited()
 
+    async def test_health_is_private_and_available_without_database_queries(self):
+        import asyncio
+        self.bot._db_ready_event=asyncio.Event()
+        self.bot.background_task_status={'recovery_task':dict(state='waiting',restarts=2)}
+        inter=interaction()
+        with patch.object(ui.asyncio,'to_thread',new=AsyncMock()) as worker:
+            await self.bot.tree.get_command('admin_audit').get_command('health').callback(inter)
+            worker.assert_not_awaited()
+        sent=inter.followup.send.call_args.kwargs
+        self.assertTrue(sent['ephemeral'])
+        self.assertIn('尚未完成',sent['embed'].description)
+        self.assertIn('等待恢復',sent['embed'].fields[0].value)
+
     async def test_account_is_private_and_component_checks_original_admin(self):
         with patch.object(ui.asyncio, 'to_thread', new=AsyncMock(return_value=self.snapshot)):
             inter = interaction()

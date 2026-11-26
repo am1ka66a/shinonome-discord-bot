@@ -344,7 +344,9 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                             credits[beneficiary] = credits.get(beneficiary, 0) + share
                             reasons.setdefault(beneficiary, []).append(
                                 [share, f"{domain_sync.CASINO_RECOVERY_SHARE_REASON_PREFIX}｜21點回收切割"])
-                    receipt = await store.finish(self.session_id, credits, {uid: (win, total_p, is_push)}, reasons)
+                    receipt = await store.finish(self.session_id, credits, {uid: (win, total_p, is_push)}, reasons,
+                                                 experience={uid: exp_gain})
+                    exp_gain = int(receipt.get("experience", {}).get(uid, 0))
                     if uid not in receipt["results"]:
                         res, prof, exp_gain = "牌局已中斷，已依紀錄退回注金。", 0, 0
                         self.side_p = 0
@@ -358,12 +360,17 @@ def register_blackjack_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             self._game_over = True
             self.stop()
 
-            if exp_gain > 0 and await allowed(bot, self.user.id):
-                await ensure_user_exists_async(self.user.id, 50000)
-                await add_user_exp_async(self.user.id, exp_gain)
+            if exp_gain > 0:
+                if store is None or not self.session_id:
+                    if await allowed(bot, self.user.id):
+                        await ensure_user_exists_async(self.user.id, 50000)
+                        await add_user_exp_async(self.user.id, exp_gain)
+                    else:
+                        exp_gain = 0
+            if exp_gain > 0:
                 res = f"{res}\n✨ 經驗值 `+{exp_gain}`"
             else:
-                res = f"{res}\n🧊 本局失利，不獲得 EXP"
+                res = f"{res}\n🧊 本局未發放 EXP"
             if exp_detail:
                 res = f"{res}\n{exp_detail}"
 

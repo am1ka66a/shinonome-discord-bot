@@ -198,18 +198,19 @@ def register_fun_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         death: typing.Optional[str] = None,
         item: typing.Optional[str] = None,
     ):
+        await interaction_defer_if_needed(interaction)
         m_user, err = await resolve_slash_target(
             interaction, target, user_id, required=True, in_guild_only=True
         )
         if err:
-            return await interaction.response.send_message(err, ephemeral=True)
+            return await interaction_send(interaction, err, ephemeral=True)
         if not isinstance(m_user, discord.Member):
-            return await interaction.response.send_message("目標必須是此伺服器成員。", ephemeral=True)
+            return await interaction_send(interaction, "目標必須是此伺服器成員。", ephemeral=True)
         target = m_user
         template = _resolve_kill_template(death)
         resolved_item = _resolve_kill_item(item)
         msg = _build_kill_message(template, target, interaction.user, resolved_item)
-        await interaction.response.send_message(msg)
+        await interaction_send(interaction, msg)
 
     @kill.autocomplete("death")
     async def kill_death_autocomplete(

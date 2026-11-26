@@ -4,6 +4,7 @@ import datetime
 import logging
 import os
 import sys
+import time
 import typing
 
 import discord
@@ -11,6 +12,22 @@ from discord import app_commands
 from discord.ext import commands
 
 from bot_modules.db import is_transient_db_error
+
+
+class _BelowWarning(logging.Filter):
+    def filter(self, record):
+        return record.levelno < logging.WARNING
+
+
+def _console_handlers(formatter, level):
+    output = logging.StreamHandler(sys.stdout)
+    output.setLevel(level)
+    output.addFilter(_BelowWarning())
+    errors = logging.StreamHandler(sys.stderr)
+    errors.setLevel(max(level, logging.WARNING))
+    for handler in (output, errors):
+        handler.setFormatter(formatter)
+    return output, errors
 
 
 def setup_bot_logging() -> logging.Logger:
@@ -28,10 +45,14 @@ def setup_bot_logging() -> logging.Logger:
     )
     _log_tz = datetime.timezone(datetime.timedelta(hours=8))
     fmt.converter = lambda ts: datetime.datetime.fromtimestamp(ts, _log_tz).timetuple()
-    ch = logging.StreamHandler()
-    ch.setLevel(level)
-    ch.setFormatter(fmt)
-    log.addHandler(ch)
+    for handler in _console_handlers(fmt, level):
+        log.addHandler(handler)
+    discord_log = logging.getLogger("discord")
+    if not discord_log.handlers:
+        discord_log.setLevel(level)
+        discord_log.propagate = False
+        for handler in _console_handlers(fmt, level):
+            discord_log.addHandler(handler)
     log.propagate = False
     log_path = (os.getenv("BOT_LOG_FILE") or os.getenv("LOG_FILE") or "").strip()
     if log_path:
@@ -168,7 +189,7 @@ def create_shinonome_bot(
             while not self.is_closed():
                 await asyncio.sleep(LEASE_HEARTBEAT_SECONDS)
                 try:
-                    await asyncio.to_thread(self.instance_lease.verify)
+                    await self.instance_lease.call("verify")
                 except Exception as error:
                     self._instance_lease_error = error
                     logger.exception("無法確認機器人執行權，停止服務並回報異常以觸發平台重啟")
@@ -189,9 +210,18 @@ def create_shinonome_bot(
             finally:
                 lease = getattr(self, "instance_lease", None)
                 if lease is not None:
-                    await asyncio.to_thread(lease.close)
+                    await lease.call("close")
 
-    return ShinonomeBot(command_prefix="!", intents=intents)
+    bot = ShinonomeBot(command_prefix="!", intents=intents)
+    bot.runtime_started_at = time.monotonic()
+
+    @bot.event
+    async def on_command_error(ctx, error):
+        if isinstance(error, commands.CommandNotFound):
+            return
+        logger.error("文字指令失敗: %s", error, exc_info=(type(error), error, error.__traceback__))
+
+    return bot
 
 
 def register_on_ready(
@@ -205,6 +235,8 @@ def register_on_ready(
     snapshot_cache_tasks: typing.Dict[str, typing.Any],
 ) -> None:
     background_tasks: typing.Dict[str, asyncio.Task] = {}
+    bot.background_tasks = background_tasks
+    bot.background_task_status = {}
     ready_lock = asyncio.Lock()
     initialized = False
     bot._db_ready_event = asyncio.Event()
@@ -253,5 +285,7 @@ def register_on_ready(
                     error = existing.exception()
                     if error is not None:
                         logger.error("背景任務 %s 已停止: %s", name, error)
-                background_tasks[name] = asyncio.create_task(factory(), name=name)
+                from bot_modules.runtime.tasks import supervise_task
+                background_tasks[name] = asyncio.create_task(
+                    supervise_task(bot, name, factory, logger, bot.background_task_status), name=name)
         logger.info("機器人已啟動: %s（伺服器數 %s）", bot.user, len(bot.guilds))
