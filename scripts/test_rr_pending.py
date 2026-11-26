@@ -141,6 +141,25 @@ class RouletteRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.match.settled)
         self.assertTrue(self.bot._rr_recovered)
 
+    async def test_failed_message_update_freezes_buttons_and_requests_saved_state(self):
+        self.match.settled=False
+        self.match.opponent_id=2
+        self.match.challenger_id=1
+        self.bot._rr_recovered=True
+        view=self.invite_cls(self.match)
+        self.addCleanup(view.stop)
+        self.match.view=view
+        request=interaction()
+        request.edit_original_response.side_effect=ConnectionError('Discord unavailable')
+        with patch.object(self.match,'fund',new=AsyncMock(return_value=True)):
+            with self.assertRaises(ConnectionError):
+                await view.accept.callback(request)
+        self.assertTrue(self.match.settled)
+        self.assertFalse(self.bot._rr_recovered)
+        self.assertEqual(self.bot._active_game_actions,0)
+        if self.match.view:
+            self.match.view.stop()
+
     async def test_accept_waits_until_initial_publish_and_checkpoint_finish(self):
         import asyncio
         self.match.settled=False

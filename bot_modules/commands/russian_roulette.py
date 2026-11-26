@@ -45,6 +45,9 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
 
     class RrView(discord.ui.View):
         async def on_error(self, interaction, error, item):
+            match = getattr(self, "match", None)
+            if match is not None and not match.settled:
+                match.request_restore()
             logging.getLogger("shinonome_bot").error("輪盤互動失敗 interaction=%s: %s",interaction.id,error,
                 exc_info=(type(error),error,error.__traceback__))
             try:
@@ -61,7 +64,13 @@ def register_russian_roulette_commands(bot, ctx: typing.Dict[str, typing.Any]) -
             if interaction is not None:
                 await interaction_defer_if_needed(interaction, thinking=False)
             with active_game_action(bot):
-                return await locked_action(self, interaction, m, callback, args, kwargs)
+                try:
+                    return await locked_action(self, interaction, m, callback, args, kwargs)
+                except Exception:
+                    # Includes timeouts and Discord edit failures after an in-memory
+                    # phase change. Resume from the saved state, never a dead view.
+                    m.request_restore()
+                    raise
         return guarded
 
     async def locked_action(self, interaction, m, callback, args, kwargs):
