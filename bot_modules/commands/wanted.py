@@ -203,8 +203,9 @@ def register_wanted_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         ]
     )
     async def role_choose_slash(interaction: discord.Interaction, role: str):
+        await interaction_defer_if_needed(interaction, ephemeral=True)
         if role not in ("cop", "criminal", "civilian"):
-            return await interaction.response.send_message(
+            return await interaction_send(interaction,
                 "❌ 請從選單選擇 **警察**、**搶匪** 或 **平民**。",
                 ephemeral=True,
             )
@@ -213,25 +214,25 @@ def register_wanted_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         if not role_result.get("ok"):
             reason = role_result.get("reason")
             if reason == "cert_active":
-                return await interaction.response.send_message(
+                return await interaction_send(interaction,
                     "❌ 你目前已啟用良民證，無法切換身分。請先使用 `/good_citizen` 解除後再轉職。",
                     ephemeral=True,
                 )
             if reason == "cooldown":
                 ts = tw_naive_to_discord_ts(role_result["next_dt"])
-                return await interaction.response.send_message(
+                return await interaction_send(interaction,
                     f"⏳ 轉職冷卻中，下次可於 <t:{ts}:F>（<t:{ts}:R>）再切換陣營。",
                     ephemeral=True,
                 )
             if reason == "already_civilian":
-                return await interaction.response.send_message("ℹ️ 你目前已是**平民**。", ephemeral=True)
+                return await interaction_send(interaction, "ℹ️ 你目前已是**平民**。", ephemeral=True)
             if reason == "wanted_block":
                 wanted_now = int(role_result.get("wanted_now") or 0)
-                return await interaction.response.send_message(
+                return await interaction_send(interaction,
                     f"❌ 搶匪轉為警察或平民須 **通緝 0 星**（目前 {wanted_now} 星）。請先透過追捕／入獄等流程歸零後再切換。",
                     ephemeral=True,
                 )
-            return await interaction.response.send_message("❌ 轉職失敗，請稍後再試。", ephemeral=True)
+            return await interaction_send(interaction, "❌ 轉職失敗，請稍後再試。", ephemeral=True)
         old_role = role_result.get("old_role", "civilian")
 
         role_name = (
@@ -283,7 +284,7 @@ def register_wanted_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                 inline=False,
             )
         _invalidate_wanted_caches(interaction.user.id)
-        await interaction_send(interaction, embed=emb)
+        await interaction_send(interaction, embed=emb, ephemeral=True)
 
 
     @bot.tree.command(
@@ -598,38 +599,39 @@ def register_wanted_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
 
     @bot.tree.command(name="good_citizen", description="良民證：支付 5,000 萬啟用防搶；再支付 5,000 萬解除（兩者皆 24h 冷卻）")
     async def good_citizen_slash(interaction: discord.Interaction):
+        await interaction_defer_if_needed(interaction, ephemeral=True)
         now = now_tw_naive()
         result = await toggle_good_citizen_sync_async(interaction.user.id, now)
         if not result.get("ok"):
             reason = result.get("reason")
             if reason == "not_found":
-                return await interaction.response.send_message("找不到帳號資料。", ephemeral=True)
+                return await interaction_send(interaction, "找不到帳號資料。", ephemeral=True)
             if reason == "not_civilian":
-                return await interaction.response.send_message(
+                return await interaction_send(interaction,
                     "❌ 良民證僅限 **平民** 使用；請先用 `/role_choose` 切換為平民。",
                     ephemeral=True,
                 )
             if reason == "broken_lock":
                 ts = tw_naive_to_discord_ts(result["until"])
-                return await interaction.response.send_message(
+                return await interaction_send(interaction,
                     f"❌ 你的良民證已被摧毀，需等到 <t:{ts}:F>（<t:{ts}:R>）後才能再次啟用。",
                     ephemeral=True,
                 )
             if reason == "cooldown":
                 ts = tw_naive_to_discord_ts(result["next_dt"])
-                return await interaction.response.send_message(
+                return await interaction_send(interaction,
                     f"⏳ 良民證冷卻中，下次可於 <t:{ts}:F>（<t:{ts}:R>）再操作。",
                     ephemeral=True,
                 )
             if reason == "insufficient":
                 bal = int(result.get("balance") or 0)
-                return await interaction.response.send_message(
+                return await interaction_send(interaction,
                     f"❌ 需要 `{GOOD_CITIZEN_CERT_COST:,}` 東雲幣，你的餘額不足（目前 `{bal:,}`）。",
                     ephemeral=True,
                 )
             if reason == "deduct_failed":
-                return await interaction.response.send_message("扣款失敗（餘額不足）。", ephemeral=True)
-            return await interaction.response.send_message("❌ 良民證操作失敗，請稍後再試。", ephemeral=True)
+                return await interaction_send(interaction, "扣款失敗（餘額不足）。", ephemeral=True)
+            return await interaction_send(interaction, "❌ 良民證操作失敗，請稍後再試。", ephemeral=True)
 
         _invalidate_wanted_caches(interaction.user.id)
         next_active = int(result["next_active"])
@@ -641,16 +643,17 @@ def register_wanted_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
         emb.add_field(name="目前狀態", value=status_txt, inline=False)
         emb.add_field(name="目前餘額", value=f"`{new_bal:,}` 東雲幣", inline=False)
         emb.set_footer(text="啟用與解除皆有 24 小時冷卻")
-        await interaction.response.send_message(embed=emb, ephemeral=True)
+        await interaction_send(interaction, embed=emb, ephemeral=True)
 
 
     @bot.tree.command(name="good_citizen_list", description="查看目前啟用良民證的玩家清單")
     async def good_citizen_list_slash(interaction: discord.Interaction):
         if not interaction.guild:
-            return await interaction.response.send_message("請在伺服器頻道使用。", ephemeral=True)
+            return await interaction_send(interaction, "請在伺服器頻道使用。", ephemeral=True)
+        await interaction_defer_if_needed(interaction, ephemeral=False)
         rows = await fetch_good_citizen_rows_sync_async()
         if not rows:
-            return await interaction.response.send_message("目前沒有啟用良民證的玩家。", ephemeral=True)
+            return await interaction_send(interaction, "目前沒有啟用良民證的玩家。", ephemeral=True)
         guild = interaction.guild
         entries: typing.List[typing.Tuple[int, int]] = []
         for uid_str, bal_raw, _last_action in rows:
@@ -665,14 +668,14 @@ def register_wanted_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             disp_safe = discord.utils.escape_markdown(names[mid])
             lines.append(f"• {disp_safe}（<@{mid}>）｜餘額 `{bal:,}`")
         if not lines:
-            return await interaction.response.send_message("目前沒有啟用良民證的玩家。", ephemeral=True)
+            return await interaction_send(interaction, "目前沒有啟用良民證的玩家。", ephemeral=True)
         emb = discord.Embed(
             title="🪪 良民證持有者名單",
             description="\n".join(lines)[:3900],
             color=0x57F287,
         )
         emb.set_footer(text=f"共 {len(lines)} 人")
-        await interaction.response.send_message(embed=emb, ephemeral=False)
+        await interaction_send(interaction, embed=emb, ephemeral=False)
 
 
     @bot.tree.command(name="break_citizen", description="摧毀目標良民證（花費 5 億；目標 10 天內無法再取得）")
@@ -734,9 +737,10 @@ def register_wanted_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
 
     @bot.tree.command(name="wanted_status", description="查看自己的陣營、通緝、監獄狀態與最近搶劫紀錄")
     async def wanted_status_slash(interaction: discord.Interaction):
+        await interaction_defer_if_needed(interaction, ephemeral=True)
         row = await fetch_wanted_status_row_sync_async(interaction.user.id)
         if not row:
-            return await interaction.response.send_message("找不到資料。", ephemeral=True)
+            return await interaction_send(interaction, "找不到資料。", ephemeral=True)
         role, stars, hunted, in_pr, raw_hist, arrests, rev_pend, rev_amt, bail_debt_u, cert_active = row
         role_s = role or "civilian"
         stars_i = int(stars or 0)
@@ -790,16 +794,17 @@ def register_wanted_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                 + " 幣｜/bail"
             )
         )
-        await interaction.response.send_message(embed=emb, ephemeral=True)
+        await interaction_send(interaction, embed=emb, ephemeral=True)
 
 
     @bot.tree.command(name="wanted_list", description="列出目前通緝中玩家（不含 0 星），並顯示可否被追捕")
     async def wanted_list_slash(interaction: discord.Interaction):
         if not interaction.guild:
-            return await interaction.response.send_message("請在伺服器頻道使用。", ephemeral=True)
+            return await interaction_send(interaction, "請在伺服器頻道使用。", ephemeral=True)
+        await interaction_defer_if_needed(interaction, ephemeral=False)
         rows = await fetch_wanted_list_rows_sync_async()
         if not rows:
-            return await interaction.response.send_message(
+            return await interaction_send(interaction,
                 "目前沒有通緝中的玩家（僅顯示通緝星 1～5 星）。",
                 ephemeral=True,
             )
@@ -829,7 +834,7 @@ def register_wanted_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                 hunt_txt = "**可追捕**"
             lines.append(f"• {disp_safe}（<@{mid}>）｜{star_s}｜可獲獎金 {bounty_txt}｜{hunt_txt}")
         if not lines:
-            return await interaction.response.send_message(
+            return await interaction_send(interaction,
                 "目前沒有通緝中的玩家（僅顯示通緝星 1～5 星）。",
                 ephemeral=True,
             )
@@ -840,7 +845,7 @@ def register_wanted_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
             color=0xED4245,
         )
         emb.set_footer(text="警察請用 /cop_hunt 指定對象｜0 星不會出現在此清單")
-        await interaction.response.send_message(embed=emb, ephemeral=False)
+        await interaction_send(interaction, embed=emb, ephemeral=False)
 
 
     @bot.tree.command(
@@ -856,26 +861,27 @@ def register_wanted_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
 
     @bot.tree.command(name="bail", description=f"繳納假釋金（基礎 {BAIL_COST:,} + 累計欠款）出獄")
     async def bail_slash(interaction: discord.Interaction):
+        await interaction_defer_if_needed(interaction, ephemeral=True)
         now = now_tw_naive()
         result = await pay_bail_sync_async(interaction.user.id, now)
         if not result.get("ok"):
             reason = result.get("reason")
             if reason == "not_in_prison":
-                return await interaction.response.send_message("你不在監獄裡。", ephemeral=True)
+                return await interaction_send(interaction, "你不在監獄裡。", ephemeral=True)
             if reason == "insufficient":
                 debt = int(result.get("debt") or 0)
                 total_bail = int(result.get("total_bail") or BAIL_COST)
-                return await interaction.response.send_message(
+                return await interaction_send(interaction,
                     f"假釋須繳 **基礎 `{BAIL_COST:,}`**"
                     + (f" + **欠款 `{debt:,}`**" if debt else "")
                     + f" = **合計 `{total_bail:,}`** 東雲幣，你的餘額不足。",
                     ephemeral=True,
                 )
-            return await interaction.response.send_message("扣款失敗（餘額不足）。", ephemeral=True)
+            return await interaction_send(interaction, "扣款失敗（餘額不足）。", ephemeral=True)
         _invalidate_wanted_caches(interaction.user.id)
         debt = int(result["debt"])
         total_bail = int(result["total_bail"])
-        await interaction.response.send_message(
+        await interaction_send(interaction,
             f"✅ 已繳納 **`{total_bail:,}`** 東雲幣（基礎 `{BAIL_COST:,}`"
             + (f" + 清償欠款 `{debt:,}`" if debt else "")
             + "），你已出獄。",

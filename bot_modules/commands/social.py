@@ -113,6 +113,7 @@ def register_social_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
 
     @bot.tree.command(name="rank", description="查看自己的全站名次")
     async def rank_slash(interaction: discord.Interaction):
+        await interaction_defer_if_needed(interaction, ephemeral=True)
         await ensure_user_exists_async(interaction.user.id, 50000)
         ranks = await fetch_user_ranks_async(interaction.user.id)
         if not ranks:

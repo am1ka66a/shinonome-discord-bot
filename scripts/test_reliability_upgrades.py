@@ -13,7 +13,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from bot_modules import bot_core
-from bot_modules.commands import economy, fun, wanted, russian_roulette
+from bot_modules.commands import economy, fun, wanted, russian_roulette, social
 from bot_modules.discord_helpers import resolve_slash_target
 from bot_modules.runtime.app_lock import register_app_command_lock
 from bot_modules.runtime.tasks import supervise_task
@@ -95,6 +95,33 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
                 inter=interaction()
                 await cmd.callback(inter,user_id='531308526262550528')
                 self.assertEqual(inter.followup.send.call_args.args[0],'lookup unavailable')
+
+    async def test_account_and_wanted_queries_ack_before_slow_database_and_reply_once(self):
+        import datetime
+        self.ctx['now_tw_naive']=lambda:datetime.datetime(2026,11,26)
+        social.register_social_commands(self.bot,self.ctx)
+        wanted.register_wanted_commands(self.bot,self.ctx)
+        cases=[('rank','ensure_user_exists_async',None,{},True),
+            ('role_choose','choose_role_sync_async',{'ok':False},{'role':'civilian'},True),
+            ('good_citizen','toggle_good_citizen_sync_async',{'ok':False,'reason':'not_found'},{},True),
+            ('good_citizen_list','fetch_good_citizen_rows_sync_async',[],{},False),
+            ('wanted_status','fetch_wanted_status_row_sync_async',None,{},True),
+            ('wanted_list','fetch_wanted_list_rows_sync_async',[],{},False),
+            ('bail','pay_bail_sync_async',{'ok':False,'reason':'not_in_prison'},{},True)]
+        for name,key,result,kwargs,private in cases:
+            with self.subTest(command=name):
+                inter=interaction()
+                inter.guild=SimpleNamespace(id=1)
+                async def slow_query(*args,**kw):
+                    self.assertTrue(inter.response.is_done())
+                    return result
+                self.ctx[key].side_effect=slow_query
+                self.ctx['fetch_user_ranks_async'].return_value=None
+                await self.bot.tree.get_command(name).callback(inter,**kwargs)
+                inter.response.defer.assert_awaited_once_with(ephemeral=private,thinking=True)
+                inter.response.send_message.assert_not_awaited()
+                inter.followup.send.assert_awaited_once()
+                self.ctx[key].side_effect=None
 
     async def test_invalid_optional_user_id_is_not_silently_replaced_with_self(self):
         target,error=await resolve_slash_target(interaction(),None,'bad-id',required=False)
