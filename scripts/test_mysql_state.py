@@ -64,6 +64,21 @@ class MySQLStateTests(unittest.TestCase):
             list(pool.map(lambda _: self.store.apply("ci:bj"), range(2)))
         self.assertEqual(self.balances(), [1100, 1000])
 
+    def test_pool_disconnect_inside_transaction_cannot_replay_only_last_statement(self):
+        import pymysql
+        with self.assertRaises(pymysql.MySQLError):
+            with db.db_cursor(commit=True) as c:
+                c.execute("UPDATE users SET balance=balance-100 WHERE user_id='1'")
+                # Close just the disposable test connection. Its uncommitted
+                # debit must roll back; DBUtils must not reconnect and commit
+                # only the following log as an orphaned partial operation.
+                c._con._con.close()
+                c.execute("INSERT INTO logs (user_id,amount,reason) VALUES ('1',-100,'must not replay')")
+        self.assertEqual(self.balances(),[1000,1000])
+        with db.db_cursor() as c:
+            c.execute('SELECT COUNT(*) FROM logs')
+            self.assertEqual(c.fetchone()[0],0)
+
     def test_concurrent_claim_by_same_user_is_once(self):
         self.store.debit("ci:packet", "redpacket", 1, 100, "open", {"creator_id": 1, "count": 1, "claims": {}})
         with ThreadPoolExecutor(max_workers=2) as pool:

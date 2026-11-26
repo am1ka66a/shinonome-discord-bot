@@ -8,6 +8,7 @@ from bot_modules.user_repo import is_blacklisted
 from bot_modules.discord_helpers import interaction_defer_if_needed, interaction_send
 
 READ_COMMANDS = {
+    "ask",
     "help", "adminhelp", "balance", "level", "record", "leaderboard", "lvleaderboard",
     "casino_stats", "share_stats", "wanted_status", "wanted_list", "good_citizen_list",
     "profile", "cooldowns", "compare", "rank",

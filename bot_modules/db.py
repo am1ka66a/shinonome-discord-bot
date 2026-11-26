@@ -162,8 +162,19 @@ def _release_conn(conn, *, discard: bool = False) -> None:
         pass
 
 
+def begin_transaction(conn):
+    """Tell DBUtils this is a transaction, disabling mid-transaction replay."""
+    begin = getattr(conn, "begin", None)
+    if callable(begin):
+        # Checkout uses ping=2. Repair stale idle connections before marking
+        # a transaction; reconnecting after its first statement is unsafe.
+        cursor = conn.cursor()
+        cursor.close()
+        begin()
+
+
 @contextlib.contextmanager
-def db_conn(connect=None):
+def db_conn(connect=None, *, transaction=True):
     """連線 context manager：離開時保證歸還連線，發生例外時先 rollback。
 
     connect 可傳入自訂的取連線函式（供以依賴注入方式取得連線的模組使用）。
@@ -171,6 +182,8 @@ def db_conn(connect=None):
     conn = (connect or get_db_connection)()
     discard = False
     try:
+        if transaction:
+            begin_transaction(conn)
         yield conn
     except BaseException as exc:
         discard = is_transient_db_error(exc)
@@ -186,7 +199,7 @@ def db_conn(connect=None):
 @contextlib.contextmanager
 def db_cursor(commit: bool = False, connect=None):
     """游標 context manager；commit=True 時正常離開會自動 commit。"""
-    with db_conn(connect) as conn:
+    with db_conn(connect, transaction=commit) as conn:
         yield conn.cursor()
         if commit:
             conn.commit()

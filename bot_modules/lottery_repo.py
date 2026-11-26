@@ -5,7 +5,7 @@ import typing
 import pymysql
 
 from bot_modules import config
-from bot_modules.db import db_conn, db_cursor
+from bot_modules.db import begin_transaction, db_conn, db_cursor
 from bot_modules.social_repo import lottery_day_key
 from bot_modules.tx_ops import log_transaction_in_tx
 
@@ -67,6 +67,9 @@ def finalize_due_rounds_sync(now: typing.Optional[datetime.datetime] = None) -> 
                 continue
             if _day_sort_key(key_str) >= current_sort:
                 continue
+            # Each round commits independently, so re-establish DBUtils' guard
+            # after the preceding round's commit before locking or paying.
+            begin_transaction(conn)
             # Other commands and the background worker can finalize the same day.
             # A locking read sees the latest committed state even under REPEATABLE READ.
             c.execute(
