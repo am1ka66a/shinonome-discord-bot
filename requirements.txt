@@ -1,5 +1,4 @@
 discord.py==2.3.2
-aiohttp>=3.9,<4
 python-dotenv==1.2.4
 PyMySQL==1.2.4
 # MySQL 8 caching_sha2_password：新建連線（含連線池重連）需要 RSA 加密密碼

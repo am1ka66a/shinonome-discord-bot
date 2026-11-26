@@ -9,7 +9,6 @@ from bot_modules.discord_helpers import interaction_send
 
 DEFAULT_READ_ONLY_APP_COMMANDS: typing.Set[str] = {
     "help",
-    "ask",
     "kill",  # Sends a Minecraft-style message without changing player data.
     "balance",
     "level",

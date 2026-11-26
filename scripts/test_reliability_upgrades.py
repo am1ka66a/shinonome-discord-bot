@@ -129,13 +129,6 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(error)
         self.assertEqual(await resolve_slash_target(interaction(),None,None,required=False),(None,None))
 
-    async def test_ai_question_does_not_block_financial_commands(self):
-        register_app_command_lock(self.bot,Mock())
-        ask=interaction(iid=1,command='ask')
-        self.assertTrue(await self.bot.tree.interaction_check(ask))
-        self.assertEqual(self.bot._active_mutating_commands,{})
-        self.assertTrue(await self.bot.tree.interaction_check(interaction(iid=2,command='transfer')))
-
     async def test_large_red_packet_summary_stays_below_discord_message_limit(self):
         import inspect
         economy.register_economy_commands(self.bot,self.ctx)
