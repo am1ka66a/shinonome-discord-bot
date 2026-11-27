@@ -53,7 +53,7 @@ class MySQLStateTests(unittest.TestCase):
         self.assertEqual(self.balances(), [1000, 1000])
         with db.db_cursor() as c:
             c.execute("SELECT version FROM bot_schema_migrations ORDER BY version")
-            self.assertEqual([r[0] for r in c.fetchall()], [1, 2, 3])
+            self.assertEqual([r[0] for r in c.fetchall()], [1, 2, 3, 4])
             c.execute("SHOW INDEX FROM casino_logs WHERE Key_name='idx_casino_logs_user_id'")
             self.assertEqual([r[4] for r in c.fetchall()], ['user_id', 'id'])
 
