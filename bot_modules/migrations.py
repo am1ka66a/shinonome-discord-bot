@@ -147,7 +147,18 @@ def startup_grant_flag(c):
     c.execute('UPDATE users SET startup_granted=1')
 
 
-MIGRATIONS = ((1, baseline_schema), (2, maintenance_tables), (3, audit_indexes), (4, startup_grant_flag))
+def reconcile_tables(c):
+    """Baseline for balance-vs-ledger reconciliation; never touches balances."""
+    c.execute("""CREATE TABLE IF NOT EXISTS bot_reconcile_baseline (
+        user_id VARCHAR(255) PRIMARY KEY, offset_amount BIGINT NOT NULL)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS bot_reconcile_meta (
+        id TINYINT PRIMARY KEY, actor_id VARCHAR(255) NOT NULL,
+        accounts INT NOT NULL, total_offset BIGINT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+
+
+MIGRATIONS = ((1, baseline_schema), (2, maintenance_tables), (3, audit_indexes), (4, startup_grant_flag),
+              (5, reconcile_tables))
 
 
 def run_migrations(conn):

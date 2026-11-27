@@ -96,3 +96,77 @@ def pending_settlements(connect=None):
         c.execute("SELECT COUNT(*) FROM russian_roulette_active_matches WHERE phase='settling'")
         roulette_pending = int(c.fetchone()[0])
         return {"total": total, "rows": rows, "roulette_count": roulette_count, "roulette_pending": roulette_pending}
+
+
+@dataclass(frozen=True)
+class ReconcileReport:
+    accounts: int
+    matched: int
+    drifted: list          # [(user_id, balance, ledger_sum, offset, drift)] sorted by |drift| desc
+    total_drift: int
+    orphan_users: int
+    orphan_amount: int
+    baseline: object       # (actor_id, created_at, accounts, total_offset) or None
+    checked_at: int
+
+
+def _account_differences(c):
+    c.execute(
+        "SELECT u.user_id, COALESCE(u.balance,0), COALESCE(l.total,0), b.offset_amount "
+        "FROM users u "
+        "LEFT JOIN (SELECT user_id, SUM(amount) AS total FROM casino_logs GROUP BY user_id) l "
+        "ON l.user_id=u.user_id "
+        "LEFT JOIN bot_reconcile_baseline b ON b.user_id=u.user_id"
+    )
+    return c.fetchall()
+
+
+def reconcile_report(connect=None, limit=100):
+    """Compare every balance with the sum of its permanent ledger (casino_logs).
+
+    drift = balance - ledger_sum - baseline_offset. A baseline absorbs history
+    that predates the ledger; any later drift means money moved without a
+    matching ledger row. Read-only.
+    """
+    with db_cursor(connect=connect) as c:
+        rows = _account_differences(c)
+        c.execute(
+            "SELECT COUNT(DISTINCT user_id), COALESCE(SUM(amount),0) FROM casino_logs "
+            "WHERE user_id IS NOT NULL AND user_id NOT IN (SELECT user_id FROM users)"
+        )
+        orphan_users, orphan_amount = c.fetchone()
+        c.execute("SELECT actor_id, created_at, accounts, total_offset FROM bot_reconcile_meta WHERE id=1")
+        baseline = c.fetchone()
+    drifted = []
+    for uid, balance, ledger_sum, offset in rows:
+        balance, ledger_sum, offset = int(balance), int(ledger_sum), int(offset or 0)
+        drift = balance - ledger_sum - offset
+        if drift:
+            drifted.append((str(uid), balance, ledger_sum, offset, drift))
+    drifted.sort(key=lambda r: (-abs(r[4]), r[0]))
+    return ReconcileReport(
+        accounts=len(rows), matched=len(rows) - len(drifted),
+        drifted=drifted[:max(1, int(limit))], total_drift=sum(r[4] for r in drifted),
+        orphan_users=int(orphan_users or 0), orphan_amount=int(orphan_amount or 0),
+        baseline=tuple(baseline) if baseline else None, checked_at=int(time.time()),
+    )
+
+
+def set_reconcile_baseline(actor_id, connect=None):
+    """Record today's per-account differences as the accepted baseline.
+
+    Touches only the baseline tables; balances and ledgers are never changed.
+    """
+    with db_cursor(commit=True, connect=connect) as c:
+        rows = _account_differences(c)
+        c.execute("DELETE FROM bot_reconcile_baseline")
+        offsets = [(str(uid), int(bal) - int(total))
+                   for uid, bal, total, _ in rows if int(bal) - int(total) != 0]
+        for uid, offset in offsets:
+            c.execute("INSERT INTO bot_reconcile_baseline (user_id, offset_amount) VALUES (%s, %s)", (uid, offset))
+        c.execute("DELETE FROM bot_reconcile_meta WHERE id=1")
+        c.execute(
+            "INSERT INTO bot_reconcile_meta (id, actor_id, accounts, total_offset) VALUES (1, %s, %s, %s)",
+            (str(actor_id), len(offsets), sum(o for _, o in offsets)),
+        )
+    return {"accounts": len(offsets), "total_offset": sum(o for _, o in offsets)}

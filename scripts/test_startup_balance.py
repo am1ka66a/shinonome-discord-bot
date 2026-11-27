@@ -113,7 +113,7 @@ class StartupMigration(unittest.TestCase):
         migrations.startup_grant_flag(c)
         self.assertIn('startup_granted', c.sql[0])
         self.assertEqual(c.sql[1], 'UPDATE users SET startup_granted=1')
-        self.assertEqual(migrations.MIGRATIONS[-1][0], 4)
+        self.assertIn((4, migrations.startup_grant_flag), migrations.MIGRATIONS)
 
 
 if __name__ == '__main__':

@@ -109,6 +109,75 @@ class AccountLedgerView(discord.ui.View):
                 pass
 
 
+class BaselineConfirmView(discord.ui.View):
+    """Second step before recording the reconciliation baseline."""
+    def __init__(self, owner_id, host_ids, connect, logger):
+        super().__init__(timeout=60)
+        self.owner_id, self.host_ids, self.connect, self.logger = owner_id, host_ids, connect, logger
+        self.message = None
+        self.done = False
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.owner_id or interaction.user.id not in self.host_ids:
+            await interaction_send(interaction, "只有原查詢管理者可以操作此面板。", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="確認：以目前差額設為基準", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction, button):
+        if self.done:
+            return
+        self.done = True
+        self.stop()
+        await interaction_defer_if_needed(interaction, ephemeral=True, thinking=False)
+        try:
+            result = await asyncio.to_thread(admin_audit_repo.set_reconcile_baseline, interaction.user.id, self.connect)
+        except Exception:
+            self.logger.exception("對帳基準寫入失敗 actor=%s", interaction.user.id)
+            return await interaction_send(interaction, "基準寫入失敗，沒有變更任何資料，請稍後重試。", ephemeral=True)
+        self.logger.warning("對帳基準已更新 actor=%s accounts=%s total=%s",
+                            interaction.user.id, result["accounts"], result["total_offset"])
+        await interaction.edit_original_response(
+            content=f"✅ 已記錄基準：{result['accounts']:,} 個帳戶，總差額 {result['total_offset']:+,}。"
+                    "之後的對帳只會顯示基準之後新出現的差額。", embed=None, view=None)
+
+    @discord.ui.button(label="取消", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction, button):
+        self.done = True
+        self.stop()
+        await interaction.response.edit_message(content="已取消，沒有變更任何資料。", embed=None, view=None)
+
+    async def on_timeout(self):
+        if self.message is not None and not self.done:
+            try:
+                await self.message.edit(content="確認逾時，沒有變更任何資料。", embed=None, view=None)
+            except discord.HTTPException:
+                pass
+
+
+def reconcile_lines(report):
+    lines = []
+    for uid, balance, ledger_sum, offset, drift in report.drifted:
+        base = f"｜基準 {offset:+,}" if offset else ""
+        lines.append(f"<@{uid}>（`{uid}`）差額 **{drift:+,}**\n"
+                     f"餘額 {balance:,}｜總帳合計 {ledger_sum:,}{base}")
+    return lines
+
+
+def reconcile_summary(report):
+    if report.baseline:
+        actor, created, accounts, total = report.baseline
+        baseline = f"基準：{safe_text(created, 20)} 由 `{actor}` 設定（{int(accounts):,} 帳戶，{int(total):+,}）"
+    else:
+        baseline = "基準：尚未設定（差額包含總帳建立前的歷史）"
+    orphan = ""
+    if report.orphan_users:
+        orphan = f"\n⚠️ 總帳中有 {report.orphan_users} 個不存在的帳戶，合計 {report.orphan_amount:+,}"
+    status = "✅ 全部相符" if not report.drifted else f"⚠️ {report.accounts - report.matched:,} 個帳戶不符"
+    return (f"{status}\n檢查 {report.accounts:,} 個帳戶｜相符 {report.matched:,}｜差額合計 {report.total_drift:+,}\n"
+            f"{baseline}{orphan}\n檢查時間：<t:{report.checked_at}:F>")
+
+
 def register_admin_audit_commands(bot, ctx):
     hosts = ctx["ALLOWED_HOST_IDS"]
     connect = ctx["get_db_connection"]
@@ -204,6 +273,26 @@ def register_admin_audit_commands(bot, ctx):
         await send_panel(interaction, f"待處理結算：{data['total']+roulette_pending} 筆",
             lines or ["目前沒有待結算或逾時款項。"],
             f"輪盤對局 {data['roulette_count']} 場（可能正常進行中）｜最多 100 筆｜不會觸發付款")
+
+    @group.command(name="reconcile", description="比對每個帳戶餘額與總帳流水合計")
+    @app_commands.describe(set_baseline="把目前差額記為基準（需再按確認；不改變任何餘額）")
+    async def reconcile(interaction: discord.Interaction, set_baseline: bool = False):
+        if not await authorize(interaction):
+            return
+        report = await asyncio.to_thread(admin_audit_repo.reconcile_report, connect)
+        summary = reconcile_summary(report)
+        if set_baseline:
+            view = BaselineConfirmView(interaction.user.id, hosts, connect, logger)
+            embed = discord.Embed(title="設定對帳基準", color=0xED4245, description=(
+                summary + "\n\n確認後，目前每個帳戶的差額都會被視為正常歷史；"
+                "只記錄基準，不會修改任何餘額或流水。60 秒內有效。"))
+            view.message = await interaction_send(interaction, embed=embed, view=view, ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none())
+            return
+        lines = [summary, ""] + reconcile_lines(report)
+        if len(report.drifted) < report.accounts - report.matched:
+            lines.append(f"（只列出差額最大的 {len(report.drifted)} 個）")
+        await send_panel(interaction, "餘額對帳", lines, "唯讀｜差額 = 餘額 − 總帳合計 − 基準")
 
     @group.command(name="health", description="查看連線延遲、執行權檢查與背景任務")
     async def health(interaction: discord.Interaction):

@@ -21,7 +21,7 @@ class MySQLStateTests(unittest.TestCase):
 
     def setUp(self):
         with db.db_cursor(commit=True) as c:
-            for table in ("bot_admin_snapshots", "bot_admin_operations", "bot_settings", "bot_game_events", "bot_game_sessions", "russian_roulette_active_matches", "russian_roulette_settlements", "russian_roulette_stats", "casino_logs", "logs", "activity_stats", "blacklist", "users"):
+            for table in ("bot_reconcile_baseline", "bot_reconcile_meta", "bot_admin_snapshots", "bot_admin_operations", "bot_settings", "bot_game_events", "bot_game_sessions", "russian_roulette_active_matches", "russian_roulette_settlements", "russian_roulette_stats", "casino_logs", "logs", "activity_stats", "blacklist", "users"):
                 c.execute("DELETE FROM " + table)
             c.execute("INSERT INTO users (user_id,balance) VALUES ('1',1000),('2',1000)")
         self.store = state_repo.GameStore()
@@ -30,6 +30,21 @@ class MySQLStateTests(unittest.TestCase):
         with db.db_cursor() as c:
             c.execute("SELECT balance FROM users ORDER BY user_id")
             return [int(row[0]) for row in c.fetchall()]
+
+    def test_startup_grant_and_reconcile_on_mysql(self):
+        from bot_modules import admin_audit_repo as audit, user_repo
+        user_repo.ensure_user_exists(3, 0)
+        user_repo.ensure_user_exists(3, 50_000)
+        user_repo.ensure_user_exists(3, 50_000)
+        with db.db_cursor() as c:
+            c.execute("SELECT balance, startup_granted FROM users WHERE user_id='3'")
+            self.assertEqual(tuple(int(v) for v in c.fetchone()), (50_000, 1))
+        report = audit.reconcile_report()
+        # Seed accounts 1 and 2 were inserted without ledger rows; account 3 matches.
+        self.assertEqual(sorted(r[0] for r in report.drifted), ['1', '2'])
+        self.assertEqual(audit.set_reconcile_baseline(7), {"accounts": 2, "total_offset": 2000})
+        self.assertEqual(audit.reconcile_report().drifted, [])
+        self.assertEqual(self.balances(), [1000, 1000, 50_000])
 
     def test_audit_indexes_and_ledger_pagination_on_mysql(self):
         from bot_modules import admin_audit_repo as audit
@@ -53,7 +68,7 @@ class MySQLStateTests(unittest.TestCase):
         self.assertEqual(self.balances(), [1000, 1000])
         with db.db_cursor() as c:
             c.execute("SELECT version FROM bot_schema_migrations ORDER BY version")
-            self.assertEqual([r[0] for r in c.fetchall()], [1, 2, 3, 4])
+            self.assertEqual([r[0] for r in c.fetchall()], [1, 2, 3, 4, 5])
             c.execute("SHOW INDEX FROM casino_logs WHERE Key_name='idx_casino_logs_user_id'")
             self.assertEqual([r[4] for r in c.fetchall()], ['user_id', 'id'])
 
