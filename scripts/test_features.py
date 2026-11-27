@@ -179,7 +179,7 @@ class FeatureTests(unittest.TestCase):
         self.assertIsNotNone(bot.tree.get_command("level"))
         self.assertIsNotNone(bot.tree.get_command("setlevel"))
         audit = bot.tree.get_command("admin_audit")
-        self.assertEqual({cmd.name for cmd in audit.commands}, {"account", "resets", "pending", "health"})
+        self.assertEqual({cmd.name for cmd in audit.commands}, {"account", "resets", "pending", "health", "reconcile"})
         self.assertEqual(audit.default_permissions, discord.Permissions(administrator=True))
 
     def test_level_query_keeps_progress_without_milestone_rewards(self):
