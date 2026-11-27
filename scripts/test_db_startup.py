@@ -29,7 +29,7 @@ class DatabaseStartupTests(unittest.TestCase):
         self.assertTrue(ddl)
         self.assertEqual(len(ddl), len(set(ddl)))
         self.assertFalse(any("milestone" in call.args[0].lower() for call in cursor.execute.call_args_list))
-        self.assertEqual(conn.commit.call_count, 3)
+        self.assertEqual(conn.commit.call_count, 4)
         conn.close.assert_called_once()
 
     def test_migrations_run_once_and_do_not_rebuild_history(self):
@@ -47,7 +47,7 @@ class DatabaseStartupTests(unittest.TestCase):
         first_calls = len(cursor.execute.call_args_list)
         migrations.run_migrations(conn)
         repeated = [call.args[0] for call in cursor.execute.call_args_list[first_calls:]]
-        self.assertEqual(versions, {1, 2, 3})
+        self.assertEqual(versions, {1, 2, 3, 4})
         self.assertFalse(any(sql.startswith("ALTER TABLE") for sql in repeated))
         all_sql = [call.args[0].upper() for call in cursor.execute.call_args_list]
         self.assertFalse(any("TRUNCATE" in sql or "DELETE FROM CASINO_LOGS" in sql for sql in all_sql))

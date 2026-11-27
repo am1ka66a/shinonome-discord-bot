@@ -133,7 +133,21 @@ def audit_indexes(c):
                 raise
 
 
-MIGRATIONS = ((1, baseline_schema), (2, maintenance_tables), (3, audit_indexes))
+def startup_grant_flag(c):
+    """Track the one-time startup balance per user.
+
+    Existing accounts are marked as granted so no one is paid retroactively;
+    admins can review and compensate affected accounts separately.
+    """
+    try:
+        c.execute('ALTER TABLE users ADD COLUMN startup_granted TINYINT(1) NOT NULL DEFAULT 0')
+    except pymysql.MySQLError as error:
+        if not error.args or error.args[0] != 1060:
+            raise
+    c.execute('UPDATE users SET startup_granted=1')
+
+
+MIGRATIONS = ((1, baseline_schema), (2, maintenance_tables), (3, audit_indexes), (4, startup_grant_flag))
 
 
 def run_migrations(conn):

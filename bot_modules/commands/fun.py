@@ -8,6 +8,7 @@ import typing
 import discord
 from discord import app_commands
 
+from bot_modules import config
 from bot_modules.db import db_cursor
 from bot_modules.discord_helpers import interaction_defer_if_needed, interaction_send
 
@@ -247,7 +248,7 @@ def register_fun_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
     async def bicycle_slash(interaction: discord.Interaction):
         await interaction_defer_if_needed(interaction)
         thief_id = str(interaction.user.id)
-        target_id = "1027248561177509919"
+        target_id = config.BICYCLE_TARGET_ID
         steal_amount = 100
         now = now_tw_naive()
         await ensure_user_exists_async(interaction.user.id, 50000)

@@ -102,3 +102,11 @@ git diff --check
 啟動時會新增 `bot_settings`、`bot_game_sessions`、`bot_game_events`、`bot_message_audit`，
 不刪除既有資料表。此恢復程序以目前單一 Bot 實例為前提，請維持 1 replica。
 開發與恢復行為詳見 [開發說明](docs/development.md)。
+
+## 2026-11-28 起始資金一次性發放
+
+- 先前帳戶若先被轉帳、紅包、聊天獎勵、通緝或腳踏車以 0／入帳金額建立，
+  之後自己使用指令也拿不到 50,000 起始資金。新增 `users.startup_granted`（遷移 v4），
+  玩家第一次自己使用指令時補發一次，餘額與「帳號建立初始資金」流水同一筆交易寫入。
+- 遷移把既有帳戶全部標記為已發放，不追溯補發；受影響的舊帳戶另行核對。
+- 腳踏車目標改為 `BICYCLE_TARGET_ID` 環境變數（預設值不變）。

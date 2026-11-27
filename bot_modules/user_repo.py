@@ -1,5 +1,6 @@
 from bot_modules import config
-from bot_modules.db import call_with_db_retry, db_cursor, log_transaction
+from bot_modules.db import call_with_db_retry, db_cursor
+from bot_modules.tx_ops import log_transaction_in_tx
 
 
 def is_blacklisted(user_id):
@@ -103,17 +104,31 @@ def fetch_casino_share_stats_rows(days: int = 7):
 
 
 def ensure_user_exists(user_id, startup_balance=config.DEFAULT_STARTUP_BALANCE):
+    """建立帳戶並保證每位玩家只拿一次起始資金。
+
+    帳戶可能先被轉帳、紅包或聊天獎勵以 0 或入帳金額建立（startup_granted=0）。
+    玩家第一次以 startup_balance>0 呼叫時補發一次，餘額與流水在同一筆交易寫入。
+    """
     uid = str(user_id)
     bal = int(startup_balance)
     with db_cursor(commit=True) as c:
+        if bal <= 0:
+            c.execute("INSERT IGNORE INTO users (user_id, balance) VALUES (%s, 0)", (uid,))
+            return
         c.execute(
-            "INSERT IGNORE INTO users (user_id, balance) VALUES (%s, %s)",
+            "INSERT IGNORE INTO users (user_id, balance, startup_granted) VALUES (%s, %s, 1)",
             (uid, bal),
         )
-        inserted = c.rowcount > 0
-    # log_transaction 會另開連線，必須在歸還連線之後才呼叫
-    if inserted and bal != 0:
-        log_transaction(uid, bal, config.REASON_USER_INITIAL_BALANCE)
+        granted = c.rowcount > 0
+        if not granted:
+            c.execute(
+                "UPDATE users SET balance=COALESCE(balance,0)+%s, startup_granted=1 "
+                "WHERE user_id=%s AND startup_granted=0",
+                (bal, uid),
+            )
+            granted = c.rowcount > 0
+        if granted:
+            log_transaction_in_tx(c, uid, bal, config.REASON_USER_INITIAL_BALANCE)
 
 
 async def ensure_user_exists_async(user_id, startup_balance=config.DEFAULT_STARTUP_BALANCE):
