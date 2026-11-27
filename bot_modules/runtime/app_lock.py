@@ -24,7 +24,7 @@ DEFAULT_READ_ONLY_APP_COMMANDS: typing.Set[str] = {
     "admin_logs",
     "dev_list_guilds",
     "admin_audit account", "admin_audit resets", "admin_audit pending",
-    "admin_audit health",
+    "admin_audit health", "admin_audit reconcile",
     "profile", "cooldowns", "rank", "compare", "lottery status",
     "russian_roulette stats me", "russian_roulette stats wins", "russian_roulette stats rate",
 }
