@@ -44,6 +44,12 @@ class StateTests(unittest.TestCase):
             self.assertTrue(self.store.debit("bj:1", "bj", 1, 100, "double"))
         self.assertEqual(self.balance(), 800)
 
+    def test_stake_log_is_tagged_with_its_session(self):
+        self.store.debit("bj:1", "bj", 1, 100, "open", reason="21點開局扣款")
+        self.store.debit("bj:1", "bj", 1, 100, "double")
+        reasons = [r[0] for r in self.conn.db.execute("SELECT reason FROM logs ORDER BY id")]
+        self.assertEqual(reasons, ["21點開局扣款｜bj:1", "bj 注金｜bj:1"])
+
     def test_insufficient_balance_rolls_back_session_and_event(self):
         self.assertFalse(self.store.debit("bj:1", "bj", 1, 2000, "open"))
         self.assertEqual(self.balance(), 1000)

@@ -316,6 +316,53 @@ class AsyncRegressions(unittest.IsolatedAsyncioTestCase):
         finally:
             conn.db.close()
 
+    async def test_admin_reversal_guards_game_stakes(self):
+        conn = SqliteConnection()
+        conn.db.execute("INSERT INTO users (user_id,balance) VALUES ('3',0)")
+        conn.db.execute('CREATE TABLE bot_game_sessions (session_id TEXT PRIMARY KEY, phase TEXT)')
+        conn.db.executemany("INSERT INTO bot_game_sessions (session_id,phase) VALUES (?,?)",
+            [('bj:1', 'settled'), ('bj:2', 'active')])
+        conn.db.executemany('INSERT INTO logs (id,user_id,amount,reason) VALUES (?,?,?,?)', [
+            (1, '3', -100, '21點 All In 開局扣款｜bj:1'),
+            (2, '3', -100, '21點開局扣款｜bj:2'),
+            (3, '3', -100, '21點開局扣款'),
+            (4, '3', -100, '管理員扣除'),
+        ])
+        conn.commit()
+        try:
+            self.ctx.update(ALLOWED_HOST_IDS=[2], get_db_connection=lambda: conn)
+            admin_commands.register_admin_commands(self.bot, self.ctx)
+            callback = self.bot.tree.get_command('admin_revert_tx').callback
+
+            def revert(tx_id, force=False):
+                inter = interaction()
+                return inter, callback(inter, tx_id, '', force)
+
+            balance = lambda: conn.db.execute('SELECT balance FROM users').fetchone()[0]
+            cases = [
+                (1, False, '已經結算', 0),      # settled game: needs force
+                (2, True, '還沒結算完', 0),     # running game: never, even with force
+                (3, False, '查不到對應牌局', 0),  # untagged legacy stake: needs force
+                (4, False, '已沖正', 100),      # ordinary admin deduction reverses
+                (1, True, '已沖正', 200),
+                (3, True, '已沖正', 300),
+            ]
+            for tx_id, force, expected, after in cases:
+                inter, call = revert(tx_id, force)
+                await call
+                self.assertIn(expected, inter.followup.send.call_args.args[0], (tx_id, force))
+                self.assertEqual(balance(), after, (tx_id, force))
+        finally:
+            conn.db.close()
+
+    def test_stake_reason_helpers(self):
+        self.assertEqual(admin_commands.stake_session_id('21點開局扣款｜bj:12'), 'bj:12')
+        self.assertEqual(admin_commands.stake_session_id('duel 注金｜duel:5'), 'duel:5')
+        self.assertIsNone(admin_commands.stake_session_id('管理員重置｜actor=1｜op=2'))
+        self.assertTrue(admin_commands.is_game_stake('發送紅包扣款｜redpacket:9'))
+        self.assertTrue(admin_commands.is_game_stake('俄羅斯輪盤下注'))
+        self.assertFalse(admin_commands.is_game_stake('21點遊戲結算'))
+
     async def test_old_duel_picker_cannot_play_in_next_round(self):
         duel.register_duel_commands(self.bot, self.ctx)
         invite = nested_class(self.bot, 'duel', 'EDuelInviteView')

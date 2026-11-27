@@ -11,6 +11,50 @@ from bot_modules.db import db_cursor
 from bot_modules.tx_ops import log_transaction_in_tx
 from bot_modules.discord_helpers import interaction_defer_if_needed, interaction_send
 
+# Game stakes are paid back by the game itself (payout, push or refund).
+# Reversing one by hand after that pays the player twice.
+GAME_STAKE_REASONS = (
+    "21點開局扣款", "21點 All In 開局扣款", "21點雙倍加注", "21點分牌加注",
+    "E卡決鬥下注", "發送紅包扣款", "拋硬幣下注",
+    "俄羅斯輪盤下注", "俄羅斯輪盤加注", "俄羅斯輪盤重賽下注",
+)
+_SESSION_KINDS = ("bj", "duel", "redpacket")
+
+
+def stake_session_id(reason: str) -> typing.Optional[str]:
+    """Session id a stake row was tagged with (``原因｜bj:123``), if any."""
+    tail = str(reason or "").rsplit("｜", 1)
+    if len(tail) != 2:
+        return None
+    kind, sep, rest = tail[1].partition(":")
+    return tail[1] if sep and kind in _SESSION_KINDS and rest else None
+
+
+def is_game_stake(reason: str) -> bool:
+    head = str(reason or "").split("｜", 1)[0]
+    return head in GAME_STAKE_REASONS or head.endswith(" 注金")
+
+
+def reversal_block_reason(c, amount: int, reason: str, force: bool) -> typing.Optional[str]:
+    """Why reversing this ledger row would double-pay a game stake, or None."""
+    if amount >= 0 or not is_game_stake(reason):
+        return None
+    sid = stake_session_id(reason)
+    if sid:
+        c.execute("SELECT phase FROM bot_game_sessions WHERE session_id=%s", (sid,))
+        row = c.fetchone()
+        phase = str(row[0]) if row else None
+        if phase in ("active", "settling"):
+            return (f"這筆是遊戲 `{sid}` 的注金，該局還沒結算完。"
+                    "系統會自動結算或退回注金，請勿手動沖正。")
+        if phase == "settled" and not force:
+            return (f"這筆是遊戲 `{sid}` 的注金，該局已經結算（已派彩、平手退回或中斷退款）。"
+                    "再沖正會重複發錢；確定要沖正請加上 `force:True`。")
+    if force:
+        return None
+    return ("這筆看起來是遊戲注金，但查不到對應牌局，無法確認是否已派彩或退款。"
+            "請先用 `/admin_audit account` 查該玩家的後續流水，確認沒有退回後再加上 `force:True` 沖正。")
+
 
 def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.Any]) -> None:
     allowed_host_ids = ctx["ALLOWED_HOST_IDS"]
@@ -408,7 +452,7 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
 `/admin_balance_set` - 直接設定玩家餘額
 `/admin_user_flags` - 查看玩家關鍵狀態（通緝/監獄/良民證/黑名單等）
 `/admin_unjail` - 強制釋放玩家（可選清債/清通緝）
-`/admin_revert_tx` - 依流水 ID 進行反向沖正
+`/admin_revert_tx` - 依流水 ID 進行反向沖正（遊戲注金需確認未退回，必要時加 force）
 `/admin_logs` - 查詢含流水 ID 的最近帳務紀錄
 `/admin_audit account` - 私人查詢玩家帳戶及完整總帳（可翻頁）
 `/admin_audit resets` - 查詢重置操作者及重置前快照
@@ -657,8 +701,12 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
 
     @bot.tree.command(name="admin_revert_tx", description="[管理員] 依流水 ID 做反向沖正")
     @app_commands.default_permissions(administrator=True)
-    @app_commands.describe(tx_id="logs 的流水 ID", note="備註（選填）")
-    async def admin_revert_tx_slash(interaction: discord.Interaction, tx_id: int, note: str = ""):
+    @app_commands.describe(
+        tx_id="logs 的流水 ID",
+        note="備註（選填）",
+        force="確認遊戲注金未被退回時才勾選，會略過已結算檢查",
+    )
+    async def admin_revert_tx_slash(interaction: discord.Interaction, tx_id: int, note: str = "", force: bool = False):
         await interaction_defer_if_needed(interaction)
         if not is_slash_host(interaction):
             return await interaction_send(interaction, "❌ 你沒有權限使用此指令！", ephemeral=True)
@@ -681,6 +729,9 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
                 )
                 if c.fetchone():
                     return None, "這筆流水已經沖正過了。"
+                blocked = reversal_block_reason(c, amt, rs, bool(force))
+                if blocked:
+                    return None, blocked
                 reverse = -amt
                 if int(user[0] or 0) + reverse < 0:
                     return None, "沖正需要扣款，但目標餘額不足，已中止。"

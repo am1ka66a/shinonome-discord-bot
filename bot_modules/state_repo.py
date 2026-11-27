@@ -84,7 +84,10 @@ class GameStore:
                 if balance is None or int(balance[0]) < amount:
                     raise InsufficientFunds()
                 c.execute("UPDATE users SET balance=balance-%s WHERE user_id=%s", (amount, uid))
-                log_transaction_in_tx(c, uid, -amount, reason or f"{kind} 注金｜{sid}")
+                # Tag the stake with its session so an admin reversal can tell
+                # whether the game already paid out or refunded it.
+                label = f"{reason}｜{sid}" if reason else f"{kind} 注金｜{sid}"
+                log_transaction_in_tx(c, uid, -amount, label[:255])
                 escrow[uid] = escrow.get(uid, 0) + amount
                 data.update(payload or {})
                 c.execute("UPDATE bot_game_sessions SET escrow=%s,payload=%s,expires_at=%s WHERE session_id=%s",
