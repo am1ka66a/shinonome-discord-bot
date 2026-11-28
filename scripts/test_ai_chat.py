@@ -80,6 +80,7 @@ class PromptTests(unittest.TestCase):
         system = ai_chat.build_system("你是小咪。")
         self.assertTrue(system[0]["text"].startswith("你是小咪。"))
         self.assertIn("繁體中文", system[0]["text"])
+        self.assertIn("不講、不接、不附和任何歧視梗", system[0]["text"])
         self.assertEqual(system[0]["cache_control"], {"type": "ephemeral"})
 
     def test_user_turn_has_history_then_the_question(self):
