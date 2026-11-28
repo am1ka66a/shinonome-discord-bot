@@ -114,7 +114,7 @@ class PromptTests(unittest.TestCase):
 
 
 class HandleTests(unittest.IsolatedAsyncioTestCase):
-    async def test_reply_uses_history_and_blocks_pings(self):
+    async def test_reply_uses_history_and_pings_only_the_author(self):
         chat, client = make_chat()
         older = SimpleNamespace(author=SimpleNamespace(id=2, display_name="阿華"), clean_content="小咪在嗎")
         mine = SimpleNamespace(author=BOT, clean_content="在喵")
@@ -126,7 +126,11 @@ class HandleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("阿華：小咪在嗎\n你：在喵", kwargs["messages"][0]["content"])
         msg.reply.assert_awaited_once()
         self.assertEqual(msg.reply.await_args.args[0], "喵～")
-        self.assertFalse(msg.reply.await_args.kwargs["allowed_mentions"].everyone)
+        kw = msg.reply.await_args.kwargs
+        self.assertTrue(kw["mention_author"])
+        pings = kw["allowed_mentions"]
+        self.assertTrue(pings.replied_user)
+        self.assertEqual((pings.everyone, pings.users, pings.roles), (False, False, False))
 
     async def test_cooldown_reacts_instead_of_calling_api(self):
         chat, client = make_chat()
