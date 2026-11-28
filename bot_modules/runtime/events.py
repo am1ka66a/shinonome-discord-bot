@@ -21,6 +21,7 @@ def register_events(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Dict[str, 
     relay_user_message_to_staff_channel = ctx["relay_user_message_to_staff_channel"]
     process_on_message_activity_sync = ctx["process_on_message_activity_sync"]
     cleanup_local_caches = ctx.get("cleanup_local_caches")
+    ai_chat = ctx.get("ai_chat")
     finalize_due_lottery_rounds_async = ctx.get("finalize_due_lottery_rounds_async")
     lottery_draw_check_seconds = float(ctx.get("LOTTERY_DRAW_CHECK_SECONDS", 3600))
 
@@ -210,6 +211,12 @@ def register_events(bot, ctx: typing.Dict[str, typing.Any]) -> typing.Dict[str, 
                 return
             if not await allowed(bot, message.author.id):
                 return
+            if (
+                ai_chat is not None
+                and message.channel.id != dm_relay_channel_id
+                and ai_chat.wants(message, bot.user)
+            ):
+                ai_chat.schedule(message, bot.user)
             async with activity_locks.hold(message.author.id):
                 user_id = str(message.author.id)
                 now = now_tw_naive()

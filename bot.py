@@ -14,6 +14,7 @@ from bot_modules import domain_sync
 from bot_modules import discord_helpers
 from bot_modules import discord_logging
 from bot_modules import assembly
+from bot_modules import ai_chat
 from bot_modules import state_repo
 from bot_modules.runtime import policy
 from bot_modules.async_bridge import build_async_wrappers
@@ -242,6 +243,7 @@ _event_tasks = register_events(
         "relay_user_message_to_staff_channel": _relay_handlers["relay_user_message_to_staff_channel"],
         "process_on_message_activity_sync": process_on_message_activity_sync,
         "cleanup_local_caches": snapshot_cache.cleanup_local_caches,
+        "ai_chat": ai_chat.create_ai_chat(logger),
         "DM_RELAY_CHANNEL_ID": DM_RELAY_CHANNEL_ID,
         "DELETE_LOG_CHANNEL_ID": DELETE_LOG_CHANNEL_ID,
         "MSG_DB_FLUSH_EVERY_SECONDS": MSG_DB_FLUSH_EVERY_SECONDS,
