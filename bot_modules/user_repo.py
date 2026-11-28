@@ -61,6 +61,24 @@ def fetch_balance_leaderboard_snapshot():
     return call_with_db_retry(_fetch_balance_leaderboard_snapshot_once)
 
 
+def _fetch_ai_balances_once(user_ids, top: int = 5):
+    ids = sorted({str(uid) for uid in user_ids})
+    with db_cursor() as c:
+        balances = {}
+        if ids:
+            marks = ",".join(["%s"] * len(ids))
+            c.execute(f"SELECT user_id, balance FROM users WHERE user_id IN ({marks})", tuple(ids))
+            balances = {str(uid): int(bal or 0) for uid, bal in c.fetchall()}
+        c.execute("SELECT user_id, balance FROM users ORDER BY balance DESC LIMIT %s", (int(top),))
+        leaders = [(str(uid), int(bal or 0)) for uid, bal in c.fetchall()]
+    return balances, leaders
+
+
+def fetch_ai_balances(user_ids, top: int = 5):
+    """Balances of the given users plus the top of the balance board, for the AI chat (read only)."""
+    return call_with_db_retry(lambda: _fetch_ai_balances_once(user_ids, top))
+
+
 def _fetch_level_leaderboard_snapshot_once():
     with db_cursor() as c:
         c.execute("SELECT user_id, level, exp FROM users ORDER BY level DESC, exp DESC")
