@@ -441,6 +441,8 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
 `/admin_audit resets` - 查詢重置操作者及重置前快照
 `/admin_audit pending` - 查詢待結算或逾時遊戲
 `/admin_audit health` - 私人查看連線延遲、執行權檢查及背景任務
+`/admin_audit reconcile` - 比對餘額與總帳流水
+`/admin_audit ai` - 查看 AI 聊天設定、今日用量與估計花費
 `/admin_reward_grant` - 全體活動獎勵（可同時發幣 + 發 EXP）
 `/admin_feature_toggle` - 線上開關功能（rob/bj/duel/redpacket/share）
 """

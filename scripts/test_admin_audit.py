@@ -111,6 +111,20 @@ class AuditUITests(unittest.IsolatedAsyncioTestCase):
             worker.assert_not_awaited()
         self.ctx['resolve_slash_target'].assert_not_awaited()
 
+    async def test_ai_panel_reports_disabled_or_usage_without_database(self):
+        group = self.bot.tree.get_command('admin_audit')
+        with patch.object(ui.asyncio, 'to_thread', new=AsyncMock()) as worker:
+            inter = interaction()
+            await group.get_command('ai').callback(inter)
+            self.assertIn('未啟用', inter.followup.send.call_args.kwargs['embed'].description)
+            self.bot.ai_chat = SimpleNamespace(status_lines=lambda: ['今日次數 3 / 300'])
+            inter = interaction()
+            await group.get_command('ai').callback(inter)
+            worker.assert_not_awaited()
+        sent = inter.followup.send.call_args.kwargs
+        self.assertTrue(sent['ephemeral'])
+        self.assertIn('今日次數 3 / 300', sent['embed'].description)
+
     async def test_health_is_private_and_available_without_database_queries(self):
         import asyncio
         self.bot._db_ready_event=asyncio.Event()

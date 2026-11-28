@@ -318,4 +318,19 @@ def register_admin_audit_commands(bot, ctx):
         await interaction_send(interaction, embed=embed, ephemeral=True,
                                allowed_mentions=discord.AllowedMentions.none())
 
+    @group.command(name="ai", description="查看 AI 聊天的設定、今日用量與估計花費")
+    async def ai(interaction: discord.Interaction):
+        if not await authorize(interaction):
+            return
+        chat = getattr(bot, "ai_chat", None)
+        embed = discord.Embed(title="AI 聊天狀態", color=0x5865F2)
+        if chat is None:
+            embed.description = ("未啟用：Railway 沒有設定 `ANTHROPIC_API_KEY`，或 `AI_CHAT_ENABLED` 設為 false。\n"
+                                 "設定後需重新部署才會生效。")
+        else:
+            embed.description = "\n".join(chat.status_lines())[:4000]
+        embed.set_footer(text="用量記在記憶體，重啟後歸零；實際帳單以 Anthropic Console 為準")
+        await interaction_send(interaction, embed=embed, ephemeral=True,
+                               allowed_mentions=discord.AllowedMentions.none())
+
     bot.tree.add_command(group)

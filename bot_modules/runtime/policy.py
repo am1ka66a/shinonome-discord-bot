@@ -12,7 +12,7 @@ READ_COMMANDS = {
     "casino_stats", "share_stats", "wanted_status", "wanted_list", "good_citizen_list",
     "profile", "cooldowns", "compare", "rank",
     "admin_audit account", "admin_audit resets", "admin_audit pending",
-    "admin_audit health", "admin_audit reconcile",
+    "admin_audit health", "admin_audit reconcile", "admin_audit ai",
 }
 
 

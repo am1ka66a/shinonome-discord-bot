@@ -230,6 +230,8 @@ _relay_handlers = relay.register_relay(
     },
 )
 
+bot.ai_chat = ai_chat.create_ai_chat(logger)
+
 _event_tasks = register_events(
     bot,
     {
@@ -243,7 +245,7 @@ _event_tasks = register_events(
         "relay_user_message_to_staff_channel": _relay_handlers["relay_user_message_to_staff_channel"],
         "process_on_message_activity_sync": process_on_message_activity_sync,
         "cleanup_local_caches": snapshot_cache.cleanup_local_caches,
-        "ai_chat": ai_chat.create_ai_chat(logger),
+        "ai_chat": bot.ai_chat,
         "DM_RELAY_CHANNEL_ID": DM_RELAY_CHANNEL_ID,
         "DELETE_LOG_CHANNEL_ID": DELETE_LOG_CHANNEL_ID,
         "MSG_DB_FLUSH_EVERY_SECONDS": MSG_DB_FLUSH_EVERY_SECONDS,
