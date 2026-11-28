@@ -82,7 +82,8 @@ class PromptTests(unittest.TestCase):
     def test_persona_comes_before_rules_and_is_cached(self):
         system = ai_chat.build_system("你是小咪。")
         self.assertTrue(system[0]["text"].startswith("你是小咪。"))
-        self.assertIn("繁體中文", system[0]["text"])
+        self.assertIn("只用繁體中文回覆，不用簡體字", system[0]["text"])
+        self.assertNotIn("除非對方用其他語言", system[0]["text"])
         self.assertIn("不講、不接、不附和任何歧視梗", system[0]["text"])
         self.assertEqual(system[0]["cache_control"], {"type": "ephemeral"})
 
