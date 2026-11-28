@@ -7,7 +7,7 @@ import pymysql
 from bot_modules import config
 from bot_modules.db import begin_transaction, db_conn, db_cursor
 from bot_modules.social_repo import lottery_day_key
-from bot_modules.tx_ops import log_transaction_in_tx
+from bot_modules.tx_ops import change_balance
 
 
 def init_lottery_tables(cursor) -> None:
@@ -102,11 +102,7 @@ def finalize_due_rounds_sync(now: typing.Optional[datetime.datetime] = None) -> 
                             break
                     c.execute("SELECT user_id FROM users WHERE user_id=%s FOR UPDATE", (winner_uid,))
                     if c.fetchone():
-                        c.execute(
-                            "UPDATE users SET balance=balance+%s WHERE user_id=%s",
-                            (pool, winner_uid),
-                        )
-                        log_transaction_in_tx(c, winner_uid, pool, f"日彩池開獎（{key_str}）")
+                        change_balance(c, winner_uid, pool, f"日彩池開獎（{key_str}）")
             c.execute(
                 "UPDATE lottery_rounds SET winner_id=%s, drawn_at=%s WHERE week_key=%s",
                 (winner_uid, now, key_str),
@@ -163,8 +159,7 @@ def buy_lottery_tickets_sync(
         if balance < cost:
             return {"ok": False, "reason": "insufficient", "balance": balance, "cost": cost}
 
-        c.execute("UPDATE users SET balance=balance-%s WHERE user_id=%s", (cost, uid))
-        log_transaction_in_tx(c, uid, -cost, f"日彩池購票（{day_key} x{tickets}）")
+        change_balance(c, uid, -cost, f"日彩池購票（{day_key} x{tickets}）")
         c.execute(
             "INSERT INTO lottery_entries (week_key, user_id, tickets, amount_paid) VALUES (%s, %s, %s, %s) "
             "ON DUPLICATE KEY UPDATE tickets=tickets+%s, amount_paid=amount_paid+%s",

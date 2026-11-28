@@ -1,6 +1,6 @@
 from bot_modules import config
 from bot_modules.db import call_with_db_retry, db_cursor
-from bot_modules.tx_ops import log_transaction_in_tx
+from bot_modules.tx_ops import change_balance
 
 
 def is_blacklisted(user_id):
@@ -116,19 +116,15 @@ def ensure_user_exists(user_id, startup_balance=config.DEFAULT_STARTUP_BALANCE):
             c.execute("INSERT IGNORE INTO users (user_id, balance) VALUES (%s, 0)", (uid,))
             return
         c.execute(
-            "INSERT IGNORE INTO users (user_id, balance, startup_granted) VALUES (%s, %s, 1)",
-            (uid, bal),
+            "INSERT IGNORE INTO users (user_id, balance, startup_granted) VALUES (%s, 0, 1)",
+            (uid,),
         )
         granted = c.rowcount > 0
         if not granted:
-            c.execute(
-                "UPDATE users SET balance=COALESCE(balance,0)+%s, startup_granted=1 "
-                "WHERE user_id=%s AND startup_granted=0",
-                (bal, uid),
-            )
+            c.execute("UPDATE users SET startup_granted=1 WHERE user_id=%s AND startup_granted=0", (uid,))
             granted = c.rowcount > 0
         if granted:
-            log_transaction_in_tx(c, uid, bal, config.REASON_USER_INITIAL_BALANCE)
+            change_balance(c, uid, bal, config.REASON_USER_INITIAL_BALANCE)
 
 
 async def ensure_user_exists_async(user_id, startup_balance=config.DEFAULT_STARTUP_BALANCE):

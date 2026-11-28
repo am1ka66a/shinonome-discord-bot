@@ -2,6 +2,7 @@ import typing
 import random
 
 from bot_modules.db import db_conn, db_cursor
+from bot_modules.tx_ops import change_balance, get_locked_user_balance
 
 
 def roll_gamble_exp_from_bet(gamble_exp_min: int, gamble_exp_max: int, main_bet: int) -> int:
@@ -92,16 +93,19 @@ def update_game_result(
         win_int = 1 if is_win else 0
         if is_push:
             c.execute(
-                "UPDATE users SET balance=GREATEST(0, balance+%s), total_profit=total_profit+%s WHERE user_id=%s",
-                (balance_delta, profit_delta, str(user_id)),
+                "UPDATE users SET total_profit=total_profit+%s WHERE user_id=%s",
+                (profit_delta, str(user_id)),
             )
         else:
             c.execute(
-                "UPDATE users SET balance=GREATEST(0, balance+%s), total_profit=total_profit+%s, total_games=total_games+1, wins=wins+%s WHERE user_id=%s",
-                (balance_delta, profit_delta, win_int, str(user_id)),
+                "UPDATE users SET total_profit=total_profit+%s, total_games=total_games+1, wins=wins+%s WHERE user_id=%s",
+                (profit_delta, win_int, str(user_id)),
             )
-        if balance_delta != 0:
-            log_transaction_in_tx(c, user_id, balance_delta, "21點遊戲結算")
+        delta = int(balance_delta or 0)
+        if delta < 0:
+            # Never below zero; log only what was actually taken.
+            delta = max(delta, -get_locked_user_balance(c, user_id))
+        change_balance(c, user_id, delta, "21點遊戲結算")
 
     # 分潤會另開連線，必須在歸還連線之後才呼叫，否則可能把連線池佔滿
     if (
@@ -147,13 +151,11 @@ def settle_coinflip_sync(
 
         outcome = random.choice(sides)
         win = picked_side == outcome
-        c.execute("UPDATE users SET balance=balance-%s WHERE user_id=%s", (bet, uid))
-        log_transaction_in_tx(c, uid, -bet, "拋硬幣下注")
+        change_balance(c, uid, -bet, "拋硬幣下注")
         profit_delta = -bet
         if win:
             payout = bet * 2
-            c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (payout, uid))
-            log_transaction_in_tx(c, uid, payout, "拋硬幣獲勝")
+            change_balance(c, uid, payout, "拋硬幣獲勝")
             profit_delta = bet
             c.execute(
                 "UPDATE users SET total_games=total_games+1, wins=wins+1, total_profit=total_profit+%s WHERE user_id=%s",

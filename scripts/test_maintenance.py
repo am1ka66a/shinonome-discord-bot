@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bot_modules import maintenance, state_repo
+from bot_modules import tx_ops
 from bot_modules.db import db_cursor
 from test_regressions import SqliteConnection
 
@@ -49,12 +50,12 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(self.conn.db.execute("SELECT wins FROM users ORDER BY user_id").fetchall(), [(2,), (3,)])
 
     def test_failure_rolls_back_snapshots_balances_and_ledger(self):
-        real_log = maintenance.log_transaction_in_tx
+        real_log = tx_ops.log_transaction_in_tx
         def fail_second(c, uid, *args):
             if uid == "2":
                 raise RuntimeError("injected failure")
             return real_log(c, uid, *args)
-        with patch.object(maintenance, "log_transaction_in_tx", side_effect=fail_second), self.assertRaises(RuntimeError):
+        with patch.object(tx_ops, "log_transaction_in_tx", side_effect=fail_second), self.assertRaises(RuntimeError):
             maintenance.reset_balances("fail", 123, 0)
         self.assertEqual(self.balances(), [(1000,), (2000,)])
         for table in ("logs", "casino_logs", "bot_admin_snapshots", "bot_admin_operations"):

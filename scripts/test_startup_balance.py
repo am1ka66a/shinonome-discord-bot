@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from bot_modules import config, economy_service, user_repo
+from bot_modules import tx_ops
 
 
 class _Conn:
@@ -77,7 +78,7 @@ class StartupBalance(unittest.TestCase):
         self.assertEqual(self.conn.startup_logs('2'), 1)
 
     def test_account_created_by_credit_gets_startup_later(self):
-        economy_service.credit_user(lambda: self.conn, user_repo.log_transaction_in_tx, 3, 120, 'redpacket')
+        economy_service.credit_user(lambda: self.conn, tx_ops.log_transaction_in_tx, 3, 120, 'redpacket')
         user_repo.ensure_user_exists(3, 50_000)
         self.assertEqual(self.conn.row('3'), (50_120, 1))
         self.assertEqual(self.conn.startup_logs('3'), 1)
@@ -89,7 +90,7 @@ class StartupBalance(unittest.TestCase):
         self.assertEqual(self.conn.startup_logs('4'), 0)
 
     def test_startup_and_ledger_roll_back_together(self):
-        with patch.object(user_repo, 'log_transaction_in_tx', side_effect=RuntimeError('log failed')):
+        with patch.object(tx_ops, 'log_transaction_in_tx', side_effect=RuntimeError('log failed')):
             with self.assertRaises(RuntimeError):
                 user_repo.ensure_user_exists(5, 50_000)
         self.assertIsNone(self.conn.row('5'))

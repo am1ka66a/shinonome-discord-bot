@@ -7,7 +7,7 @@ import time
 import uuid
 
 from bot_modules.db import db_cursor
-from bot_modules.tx_ops import lock_user_rows, log_transaction_in_tx
+from bot_modules.tx_ops import change_balance, lock_user_rows
 
 
 def init_state_tables(c):
@@ -83,11 +83,10 @@ class GameStore:
                 balance = c.fetchone()
                 if balance is None or int(balance[0]) < amount:
                     raise InsufficientFunds()
-                c.execute("UPDATE users SET balance=balance-%s WHERE user_id=%s", (amount, uid))
                 # Tag the stake with its session so an admin reversal can tell
                 # whether the game already paid out or refunded it.
                 label = f"{reason}｜{sid}" if reason else f"{kind} 注金｜{sid}"
-                log_transaction_in_tx(c, uid, -amount, label[:255])
+                change_balance(c, uid, -amount, label[:255])
                 escrow[uid] = escrow.get(uid, 0) + amount
                 data.update(payload or {})
                 c.execute("UPDATE bot_game_sessions SET escrow=%s,payload=%s,expires_at=%s WHERE session_id=%s",
@@ -136,15 +135,14 @@ class GameStore:
             for uid in ids:
                 amount = int(intent["credits"].get(uid, 0))
                 if amount:
-                    c.execute("UPDATE users SET balance=COALESCE(balance,0)+%s WHERE user_id=%s", (amount, uid))
                     reason = intent["reason"].get(uid, "遊戲結算") if isinstance(intent["reason"], dict) else intent["reason"]
                     if isinstance(reason, list):
                         if sum(int(part[0]) for part in reason) != amount:
                             raise ValueError("結算與流水金額不一致")
                         for delta, label in reason:
-                            log_transaction_in_tx(c, uid, int(delta), label)
+                            change_balance(c, uid, int(delta), label)
                     else:
-                        log_transaction_in_tx(c, uid, amount, reason)
+                        change_balance(c, uid, amount, reason)
                 result = intent["results"].get(uid)
                 if result:
                     win, profit, push = result
@@ -186,8 +184,7 @@ class GameStore:
             amount = left if count == 1 else random.randint(1, max(1, min(left - count + 1, int(left * .4))))
             c.execute("INSERT IGNORE INTO users (user_id,balance) VALUES (%s,0)", (uid,))
             lock_user_rows(c, [uid])
-            c.execute("UPDATE users SET balance=COALESCE(balance,0)+%s WHERE user_id=%s", (amount, uid))
-            log_transaction_in_tx(c, uid, amount, f"搶紅包｜{sid}")
+            change_balance(c, uid, amount, f"搶紅包｜{sid}")
             creator = str(data["creator_id"])
             escrow[creator] -= amount
             claimed[uid] = amount

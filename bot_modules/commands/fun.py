@@ -10,6 +10,7 @@ from discord import app_commands
 
 from bot_modules import config
 from bot_modules.db import db_cursor
+from bot_modules.tx_ops import change_balance
 from bot_modules.discord_helpers import interaction_defer_if_needed, interaction_send
 
 
@@ -270,18 +271,10 @@ def register_fun_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                     c.execute("UPDATE users SET last_bicycle=%s WHERE user_id=%s", (now, thief_id))
                     outcome = "小黑龜再練練 連個腳踏車都偷不走"
                 else:
-                    c.execute(
-                        "UPDATE users SET balance=balance-%s WHERE user_id=%s AND balance >= %s",
-                        (steal_amount, target_id, steal_amount),
-                    )
-                    if c.rowcount > 0:
-                        c.execute(
-                            "UPDATE users SET balance=balance+%s WHERE user_id=%s",
-                            (steal_amount, thief_id),
-                        )
+                    if change_balance(c, target_id, -steal_amount, f"腳踏車被偷（偷車者:{thief_id}）",
+                                      require_funds=True):
+                        change_balance(c, thief_id, steal_amount, f"偷走奈音腳踏車（目標:{target_id}）")
                         c.execute("UPDATE users SET last_bicycle=%s WHERE user_id=%s", (now, thief_id))
-                        log_transaction_in_tx(c, target_id, -steal_amount, f"腳踏車被偷（偷車者:{thief_id}）")
-                        log_transaction_in_tx(c, thief_id, steal_amount, f"偷走奈音腳踏車（目標:{target_id}）")
                         outcome = "你成功偷走了奈音的腳踏車!"
                     else:
                         c.execute("UPDATE users SET last_bicycle=%s WHERE user_id=%s", (now, thief_id))

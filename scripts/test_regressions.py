@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT))
 import discord
 from discord.ext import commands
 from bot_modules import admin_commands, bot_core, config, economy_service, economy_repo, game_repo, lottery_repo, rr_match_repo
+from bot_modules import tx_ops
 from bot_modules.commands import economy, duel, blackjack, fun, russian_roulette, wanted
 from bot_modules.discord_helpers import interaction_defer_if_needed, interaction_send
 from bot_modules.runtime import app_lock, policy
@@ -460,8 +461,8 @@ class DatabaseRegressions(unittest.TestCase):
         self.assertEqual(self.conn.db.execute('SELECT SUM(amount) FROM logs').fetchone()[0], 200)
 
     def test_credit_and_log_roll_back_together(self):
-        with self.assertRaises(RuntimeError):
-            economy_service.credit_user(lambda: self.conn, Mock(side_effect=RuntimeError('log failed')), 123, 100, 'redpacket')
+        with self.assertRaises(RuntimeError),              patch.object(tx_ops, 'log_transaction_in_tx', side_effect=RuntimeError('log failed')):
+            economy_service.credit_user(lambda: self.conn, None, 123, 100, 'redpacket')
         self.assertIsNone(self.conn.db.execute('SELECT * FROM users').fetchone())
 
     def test_inflation_query_releases_connection_before_beg_transaction(self):
@@ -490,7 +491,7 @@ class DatabaseRegressions(unittest.TestCase):
         conn.cursor.return_value = cursor
         with patch.object(lottery_repo, 'get_db_connection', create=True), \
              patch('bot_modules.db.get_db_connection', return_value=conn), \
-             patch.object(lottery_repo, 'log_transaction_in_tx') as log:
+             patch.object(tx_ops, 'log_transaction_in_tx') as log:
             result = lottery_repo.finalize_due_rounds_sync(datetime.datetime(2026, 10, 22))
         self.assertEqual(result, [])
         log.assert_not_called()
@@ -513,7 +514,7 @@ class DatabaseRegressions(unittest.TestCase):
                     results={1: (True, 100), 2: (False, -100)}, reason='test',
                     payload={'participant_ids': [1, 2]}, finished=True)
         with patch('bot_modules.db.get_db_connection', return_value=self.conn):
-            with patch.object(rr_match_repo, 'log_transaction_in_tx', side_effect=RuntimeError('logging failed')):
+            with patch.object(tx_ops, 'log_transaction_in_tx', side_effect=RuntimeError('logging failed')):
                 with self.assertRaises(RuntimeError):
                     rr_match_repo.settle_event_sync(**args)
             self.assertEqual(self.conn.db.execute('SELECT balance FROM users WHERE user_id="1"').fetchone()[0], 0)

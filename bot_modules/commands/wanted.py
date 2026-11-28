@@ -7,6 +7,7 @@ import discord
 from discord import app_commands
 
 from bot_modules.db import db_cursor
+from bot_modules.tx_ops import change_balance
 from bot_modules.runtime import snapshot_cache
 
 
@@ -370,10 +371,10 @@ def register_wanted_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                         raise _AbortWithMessage(
                             f"❌ 每次追捕須支付 **`{COP_HUNT_FEE:,}`** 東雲幣，你的餘額不足。"
                         )
-                    c.execute(
-                        "UPDATE users SET balance=balance-%s WHERE user_id=%s",
-                        (COP_HUNT_FEE, cop_id),
-                    )
+                    if not change_balance(c, cop_id, -COP_HUNT_FEE, "追捕行動費用", require_funds=True):
+                        raise _AbortWithMessage(
+                            f"❌ 每次追捕須支付 **`{COP_HUNT_FEE:,}`** 東雲幣，你的餘額不足。"
+                        )
 
                     capture_chance_raw = (
                         COP_HUNT_CAPTURE_BASE_PCT
@@ -388,7 +389,6 @@ def register_wanted_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                         "INSERT INTO wanted_log (criminal_id, cop_id, wanted_stars, caught) VALUES (%s, %s, %s, %s)",
                         (criminal_id, cop_id, wanted_stars, 1 if is_caught else 0),
                     )
-                    log_transaction_in_tx(c, cop_id, -COP_HUNT_FEE, "追捕行動費用")
 
                     if is_caught:
                         last_five_total, rob_count = rob_history_total_from_raw(criminal_last_five_raw)
@@ -409,19 +409,15 @@ def register_wanted_commands(bot, ctx: typing.Dict[str, typing.Any]) -> None:
                         total_bail_needed = BAIL_COST + bail_debt_after
 
                         c.execute(
-                            """UPDATE users SET in_prison=1, prison_start=%s,
-                               balance=GREATEST(0, balance-%s), arrest_count=arrest_count+1,
+                            """UPDATE users SET in_prison=1, prison_start=%s, arrest_count=arrest_count+1,
                                wanted_stars=0, wanted_hunted_count=0, last_five_robs=NULL,
                                bail_debt=COALESCE(bail_debt,0)+%s
                                WHERE user_id=%s""",
-                            (now, confiscated_amount, conf_shortfall, criminal_id),
+                            (now, conf_shortfall, criminal_id),
                         )
-                        c.execute(
-                            "UPDATE users SET balance=balance+%s WHERE user_id=%s",
-                            (cop_reward, cop_id),
-                        )
-                        log_transaction_in_tx(c, criminal_id, -confiscated_amount, f"被警察逮捕沒收 {confiscated_amount:,}")
-                        log_transaction_in_tx(c, cop_id, cop_reward, f"逮捕通緝犯 {criminal_user.id} 贓款")
+                        # confiscated_amount <= criminal_balance, read under the row lock.
+                        change_balance(c, criminal_id, -confiscated_amount, f"被警察逮捕沒收 {confiscated_amount:,}")
+                        change_balance(c, cop_id, cop_reward, f"逮捕通緝犯 {criminal_user.id} 贓款")
                         c.execute(
                             """INSERT INTO prison_records
                                (criminal_id, cop_id, wanted_stars, confiscated_amount, cop_reward, bail_cost, arrested_at)

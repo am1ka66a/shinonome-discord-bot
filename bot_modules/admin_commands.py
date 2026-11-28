@@ -8,7 +8,7 @@ from discord import app_commands
 
 from bot_modules import maintenance
 from bot_modules.db import db_cursor
-from bot_modules.tx_ops import log_transaction_in_tx
+from bot_modules.tx_ops import change_balance
 from bot_modules.discord_helpers import interaction_defer_if_needed, interaction_send
 
 # Game stakes are paid back by the game itself (payout, push or refund).
@@ -106,11 +106,7 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
             c.execute("SELECT COALESCE(balance,0) FROM users WHERE user_id=%s FOR UPDATE", (uid,))
             row = c.fetchone()
             before_bal = int((row[0] if row else 0) or 0)
-            c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (int(amount), uid))
-            c.execute("SELECT COALESCE(balance,0) FROM users WHERE user_id=%s", (uid,))
-            row2 = c.fetchone()
-            after_bal = int((row2[0] if row2 else before_bal + int(amount)) or 0)
-            log_transaction_in_tx(c, uid, after_bal - before_bal, reason)
+            after_bal = before_bal + int(amount) if change_balance(c, uid, int(amount), reason) else before_bal
         return before_bal, after_bal
 
     def admin_take_balance_sync(target_user_id: typing.Union[int, str], amount: int, reason: str) -> typing.Tuple[int, int]:
@@ -119,11 +115,9 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
             c.execute("SELECT COALESCE(balance,0) FROM users WHERE user_id=%s FOR UPDATE", (uid,))
             row = c.fetchone()
             before_bal = int((row[0] if row else 0) or 0)
-            c.execute("UPDATE users SET balance=GREATEST(0, balance-%s) WHERE user_id=%s", (int(amount), uid))
-            c.execute("SELECT COALESCE(balance,0) FROM users WHERE user_id=%s", (uid,))
-            row2 = c.fetchone()
-            after_bal = int((row2[0] if row2 else max(0, before_bal - int(amount))) or 0)
-            log_transaction_in_tx(c, uid, after_bal - before_bal, reason)
+            # Never below zero; the ledger records only what was actually taken.
+            taken = min(int(amount), before_bal)
+            after_bal = before_bal - taken if change_balance(c, uid, -taken, reason) else before_bal
         return before_bal, after_bal
 
     def admin_set_balance_sync(target_user_id: typing.Union[int, str], amount: int, reason: str) -> int:
@@ -132,12 +126,11 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
             c.execute("SELECT COALESCE(balance,0) FROM users WHERE user_id=%s FOR UPDATE", (uid,))
             row = c.fetchone()
             before_bal = int((row[0] if row else 0) or 0)
-            c.execute("UPDATE users SET balance=%s WHERE user_id=%s", (int(amount), uid))
-            log_transaction_in_tx(c, uid, int(amount) - before_bal, reason)
+            change_balance(c, uid, int(amount) - before_bal, reason)
         return before_bal
 
     def grant_mass_rewards_sync(coins: int, exp: int, note_text: str) -> typing.Dict[str, int]:
-        """批次發放：幣走 set-based SQL；EXP 走 executemany 批次更新並同步 level。"""
+        """批次發放：幣逐人走 change_balance（餘額與兩份流水同交易）；EXP 走 executemany 批次更新並同步 level。"""
         with db_cursor(commit=True, connect=get_db_connection) as c:
             c.execute("SELECT user_id, COALESCE(exp,0), COALESCE(level,1) FROM users")
             rows = c.fetchall()
@@ -150,18 +143,8 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
                 reason = "管理員活動發幣"
                 if note_text:
                     reason += f"（備註: {note_text}）"
-                c.execute("UPDATE users SET balance=balance+%s", (int(coins),))
-                c.execute(
-                    "INSERT INTO logs (user_id, amount, reason) "
-                    "SELECT user_id, %s, %s FROM users",
-                    (int(coins), reason),
-                )
-                # 全期總金流鏡像：此批次不綁 source_log_id，避免逐筆回填造成額外成本。
-                c.execute(
-                    "INSERT INTO casino_logs (user_id, amount, reason) "
-                    "SELECT user_id, %s, %s FROM users",
-                    (int(coins), reason),
-                )
+                for uid, _, _ in target_rows:
+                    change_balance(c, uid, int(coins), reason)
 
             leveled_up_users = 0
             if exp > 0:
@@ -735,8 +718,7 @@ def register_admin_commands(bot: discord.Client, ctx: typing.Dict[str, typing.An
                 reverse = -amt
                 if int(user[0] or 0) + reverse < 0:
                     return None, "沖正需要扣款，但目標餘額不足，已中止。"
-                c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (reverse, uid))
-                log_transaction_in_tx(c, uid, reverse, f"管理員沖正 tx#{_id}（原: {rs}）"[:255])
+                change_balance(c, uid, reverse, f"管理員沖正 tx#{_id}（原: {rs}）"[:255])
                 return (_id, uid, amt, reverse), None
         result, error = await asyncio.to_thread(db_work)
         if error:

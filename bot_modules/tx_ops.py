@@ -22,6 +22,32 @@ def get_locked_user_balance(c, user_id: typing.Union[int, str]) -> int:
     return int((row[0] if row else 0) or 0)
 
 
+def change_balance(c, user_id, delta, reason, *, require_funds=False, create=False) -> bool:
+    """The only place that moves a balance: update it and write both ledgers together.
+
+    Runs inside the caller's transaction. ``require_funds`` turns a debit into a
+    conditional one (``balance >= amount``); ``create`` makes a missing account
+    first. Returns False, writing nothing, when the account is missing or short.
+    """
+    delta = int(delta or 0)
+    uid = str(user_id)
+    if delta == 0:
+        return True
+    if create:
+        c.execute("INSERT IGNORE INTO users (user_id, balance) VALUES (%s, 0)", (uid,))
+    if delta < 0 and require_funds:
+        c.execute(
+            "UPDATE users SET balance=COALESCE(balance,0)+%s WHERE user_id=%s AND COALESCE(balance,0) >= %s",
+            (delta, uid, -delta),
+        )
+    else:
+        c.execute("UPDATE users SET balance=COALESCE(balance,0)+%s WHERE user_id=%s", (delta, uid))
+    if c.rowcount == 0:
+        return False
+    log_transaction_in_tx(c, uid, delta, reason)
+    return True
+
+
 def log_transaction_in_tx(c, user_id, amount, reason):
     """Write logs + casino_logs in the same transaction."""
     amount = int(amount or 0)

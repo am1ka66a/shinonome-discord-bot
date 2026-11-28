@@ -13,7 +13,7 @@ from bot_modules import rob_repo
 from bot_modules import social_repo
 from bot_modules import wanted_repo
 from bot_modules.db import db_cursor, get_db_connection
-from bot_modules.tx_ops import get_locked_user_balance, lock_user_rows, log_transaction_in_tx
+from bot_modules.tx_ops import change_balance, get_locked_user_balance, lock_user_rows, log_transaction_in_tx
 from bot_modules.user_repo import ensure_user_exists, fetch_casino_share_stats_rows, get_user_stats
 
 MAX_LEVEL = config.MAX_LEVEL
@@ -261,17 +261,12 @@ def toggle_good_citizen_sync(user_id: int, now: datetime.datetime) -> typing.Dic
             return {"ok": False, "reason": "insufficient", "balance": bal}
         next_active = 0 if cert_active else 1
         reason = "啟用良民證（防搶）" if next_active else "解除良民證（取消防搶）"
-        c.execute(
-            """UPDATE users
-               SET balance=balance-%s,
-                   good_citizen_cert_active=%s,
-                   last_good_citizen_cert_action=%s
-               WHERE user_id=%s AND balance >= %s""",
-            (GOOD_CITIZEN_CERT_COST, next_active, now, uid, GOOD_CITIZEN_CERT_COST),
-        )
-        if c.rowcount == 0:
+        if not change_balance(c, uid, -GOOD_CITIZEN_CERT_COST, reason, require_funds=True):
             return {"ok": False, "reason": "deduct_failed"}
-        log_transaction_in_tx(c, user_id, -GOOD_CITIZEN_CERT_COST, reason)
+        c.execute(
+            "UPDATE users SET good_citizen_cert_active=%s, last_good_citizen_cert_action=%s WHERE user_id=%s",
+            (next_active, now, uid),
+        )
     return {"ok": True, "next_active": next_active, "new_balance": bal - GOOD_CITIZEN_CERT_COST}
 
 
@@ -390,19 +385,9 @@ def settle_duel_payouts_with_log(challenger_id, opponent_id, a_amt, b_amt, s_a, 
     with db_cursor(commit=True) as cur:
         lock_user_rows(cur, [challenger_id, opponent_id])
         if a_amt > 0:
-            cur.execute(
-                "UPDATE users SET balance=balance+%s WHERE user_id=%s",
-                (a_amt, str(challenger_id)),
-            )
+            change_balance(cur, challenger_id, a_amt, f"E卡決鬥分配（積分 {s_a}:{s_b}）")
         if b_amt > 0:
-            cur.execute(
-                "UPDATE users SET balance=balance+%s WHERE user_id=%s",
-                (b_amt, str(opponent_id)),
-            )
-        if a_amt > 0:
-            log_transaction_in_tx(cur, challenger_id, a_amt, f"E卡決鬥分配（積分 {s_a}:{s_b}）")
-        if b_amt > 0:
-            log_transaction_in_tx(cur, opponent_id, b_amt, f"E卡決鬥分配（積分 {s_a}:{s_b}）")
+            change_balance(cur, opponent_id, b_amt, f"E卡決鬥分配（積分 {s_a}:{s_b}）")
 
 def roll_gamble_exp_from_bet(main_bet: int) -> int:
     return game_repo.roll_gamble_exp_from_bet(GAMBLE_EXP_MIN, GAMBLE_EXP_MAX, main_bet)

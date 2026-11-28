@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from bot_modules import rob_repo
+from bot_modules import tx_ops
 from bot_modules.tx_ops import lock_user_rows, log_transaction_in_tx
 from test_regressions import SqliteConnection
 
@@ -29,10 +30,12 @@ class RobberyTransactionTests(unittest.TestCase):
         self.now=datetime.datetime(2026,11,26,12)
 
     def run_rob(self, success, log=log_transaction_in_tx):
-        if success:
-            return rob_repo.apply_rob_success_db(lambda:self.conn,lock_user_rows,lambda:self.now,
-                lambda x:x,log,0.3,100000,100000,50,5,1,2,self.now,60)
-        return rob_repo.apply_rob_fail_db(lambda:self.conn,lock_user_rows,100000,1,2,self.now,log)
+        # Ledger writes go through tx_ops.change_balance, so inject failures there.
+        with patch.object(tx_ops,'log_transaction_in_tx',log):
+            if success:
+                return rob_repo.apply_rob_success_db(lambda:self.conn,lock_user_rows,lambda:self.now,
+                    lambda x:x,log,0.3,100000,100000,50,5,1,2,self.now,60)
+            return rob_repo.apply_rob_fail_db(lambda:self.conn,lock_user_rows,100000,1,2,self.now,log)
 
     def test_success_and_failure_have_balanced_atomic_logs(self):
         for success in (True,False):

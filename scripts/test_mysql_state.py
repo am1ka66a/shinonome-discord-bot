@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bot_modules import db, state_repo
+from bot_modules import tx_ops
 
 
 @unittest.skipUnless(os.getenv("RUN_MYSQL_INTEGRATION") == "1", "requires disposable CI MySQL")
@@ -189,12 +190,12 @@ class MySQLStateTests(unittest.TestCase):
         self.store.debit("ci:duel", "duel", 1, 100, "a")
         self.store.debit("ci:duel", "duel", 2, 100, "b")
         self.store.prepare("ci:duel", {}, refund=True)
-        real_log = state_repo.log_transaction_in_tx
+        real_log = tx_ops.log_transaction_in_tx
         def fail_second(c, uid, amount, reason):
             if str(uid) == "2":
                 raise RuntimeError("injected log failure")
             real_log(c, uid, amount, reason)
-        with patch.object(state_repo, "log_transaction_in_tx", side_effect=fail_second), self.assertRaises(RuntimeError):
+        with patch.object(tx_ops, "log_transaction_in_tx", side_effect=fail_second), self.assertRaises(RuntimeError):
             self.store.apply("ci:duel")
         self.assertEqual(self.balances(), [900, 900])
         self.store.apply("ci:duel")

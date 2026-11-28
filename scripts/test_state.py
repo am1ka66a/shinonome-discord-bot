@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bot_modules import state_repo
+from bot_modules import tx_ops
 from bot_modules.db import db_cursor
 from test_regressions import SqliteConnection
 
@@ -56,7 +57,7 @@ class StateTests(unittest.TestCase):
         self.assertEqual(self.conn.db.execute("SELECT COUNT(*) FROM bot_game_sessions").fetchone()[0], 0)
 
     def test_failed_debit_log_rolls_back_money_and_save(self):
-        with patch.object(state_repo, "log_transaction_in_tx", side_effect=RuntimeError("offline log failure")):
+        with patch.object(tx_ops, "log_transaction_in_tx", side_effect=RuntimeError("offline log failure")):
             with self.assertRaises(RuntimeError):
                 self.store.debit("bj:1", "bj", 1, 100, "open")
         self.assertEqual(self.balance(), 1000)
@@ -65,7 +66,7 @@ class StateTests(unittest.TestCase):
     def test_failed_payout_then_retry_is_atomic_and_idempotent(self):
         self.store.debit("bj:1", "bj", 1, 100, "open")
         self.store.prepare("bj:1", {"1": 200}, {"1": (True, 100, False)})
-        with patch.object(state_repo, "log_transaction_in_tx", side_effect=RuntimeError("offline failure")):
+        with patch.object(tx_ops, "log_transaction_in_tx", side_effect=RuntimeError("offline failure")):
             with self.assertRaises(RuntimeError):
                 self.store.apply("bj:1")
         self.assertEqual(self.balance(), 900)
@@ -158,12 +159,12 @@ class StateTests(unittest.TestCase):
         self.store.debit("duel:1", "duel", 1, 100, "a")
         self.store.debit("duel:1", "duel", 2, 100, "b")
         self.store.prepare("duel:1", {}, refund=True)
-        real_log = state_repo.log_transaction_in_tx
+        real_log = tx_ops.log_transaction_in_tx
         def fail_second(c, uid, amount, reason):
             if str(uid) == "2":
                 raise RuntimeError("second refund failed")
             real_log(c, uid, amount, reason)
-        with patch.object(state_repo, "log_transaction_in_tx", side_effect=fail_second), self.assertRaises(RuntimeError):
+        with patch.object(tx_ops, "log_transaction_in_tx", side_effect=fail_second), self.assertRaises(RuntimeError):
             self.store.apply("duel:1")
         self.assertEqual((self.balance(1), self.balance(2)), (900, 900))
         self.store.apply("duel:1")
@@ -181,7 +182,7 @@ class StateTests(unittest.TestCase):
 
     def test_failed_claim_can_retry_without_losing_a_share(self):
         self.store.debit("packet:1", "redpacket", 1, 100, "open", {"creator_id": 1, "count": 1, "claims": {}})
-        with patch.object(state_repo, "log_transaction_in_tx", side_effect=RuntimeError("claim failed")), self.assertRaises(RuntimeError):
+        with patch.object(tx_ops, "log_transaction_in_tx", side_effect=RuntimeError("claim failed")), self.assertRaises(RuntimeError):
             self.store.claim("packet:1", 2)
         self.assertEqual(self.balance(2), 1000)
         self.assertEqual(self.store.claim("packet:1", 2)[0], 100)

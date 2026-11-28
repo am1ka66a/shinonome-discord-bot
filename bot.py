@@ -261,6 +261,24 @@ _event_tasks = register_events(
 _event_tasks["game_recovery_task"] = game_recovery_task
 _event_tasks["roulette_recovery_task"] = roulette_recovery_task
 
+
+async def reconcile_watch_task():
+    from bot_modules.runtime.reconcile_watch import run_reconcile_watch
+    await bot._db_ready_event.wait()
+    if config.RECONCILE_CHECK_SECONDS <= 0:
+        return await asyncio.Event().wait()  # disabled; park instead of restart-looping
+    await run_reconcile_watch(
+        bot,
+        logger=logger,
+        connect=get_db_connection,
+        admin_ids=config.ALLOWED_HOST_IDS,
+        interval_seconds=config.RECONCILE_CHECK_SECONDS,
+        first_delay_seconds=config.RECONCILE_FIRST_DELAY_SECONDS,
+    )
+
+
+_event_tasks["reconcile_watch_task"] = reconcile_watch_task
+
 register_on_ready(
     bot,
     logger=logger,

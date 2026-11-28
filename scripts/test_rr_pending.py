@@ -11,6 +11,7 @@ import discord
 import pymysql
 from discord.ext import commands
 from bot_modules import rr_match_repo as repo
+from bot_modules import tx_ops
 from bot_modules.commands import russian_roulette
 from test_regressions import SqliteConnection, context, interaction
 
@@ -39,7 +40,7 @@ class RoulettePendingTests(unittest.TestCase):
         return self.conn.db.execute('SELECT balance FROM users ORDER BY user_id').fetchall()
 
     def test_failed_payout_stays_durable_and_background_recovery_finishes_once(self):
-        with patch.object(repo,'log_transaction_in_tx',side_effect=RuntimeError('ledger offline')):
+        with patch.object(tx_ops,'log_transaction_in_tx',side_effect=RuntimeError('ledger offline')):
             with self.assertRaises(RuntimeError):
                 repo.settle_event_sync(**self.args)
         phase,raw=self.conn.db.execute("SELECT phase,payload FROM russian_roulette_active_matches").fetchone()

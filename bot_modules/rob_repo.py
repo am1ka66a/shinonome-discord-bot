@@ -3,6 +3,7 @@ import random
 import typing
 
 from bot_modules.db import db_conn, db_cursor
+from bot_modules.tx_ops import change_balance
 
 
 def append_rob_history_on_cursor(c, user_id: int, steal_amount: int, now_tw_naive_func) -> None:
@@ -116,17 +117,11 @@ def apply_rob_success_db(
         target_balance_snapshot = int((trow[0] if trow else 0) or 0)
         c.execute("UPDATE users SET last_rob=%s WHERE user_id=%s", (now, str(robber_id)))
         steal_amount = int(max(1, min(target_balance_snapshot * random.uniform(0.10, 0.25), int(rob_steal_cap))))
-        c.execute(
-            "UPDATE users SET balance=balance-%s WHERE user_id=%s AND balance >= %s",
-            (steal_amount, str(target_id), steal_amount),
-        )
-        if c.rowcount == 0:
+        if not change_balance(c, target_id, -steal_amount, f"被搶劫（搶匪:{robber_id}）", require_funds=True):
             conn.commit()
             return {"ok": False, "reason": "target_hidden"}
 
-        c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (steal_amount, str(robber_id)))
-        log_transaction_in_tx(c, robber_id, steal_amount, f"搶劫成功（目標:{target_id}）")
-        log_transaction_in_tx(c, target_id, -steal_amount, f"被搶劫（搶匪:{robber_id}）")
+        change_balance(c, robber_id, steal_amount, f"搶劫成功（目標:{target_id}）")
         c.execute("UPDATE users SET last_robbed=%s WHERE user_id=%s", (now, str(target_id)))
         append_rob_history_on_cursor(c, robber_id, steal_amount, now_tw_naive_func)
 
@@ -191,9 +186,11 @@ def apply_rob_success_db(
             if random.random() < counter_rate:
                 pay = min(doubled, robber_balance)
                 debt_from_shortfall = max(0, doubled - pay)
+                # pay <= robber_balance (read under lock), so this never goes below zero.
+                change_balance(c, robber_id, -pay, f"被平民自動反制（受害者:{target_id}）")
                 c.execute(
-                    "UPDATE users SET balance=GREATEST(0, balance-%s), bail_debt=COALESCE(bail_debt,0)+%s WHERE user_id=%s",
-                    (pay, debt_from_shortfall, str(robber_id)),
+                    "UPDATE users SET bail_debt=COALESCE(bail_debt,0)+%s WHERE user_id=%s",
+                    (debt_from_shortfall, str(robber_id)),
                 )
                 c.execute(
                     "SELECT COALESCE(balance,0), COALESCE(in_prison,0) FROM users WHERE user_id=%s FOR UPDATE",
@@ -216,10 +213,7 @@ def apply_rob_success_db(
                         (str(robber_id), str(target_id), 0, pay, 0, int(bail_cost), prison_now),
                     )
                     robber_imprisoned = True
-                c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (doubled, str(target_id)))
-                log_transaction_in_tx(c, target_id, doubled, f"平民自動反制成功（對搶匪:{robber_id}）")
-                if pay > 0:
-                    log_transaction_in_tx(c, robber_id, -pay, f"被平民自動反制（受害者:{target_id}）")
+                change_balance(c, target_id, doubled, f"平民自動反制成功（對搶匪:{robber_id}）")
                 debt_note = ""
                 if debt_from_shortfall > 0:
                     debt_note = f"；搶匪餘額不足，差額 `{debt_from_shortfall:,}` 已記入假釋債務"
@@ -267,13 +261,8 @@ def apply_rob_fail_db(
         fail_penalty = int(max(1, min(robber_balance_snapshot * random.uniform(0.15, 0.45), int(rob_fail_penalty_cap))))
         deducted = False
         if fail_penalty > 0:
-            c.execute(
-                "UPDATE users SET balance=balance-%s WHERE user_id=%s AND balance >= %s",
-                (fail_penalty, str(robber_id), fail_penalty),
-            )
-            deducted = c.rowcount > 0
+            deducted = change_balance(c, robber_id, -fail_penalty, f"搶劫失敗反噬（目標:{target_id}）",
+                                      require_funds=True)
             if deducted:
-                c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (fail_penalty, str(target_id)))
-                log_transaction_in_tx(c, robber_id, -fail_penalty, f"搶劫失敗反噬（目標:{target_id}）")
-                log_transaction_in_tx(c, target_id, fail_penalty, f"反制搶劫獲賠（搶匪:{robber_id}）")
+                change_balance(c, target_id, fail_penalty, f"反制搶劫獲賠（搶匪:{robber_id}）")
     return {"fail_penalty": fail_penalty, "deducted": deducted}

@@ -2,6 +2,7 @@ import datetime
 import typing
 
 from bot_modules.db import db_cursor
+from bot_modules.tx_ops import change_balance
 
 
 def fetch_wanted_status_row_sync(ensure_user_exists, get_db_connection, user_id: int):
@@ -54,18 +55,13 @@ def pay_bail_sync(
         total_bail = bail_cost + debt
         if bal < total_bail:
             return {"ok": False, "reason": "insufficient", "debt": debt, "total_bail": total_bail}
-        c.execute(
-            """UPDATE users SET balance=balance-%s, bail_debt=0, in_prison=0, prison_start=NULL
-           WHERE user_id=%s AND balance >= %s""",
-            (total_bail, uid, total_bail),
-        )
-        if c.rowcount == 0:
+        if not change_balance(c, uid, -total_bail, "監獄假釋金（含累計欠款）", require_funds=True):
             return {"ok": False, "reason": "deduct_failed"}
+        c.execute("UPDATE users SET bail_debt=0, in_prison=0, prison_start=NULL WHERE user_id=%s", (uid,))
         c.execute(
             "UPDATE prison_records SET released_at=%s WHERE criminal_id=%s AND released_at IS NULL ORDER BY id DESC LIMIT 1",
             (now, uid),
         )
-        log_transaction_in_tx(c, user_id, -total_bail, "監獄假釋金（含累計欠款）")
     return {"ok": True, "debt": debt, "total_bail": total_bail}
 
 
@@ -108,15 +104,13 @@ def wanted_buyout_sync(
             if elapsed < int(wanted_buyout_cooldown_seconds):
                 next_dt = last_buyout + datetime.timedelta(seconds=int(wanted_buyout_cooldown_seconds))
                 return {"ok": False, "reason": "cooldown", "next_dt": next_dt}
-        c.execute(
-            """UPDATE users SET balance=balance-%s,
-           wanted_stars=0, wanted_hunted_count=0, last_five_robs=NULL, last_wanted_buyout=%s
-           WHERE user_id=%s AND balance >= %s""",
-            (cost, now, uid, cost),
-        )
-        if c.rowcount == 0:
+        if not change_balance(c, uid, -cost, "通緝買斷（消除通緝星）", require_funds=True):
             return {"ok": False, "reason": "deduct_failed"}
-        log_transaction_in_tx(c, user_id, -cost, "通緝買斷（消除通緝星）")
+        c.execute(
+            """UPDATE users SET wanted_stars=0, wanted_hunted_count=0, last_five_robs=NULL, last_wanted_buyout=%s
+           WHERE user_id=%s""",
+            (now, uid),
+        )
     return {"ok": True, "stars_was": stars, "new_balance": bal - cost}
 
 
@@ -153,11 +147,8 @@ def break_citizen_sync(
         if target_active != 1:
             return {"ok": False, "reason": "target_not_active", "target_broken_until": target_broken_until}
         broken_until = now + datetime.timedelta(days=int(good_citizen_broken_lock_days))
-        c.execute(
-            "UPDATE users SET balance=balance-%s WHERE user_id=%s AND balance >= %s",
-            (int(good_citizen_destroy_cost), str(attacker_id), int(good_citizen_destroy_cost)),
-        )
-        if c.rowcount == 0:
+        if not change_balance(c, attacker_id, -int(good_citizen_destroy_cost), f"摧毀良民證（目標:{target_id}）",
+                              require_funds=True):
             return {"ok": False, "reason": "deduct_failed"}
         c.execute(
             """UPDATE users
@@ -167,7 +158,6 @@ def break_citizen_sync(
            WHERE user_id=%s""",
             (broken_until, now, str(target_id)),
         )
-        log_transaction_in_tx(c, attacker_id, -int(good_citizen_destroy_cost), f"摧毀良民證（目標:{target_id}）")
     return {"ok": True, "broken_until": broken_until}
 
 

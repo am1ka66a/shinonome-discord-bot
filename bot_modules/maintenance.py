@@ -3,7 +3,7 @@ import contextlib
 import json
 
 from bot_modules.db import db_cursor
-from bot_modules.tx_ops import log_transaction_in_tx
+from bot_modules.tx_ops import change_balance
 
 
 def casino_open(c):
@@ -63,11 +63,9 @@ def reset_balances(request_id, actor_id, target_balance, reset_stats=False):
             delta = target_balance - int(before)
             delta_total += delta
             if reset_stats:
-                c.execute("UPDATE users SET balance=%s,rescue_count=0,total_games=0,wins=0,total_profit=0 WHERE user_id=%s",
-                          (target_balance, str(uid)))
-            else:
-                c.execute("UPDATE users SET balance=%s WHERE user_id=%s", (target_balance, str(uid)))
-            log_transaction_in_tx(c, uid, delta, f"管理員重置｜actor={actor_id}｜op={request_id}")
+                c.execute("UPDATE users SET rescue_count=0,total_games=0,wins=0,total_profit=0 WHERE user_id=%s",
+                          (str(uid),))
+            change_balance(c, uid, delta, f"管理員重置｜actor={actor_id}｜op={request_id}")
         result = dict(accounts=len(rows), delta=delta_total, target_balance=target_balance)
         c.execute("INSERT INTO bot_admin_operations (request_id,actor_id,action,result_json) VALUES (%s,%s,%s,%s)",
                   (str(request_id), str(actor_id), "reset_default" if reset_stats else "reset_zero", json.dumps(result)))

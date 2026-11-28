@@ -4,6 +4,7 @@ import typing
 
 from bot_modules.db import db_conn, db_cursor
 from bot_modules.economy_service import credit_user
+from bot_modules.tx_ops import change_balance
 
 
 def try_deduct_balance(get_db_connection, get_locked_user_balance, log_transaction_in_tx, user_id, amount, reason):
@@ -14,11 +15,8 @@ def try_deduct_balance(get_db_connection, get_locked_user_balance, log_transacti
         bal = get_locked_user_balance(c, user_id)
         if bal < amount:
             return False
-        c.execute(
-            "UPDATE users SET balance=balance-%s WHERE user_id=%s",
-            (amount, str(user_id)),
-        )
-        log_transaction_in_tx(c, user_id, -amount, reason)
+        if not change_balance(c, user_id, -amount, reason, require_funds=True):
+            return False
         conn.commit()
     return True
 
@@ -52,8 +50,8 @@ def claim_beg_sync(
             c.execute("UPDATE users SET last_beg=%s WHERE user_id=%s", (now, str(user_id)))
             conn.commit()
             return {"ok": True, "earned": 0, "fail": True}
-        c.execute("UPDATE users SET balance=balance+%s, last_beg=%s WHERE user_id=%s", (earn, now, str(user_id)))
-        log_transaction_in_tx(c, user_id, earn, "乞討所得")
+        c.execute("UPDATE users SET last_beg=%s WHERE user_id=%s", (now, str(user_id)))
+        change_balance(c, user_id, earn, "乞討所得")
         conn.commit()
     return {"ok": True, "earned": earn, "fail": False}
 
@@ -86,10 +84,10 @@ def claim_rescue_sync(
             return {"ok": False, "reason": "cooldown", "remain_sec": max(1, int(rem))}
         rescue_reward = max(500, min(50000, int(1000 * inflation_mult)))
         c.execute(
-            "UPDATE users SET balance=balance+%s, last_rescue=%s, rescue_count=rescue_count+1 WHERE user_id=%s",
-            (rescue_reward, now, str(user_id)),
+            "UPDATE users SET last_rescue=%s, rescue_count=rescue_count+1 WHERE user_id=%s",
+            (now, str(user_id)),
         )
-        log_transaction_in_tx(c, user_id, rescue_reward, "賭狗破產救濟")
+        change_balance(c, user_id, rescue_reward, "賭狗破產救濟")
         conn.commit()
     return {"ok": True, "reward": rescue_reward, "claim_no": rescue_count + 1}
 
@@ -125,8 +123,8 @@ def payout_hourly_bank(get_db_connection, log_transaction_in_tx, user_id, bank, 
         return 0
     payout = int(bank * reward_per_slot)
     with db_cursor(commit=True, connect=get_db_connection) as c:
-        c.execute("UPDATE users SET balance=balance+%s, hourly_bank=0 WHERE user_id=%s", (payout, str(user_id)))
-        log_transaction_in_tx(c, user_id, payout, "每小時簽到")
+        c.execute("UPDATE users SET hourly_bank=0 WHERE user_id=%s", (str(user_id),))
+        change_balance(c, user_id, payout, "每小時簽到")
     return payout
 
 
@@ -149,13 +147,13 @@ def claim_hourly_reward(ensure_user_exists, get_db_connection, now_tw_naive_func
         last_claim += datetime.timedelta(hours=elapsed)
         payout = bank * int(reward_per_slot)
         c.execute(
-            "UPDATE users SET last_hourly_claim=%s, hourly_bank=0, balance=balance+%s WHERE user_id=%s",
-            (last_claim, payout, uid),
+            "UPDATE users SET last_hourly_claim=%s, hourly_bank=0 WHERE user_id=%s",
+            (last_claim, uid),
         )
         if not bank:
             seconds = max(0, 3600 - int((now - last_claim).total_seconds()))
             return {"ok": True, "claimed": False, "level": level, "mins": max(1, (seconds + 59) // 60)}
-        log_transaction_in_tx(c, uid, payout, "每小時簽到")
+        change_balance(c, uid, payout, "每小時簽到")
         c.execute("SELECT balance FROM users WHERE user_id=%s", (uid,))
         balance = int((c.fetchone() or [0])[0] or 0)
         return {"ok": True, "claimed": True, "level": level, "bank": bank,
@@ -190,8 +188,7 @@ def claim_daily_reward(
             "INSERT INTO daily_claims (user_id, last_claim) VALUES (%s, %s) ON DUPLICATE KEY UPDATE last_claim=%s",
             (str(user_id), today_tw, today_tw),
         )
-        c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (daily_reward, str(user_id)))
-        log_transaction_in_tx(c, user_id, daily_reward, "每日簽到")
+        change_balance(c, user_id, daily_reward, "每日簽到")
         conn.commit()
         c.execute("SELECT balance FROM users WHERE user_id=%s", (str(user_id),))
         bal_row = c.fetchone()

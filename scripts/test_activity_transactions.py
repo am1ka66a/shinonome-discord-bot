@@ -3,10 +3,11 @@ import datetime
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from bot_modules import activity_repo
+from bot_modules import tx_ops
 from bot_modules.tx_ops import log_transaction_in_tx
 from test_regressions import SqliteConnection
 
@@ -34,9 +35,11 @@ class ActivityTransactionTests(unittest.TestCase):
         self.now=datetime.datetime(2026,11,26,12)
 
     def award(self,now=None,log=log_transaction_in_tx):
-        return activity_repo.process_on_message_activity_sync(lambda:self.conn,log,lambda *a:None,
-            Mock(side_effect=AssertionError('must not open another EXP connection')),
-            '1',1,now or self.now,True,50)
+        # Ledger writes go through tx_ops.change_balance, so inject failures there.
+        with patch.object(tx_ops,'log_transaction_in_tx',log):
+            return activity_repo.process_on_message_activity_sync(lambda:self.conn,log,lambda *a:None,
+                Mock(side_effect=AssertionError('must not open another EXP connection')),
+                '1',1,now or self.now,True,50)
 
     def test_cooldown_survives_new_runtime_and_allows_at_exact_boundary(self):
         self.assertTrue(self.award()['exp_awarded'])

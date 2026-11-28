@@ -3,6 +3,7 @@ import typing
 
 from bot_modules.db import db_cursor
 from bot_modules import config, game_repo
+from bot_modules.tx_ops import change_balance
 
 # 各函式保留 get_db_connection 參數以維持既有呼叫端簽名，連線改由 db_cursor 管理。
 
@@ -40,15 +41,11 @@ def award_vc_rewards_sync(
             row = c.fetchone()
             if row and row[0] is not None and (now - row[0]).total_seconds() < 1800:
                 continue
-            c.execute(
-                "INSERT INTO users (user_id, balance) VALUES (%s, 500) ON DUPLICATE KEY UPDATE balance=balance+500",
-                (user_id,),
-            )
+            change_balance(c, user_id, 500, "語音通話獎勵 (10min)", create=True)
             c.execute(
                 "INSERT INTO activity_stats (user_id, last_vc_reward) VALUES (%s, %s) ON DUPLICATE KEY UPDATE last_vc_reward=%s",
                 (user_id, now, now),
             )
-            log_transaction_in_tx(c, user_id, 500, "語音通話獎勵 (10min)")
             awarded.append(user_id)
     return len(awarded)
 
@@ -92,15 +89,11 @@ def process_on_message_activity_sync(
 
         if row and int(row[0] or 0) >= 10:
             if row[1] is None or (now - row[1]).total_seconds() >= 1800:
-                c.execute(
-                    "INSERT INTO users (user_id, balance) VALUES (%s, 500) ON DUPLICATE KEY UPDATE balance=balance+500",
-                    (user_id,),
-                )
+                change_balance(c, user_id, 500, "聊天活躍獎勵 (10句)", create=True)
                 c.execute(
                     "UPDATE activity_stats SET msg_count=0, last_msg_reward=%s WHERE user_id=%s",
                     (now, user_id),
                 )
-                log_transaction_in_tx(c, user_id, 500, "聊天活躍獎勵 (10句)")
                 msg_rewarded = True
     return {
         "exp_awarded": exp_awarded,

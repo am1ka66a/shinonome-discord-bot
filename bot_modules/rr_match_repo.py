@@ -4,7 +4,7 @@ import typing
 import uuid
 
 from bot_modules.db import db_cursor
-from bot_modules.tx_ops import lock_user_rows, log_transaction_in_tx
+from bot_modules.tx_ops import change_balance, lock_user_rows
 
 _lock = threading.Lock()
 _user_active: typing.Dict[int, str] = {}
@@ -56,8 +56,7 @@ def _apply_event_sync(*, match_id: str, event_key: str, credits: typing.Dict[int
             if amount < 0:
                 raise ValueError("Settlement credits must be nonnegative")
             if amount:
-                c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (amount, str(uid)))
-                log_transaction_in_tx(c, uid, amount, reason)
+                change_balance(c, uid, amount, reason)
             if uid in results:
                 win, profit = results[uid]
                 c.execute(
@@ -296,8 +295,7 @@ def fund_match_sync(*, charges, event_key, reason, match_id, guild_id, channel_i
                     row = c.fetchone()
                     if row is None or int(row[0]) < amount:
                         raise _InsufficientStake()
-                    c.execute("UPDATE users SET balance=balance-%s WHERE user_id=%s",(amount,str(uid)))
-                    log_transaction_in_tx(c,uid,-amount,reason)
+                    change_balance(c, uid, -amount, reason)
                 c.execute("""INSERT INTO russian_roulette_active_matches
                     (match_id,guild_id,channel_id,message_id,mode,phase,payload) VALUES (%s,%s,%s,%s,%s,%s,%s)
                     ON DUPLICATE KEY UPDATE message_id=VALUES(message_id),phase=VALUES(phase),payload=VALUES(payload)""",

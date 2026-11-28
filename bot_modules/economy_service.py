@@ -1,6 +1,7 @@
 import typing
 
 from bot_modules.db import db_conn, db_cursor
+from bot_modules.tx_ops import change_balance
 
 
 def debit_user(
@@ -25,8 +26,8 @@ def debit_user(
         balance = get_locked_user_balance(c, user_id)
         if balance < amount:
             return False
-        c.execute("UPDATE users SET balance=balance-%s WHERE user_id=%s", (amount, str(user_id)))
-        log_transaction_in_tx(c, user_id, -amount, reason)
+        if not change_balance(c, user_id, -amount, reason, require_funds=True):
+            return False
         conn.commit()
     return True
 
@@ -43,12 +44,7 @@ def credit_user(
     if amount <= 0:
         return
     with db_cursor(commit=True, connect=get_db_connection) as c:
-        c.execute(
-            "INSERT INTO users (user_id, balance) VALUES (%s, %s) "
-            "ON DUPLICATE KEY UPDATE balance=COALESCE(balance,0)+%s",
-            (str(user_id), amount, amount),
-        )
-        log_transaction_in_tx(c, user_id, amount, reason)
+        change_balance(c, user_id, amount, reason, create=True)
 
 
 def transfer_users(
@@ -75,10 +71,9 @@ def transfer_users(
         receiver_before = get_locked_user_balance(c, receiver)
         if sender_before < amount:
             return {"ok": False, "reason": "insufficient"}
-        c.execute("UPDATE users SET balance=balance-%s WHERE user_id=%s", (amount, sender))
-        c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (amount, receiver))
-        log_transaction_in_tx(c, sender, -amount, out_reason)
-        log_transaction_in_tx(c, receiver, amount, in_reason)
+        if not change_balance(c, sender, -amount, out_reason, require_funds=True):
+            return {"ok": False, "reason": "insufficient"}
+        change_balance(c, receiver, amount, in_reason, create=True)
         conn.commit()
     return {
         "ok": True,
