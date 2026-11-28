@@ -1,5 +1,6 @@
 """AI chat: answers @-mentions in character, within the cooldown and daily cap."""
 import asyncio
+import itertools
 import logging
 import os
 import sys
@@ -12,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bot_modules import ai_chat
 
 BOT = SimpleNamespace(id=999)
+IDS = itertools.count(1000)
 
 
 def response(text="喵～", stop_reason="end_turn"):
@@ -45,6 +47,7 @@ class FakeChannel:
 
 def fake_message(content="小咪你好", author_id=1, mentions=(BOT,), history=(), reference=None):
     return SimpleNamespace(
+        id=next(IDS),
         author=SimpleNamespace(id=author_id, display_name=f"玩家{author_id}"),
         clean_content=content,
         mentions=list(mentions),
@@ -149,8 +152,8 @@ class PromptTests(unittest.TestCase):
 class HandleTests(unittest.IsolatedAsyncioTestCase):
     async def test_reply_uses_history_and_pings_only_the_author(self):
         chat, client = make_chat()
-        older = SimpleNamespace(author=SimpleNamespace(id=2, display_name="阿華"), clean_content="小咪在嗎")
-        mine = SimpleNamespace(author=BOT, clean_content="在喵")
+        older = SimpleNamespace(id=next(IDS), author=SimpleNamespace(id=2, display_name="阿華"), clean_content="小咪在嗎")
+        mine = SimpleNamespace(id=next(IDS), author=BOT, clean_content="在喵")
         msg = fake_message(history=[mine, older])
         await chat.handle(msg, BOT)
         kwargs = client.messages.create.await_args.kwargs
@@ -203,6 +206,36 @@ class HandleTests(unittest.IsolatedAsyncioTestCase):
     def test_cost_estimate(self):
         u = ai_chat.Usage(input_tokens=1_000_000, cache_read_tokens=1_000_000, output_tokens=1_000_000)
         self.assertAlmostEqual(u.cost(0.10, 0.50), 0.61)
+
+    async def test_overlapping_mentions_are_not_merged(self):
+        chat, client = make_chat(user_cooldown_seconds=0)
+        gate = asyncio.Event()
+
+        async def slow_create(**kwargs):
+            await gate.wait()
+            return response()
+
+        client.messages.create.side_effect = slow_create
+        first = fake_message("A 的問題", author_id=1)
+        second = fake_message("B 的問題", author_id=2, history=[first])
+        chat.schedule(first, BOT)
+        await asyncio.sleep(0)  # first is now waiting on the API
+        chat.schedule(second, BOT)
+        await asyncio.sleep(0)
+        gate.set()
+        await asyncio.gather(*chat.tasks)
+        turns = [c.kwargs["messages"][0]["content"] for c in client.messages.create.await_args_list]
+        self.assertNotIn("A 的問題", turns[1])
+        self.assertEqual(chat.in_flight, set())
+
+    async def test_cooldown_rejected_mention_is_left_out_of_later_history(self):
+        chat, client = make_chat(user_cooldown_seconds=30)
+        await chat.handle(fake_message("第一句"), BOT)
+        rejected = fake_message("太快的第二句")
+        await chat.handle(rejected, BOT)
+        later = fake_message("別人的話", author_id=2, history=[rejected])
+        await chat.handle(later, BOT)
+        self.assertNotIn("太快的第二句", client.messages.create.await_args.kwargs["messages"][0]["content"])
 
     async def test_channel_allowlist(self):
         chat, _ = make_chat(channel_ids=frozenset({5}))

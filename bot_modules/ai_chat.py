@@ -5,6 +5,7 @@ whole bot (reset at Taiwan midnight). Both live in memory, so a restart resets
 them; the monthly spend limit set in the Anthropic Console is the hard backstop.
 """
 import asyncio
+import collections
 import dataclasses
 import datetime
 import os
@@ -266,6 +267,11 @@ class AIChat:
         self.usage_day = self.limiter.day
         self.started_at = time.time()
         self.last_error: typing.Optional[typing.Tuple[float, str]] = None
+        # @ messages that get no reply of their own here: in flight (they will be answered on
+        # their own) or turned away by the limiter. Leaving them out of another reply's history
+        # stops the bot from answering two people's questions in one message.
+        self.in_flight: typing.Set[int] = set()
+        self.refused_ids: typing.Deque[int] = collections.deque(maxlen=500)
 
     def wants(self, message, bot_user) -> bool:
         if self.settings.channel_ids and message.channel.id not in self.settings.channel_ids:
@@ -298,6 +304,8 @@ class AIChat:
         bot_id = getattr(bot_user, "id", None)
         rows = []
         async for m in message.channel.history(limit=self.settings.history_messages, before=message):
+            if m.id in self.in_flight or m.id in self.refused_ids:
+                continue
             rows.append((speaker_label(m.author, bot_id), m.clean_content))
         rows.reverse()
         return rows
@@ -307,8 +315,10 @@ class AIChat:
         self._sync_day()
         if refused:
             self._count("cooldown_hits" if refused == "cooldown" else "daily_cap_hits")
+            self.refused_ids.append(message.id)
             await self._react(message, "⏳" if refused == "cooldown" else "💤")
             return
+        self.in_flight.add(message.id)
         try:
             async with self.semaphore:
                 async with message.channel.typing():
@@ -338,6 +348,8 @@ class AIChat:
             self.last_error = (time.time(), f"{type(exc).__name__}: {exc}"[:300])
             self.logger.exception("AI 聊天回覆失敗 user=%s", message.author.id)
             await self._react(message, "⚠️")
+        finally:
+            self.in_flight.discard(message.id)
 
     def status_lines(self) -> typing.List[str]:
         """Plain-text usage summary for the admin panel."""
