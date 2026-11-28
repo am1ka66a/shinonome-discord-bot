@@ -235,6 +235,10 @@ def is_addressed_to_bot(message, bot_user) -> bool:
         return False
     if any(getattr(m, "id", None) == bot_user.id for m in getattr(message, "mentions", ()) or ()):
         return True
+    # Discord's autocomplete also offers the bot's own role, which looks the same as "@小咪".
+    for role in getattr(message, "role_mentions", ()) or ():
+        if getattr(getattr(role, "tags", None), "bot_id", None) == bot_user.id:
+            return True
     ref = getattr(message, "reference", None)
     resolved = getattr(ref, "resolved", None) if ref is not None else None
     return getattr(getattr(resolved, "author", None), "id", None) == bot_user.id

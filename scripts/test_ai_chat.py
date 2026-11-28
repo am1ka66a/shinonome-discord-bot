@@ -114,6 +114,10 @@ class PromptTests(unittest.TestCase):
     def test_mention_or_reply_to_bot_triggers(self):
         self.assertTrue(ai_chat.is_addressed_to_bot(fake_message(), BOT))
         self.assertFalse(ai_chat.is_addressed_to_bot(fake_message(mentions=()), BOT))
+        bot_role = SimpleNamespace(tags=SimpleNamespace(bot_id=BOT.id))
+        other_role = SimpleNamespace(tags=None)
+        self.assertTrue(ai_chat.is_addressed_to_bot(SimpleNamespace(mentions=[], role_mentions=[bot_role]), BOT))
+        self.assertFalse(ai_chat.is_addressed_to_bot(SimpleNamespace(mentions=[], role_mentions=[other_role]), BOT))
         reply = SimpleNamespace(resolved=SimpleNamespace(author=BOT))
         self.assertTrue(ai_chat.is_addressed_to_bot(fake_message(mentions=(), reference=reply), BOT))
 
